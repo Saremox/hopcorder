@@ -424,10 +424,17 @@ added in the commit that introduced it.
   built, so records never differ from full-depth probing; only the replies
   the destination would send for TTLs past it are saved. Unreached targets
   always get full depth. Implemented with `TraceRequest.MinTTL`.
-- **Known limitations**: RTTs use user-space receive timestamps (tens of µs of
-  scheduling noise; kernel `SO_TIMESTAMPNS` is a possible refinement). MPLS
-  label extensions (RFC 4950) are not parsed. All TTLs up to `max_ttl` are
-  probed in cycles of unreached targets.
+- **Kernel receive timestamps** (added after review): listeners enable
+  `SO_TIMESTAMPNS`, and each reply's receive time is moved back by the lag
+  between the kernel's stamp and the user-space read. RTTs stay on the
+  monotonic clock; only the difference of two wall-clock readings taken
+  microseconds apart is used, and lags outside 0..100ms (a clock step) fall
+  back to the user-space time. On loopback this cut the median RTT from
+  ~55µs to ~24µs (p90 104 → 35µs), i.e. about 30µs of every RTT was Go
+  scheduling delay. Send times are still user-space, taken just before the
+  send call.
+- **Known limitations**: MPLS label extensions (RFC 4950) are not parsed.
+  All TTLs up to `max_ttl` are probed in cycles of unreached targets.
 - **Testing**: the demux engine sits behind a small socket interface and is
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology

@@ -4,12 +4,15 @@ package probe
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,6 +51,9 @@ type Raw struct {
 	v4     *raw4
 	v6     *raw6
 	wg     sync.WaitGroup
+
+	// kernelStamped counts replies whose receive time came from the kernel.
+	kernelStamped atomic.Uint64
 }
 
 type raw4 struct {
@@ -169,7 +175,7 @@ func (r *Raw) open4() (*raw4, error) {
 	}
 	r.v4 = &raw4{send: send, recv: recv}
 	r.wg.Add(1)
-	go r.recvLoop(recv, r.eng.handle)
+	go r.recvLoop(recv, true, r.eng.handle)
 	return r.v4, nil
 }
 
@@ -231,7 +237,7 @@ func (r *Raw) open4TCP() error {
 	}
 	r.v4.tcp = c
 	r.wg.Add(1)
-	go r.recvLoop(c, r.eng.handleTCP)
+	go r.recvLoop(c, true, r.eng.handleTCP)
 	return nil
 }
 
@@ -264,7 +270,7 @@ func (r *Raw) open6For(needUDP, needTCP bool) (*raw6, error) {
 		}
 		r.v6 = &raw6{icmpConn: c, icmp: pc}
 		r.wg.Add(1)
-		go r.recvLoop(c, r.eng.handle)
+		go r.recvLoop(c, false, r.eng.handle)
 	}
 	if needTCP && r.v6.tcp == nil {
 		c, err := listen("ip6:tcp", "::")
@@ -278,7 +284,7 @@ func (r *Raw) open6For(needUDP, needTCP bool) (*raw6, error) {
 		}
 		r.v6.tcp = pc
 		r.wg.Add(1)
-		go r.recvLoop(c, r.eng.handleTCP)
+		go r.recvLoop(c, false, r.eng.handleTCP)
 	}
 	if needUDP && r.v6.udp == nil {
 		c, err := listen("ip6:udp", "::")
@@ -298,14 +304,31 @@ func (r *Raw) open6For(needUDP, needTCP bool) (*raw6, error) {
 	return r.v6, nil
 }
 
-// recvLoop feeds every message received on c to handle.
-func (r *Raw) recvLoop(c *net.IPConn, handle func(netip.Addr, []byte, time.Time)) {
+// maxKernelLag bounds how much earlier than its user-space read a kernel
+// receive timestamp may be. Anything outside 0..maxKernelLag means the wall
+// clock stepped in between, and the user-space time is used instead.
+const maxKernelLag = 100 * time.Millisecond
+
+// recvLoop feeds every message received on c to handle. IPv4 raw sockets
+// deliver the IP header (ReadMsgIP, unlike ReadFrom, does not strip it), so
+// it is removed here; IPv6 raw sockets never include it.
+//
+// RTTs are measured on the monotonic clock. When the kernel timestamps
+// packets on arrival (SO_TIMESTAMPNS), the receive time is moved back by the
+// time the packet waited before this loop read it, so RTTs exclude Go
+// scheduling delay. The kernel stamp is wall-clock time; only the lag between
+// two wall-clock readings taken microseconds apart is used, never the stamp
+// itself.
+func (r *Raw) recvLoop(c *net.IPConn, ipv4Header bool, handle func(netip.Addr, []byte, time.Time)) {
 	defer r.wg.Done()
+	stamped := enableRxTimestamps(c)
+	if !stamped {
+		r.log.Debug("kernel receive timestamps unavailable; RTTs include scheduling delay")
+	}
 	buf := make([]byte, 1500) // ICMP errors are at most 576 (v4) / 1280 (v6) bytes
+	oob := make([]byte, 128)
 	for {
-		// For IPv4 the Go runtime strips the IP header; IPv6 raw sockets
-		// never include it.
-		n, from, err := c.ReadFromIP(buf)
+		n, oobn, _, from, err := c.ReadMsgIP(buf, oob)
 		at := time.Now()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -319,8 +342,72 @@ func (r *Raw) recvLoop(c *net.IPConn, handle func(netip.Addr, []byte, time.Time)
 		if !ok {
 			continue
 		}
-		handle(addr.WithZone(from.Zone), buf[:n], at)
+		if stamped {
+			if k, ok := kernelRxTime(oob[:oobn]); ok {
+				if lag := at.Sub(k); lag >= 0 && lag <= maxKernelLag {
+					at = at.Add(-lag) // keeps at's monotonic reading
+					r.kernelStamped.Add(1)
+				}
+			}
+		}
+		msg := buf[:n]
+		if ipv4Header {
+			msg = stripIPv4Header(msg)
+		}
+		handle(addr.WithZone(from.Zone), msg, at)
 	}
+}
+
+func enableRxTimestamps(c *net.IPConn) bool {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var serr error
+	if err := rc.Control(func(fd uintptr) {
+		serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_TIMESTAMPNS, 1)
+	}); err != nil {
+		return false
+	}
+	return serr == nil
+}
+
+// kernelRxTime extracts an SCM_TIMESTAMPNS timestamp from ancillary data.
+func kernelRxTime(oob []byte) (time.Time, bool) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, m := range msgs {
+		if m.Header.Level != syscall.SOL_SOCKET || m.Header.Type != syscall.SCM_TIMESTAMPNS {
+			continue
+		}
+		// struct timespec: two longs.
+		if strconv.IntSize == 64 && len(m.Data) >= 16 {
+			sec := int64(binary.NativeEndian.Uint64(m.Data[0:]))  //nolint:gosec // kernel time_t
+			nsec := int64(binary.NativeEndian.Uint64(m.Data[8:])) //nolint:gosec // 0..999999999
+			return time.Unix(sec, nsec), true
+		}
+		if strconv.IntSize == 32 && len(m.Data) >= 8 {
+			sec := int32(binary.NativeEndian.Uint32(m.Data[0:]))  //nolint:gosec // kernel time_t
+			nsec := int32(binary.NativeEndian.Uint32(m.Data[4:])) //nolint:gosec // 0..999999999
+			return time.Unix(int64(sec), int64(nsec)), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// stripIPv4Header returns the payload of an IPv4 packet, or b unchanged if
+// it does not start with a plausible IPv4 header.
+func stripIPv4Header(b []byte) []byte {
+	if len(b) < ipv4HeaderLen || b[0]>>4 != 4 {
+		return b
+	}
+	ihl := int(b[0]&0x0f) * 4
+	if ihl < ipv4HeaderLen || ihl > len(b) {
+		return b
+	}
+	return b[ihl:]
 }
 
 func isNoRoute(err error) bool {

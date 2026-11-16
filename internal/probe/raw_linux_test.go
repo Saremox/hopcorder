@@ -125,6 +125,9 @@ func TestRawLoopback(t *testing.T) {
 			}
 		})
 	}
+	if r.kernelStamped.Load() == 0 {
+		t.Error("no reply carried a kernel receive timestamp")
+	}
 }
 
 // closedTCPPort returns a local TCP port nothing listens on.
