@@ -170,23 +170,32 @@ func fakeNetwork() *probe.Fake {
 	return f
 }
 
+// startDaemon runs the agent daemon until stop is called or the test ends:
+// stop is also a cleanup, so a test that fails early cannot leave a daemon
+// running into the next test (which would race on package state such as
+// shutdownGrace).
 func startDaemon(t *testing.T, cfg *config.Config, f *probe.Fake) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	logger := slog.New(slog.DiscardHandler)
 	go func() { done <- runDaemon(ctx, cfg, f, logger) }()
-	return func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("runDaemon: %v", err)
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("runDaemon: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("daemon did not shut down")
 			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("daemon did not shut down")
-		}
+		})
 	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func getMetrics(t *testing.T, addr string) string {
@@ -219,10 +228,10 @@ func TestOutageAndRecovery(t *testing.T) {
 	cfg := daemonConfig(t, dir+"/spool", srv.URL, metricsAddr, tokenFile)
 
 	stop := startDaemon(t, cfg, fakeNetwork())
-	time.Sleep(400 * time.Millisecond)
-	if u, _, _ := ingest.snapshot(); u == 0 {
-		t.Fatal("nothing delivered while the endpoint was up")
-	}
+	waitFor(t, 10*time.Second, func() bool {
+		u, _, _ := ingest.snapshot()
+		return u > 0
+	}, "a delivery while the endpoint was up")
 
 	ingest.mode.Store("reset") // the network dies
 	time.Sleep(600 * time.Millisecond)
