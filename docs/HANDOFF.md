@@ -712,7 +712,10 @@ added in the commit that introduced it.
   `grafana` builds and starts the compose stack, sends records through the
   server's ingest API, and runs every query through Grafana's
   `/api/ds/query` with the real plugin (`grafana` tag).
-- **Not verified in the development container**: the plugin cannot be
-  installed there (grafana.com is unreachable), so Grafana's side was first
-  exercised by the CI job. How the panels look has not been reviewed by a
-  person yet.
+- **Verified in CI only**: the development container cannot install the
+  plugin (grafana.com is unreachable), so Grafana's side is checked by the
+  `grafana` job alone. Its first run installed plugin 4.23.5, passed the data
+  source health check, and all 17 queries returned rows. The rest of the
+  stack also ran in the development container: provisioning loaded, and the
+  agent traced and shipped through the server to ClickHouse. How the panels
+  look has not been reviewed by a person yet.
