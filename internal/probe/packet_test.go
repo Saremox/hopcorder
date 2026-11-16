@@ -41,6 +41,8 @@ func TestBuildGolden(t *testing.T) {
 		{"udp4 checksum 0x1234", buildUDP(src4, dst4, 33434, 33434, 0x1234), "829a829a00141234dd75686f70636f7264657200"},
 		{"udp6 checksum 0xabcd", buildUDP(src6, dst6, 33434, 33435, 0xabcd), "829a829b0014abcdd4a2686f70636f7264657200"},
 		{"ipv4 header", buildIPv4(src4, dst4, protoUDP, 5, 0x1234, 20), "45000028123400000511b755c0000201c6336407"},
+		{"tcp4 syn id 7", buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(7)), "829a01bb00070000000000006002faf02c9d0000020405b4"},
+		{"tcp6 syn id 0xabcd", buildTCPSyn(src6, dst6, 33434, 443, tcpSeq(0xabcd)), "829a01bbabcd0000000000006002faf0119e0000020405b4"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,7 +151,7 @@ func TestParseICMPv4(t *testing.T) {
 		{"redirect ignored", router, "0501 0000 c0000201" + "45000028 00010000 0101 0000 c0000201 c6336407 0800 56ba 829a 0001", icmpReply{}, errIgnored},
 		{"reassembly timeout ignored", router, "0b01 0000 00000000" + "45000028 00010000 0101 0000 c0000201 c6336407 0800 56ba 829a 0001", icmpReply{}, errIgnored},
 		{"quoted echo reply is not ours", router, "0b00 0000 00000000" + "45000028 00010000 0101 0000 c0000201 c6336407 0000 56ba 829a 0001", icmpReply{}, errIgnored},
-		{"quoted tcp unsupported", router, "0b00 0000 00000000" + "45000028 00010000 0106 0000 c0000201 c6336407 829a 0050 00000001", icmpReply{}, errIgnored},
+		{"quoted sctp unsupported", router, "0b00 0000 00000000" + "45000028 00010000 0184 0000 c0000201 c6336407 829a 0050 00000001", icmpReply{}, errIgnored},
 		{"quoted non-first fragment", router, "0b00 0000 00000000" + "45000028 00010010 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errIgnored},
 		{"quoted ipv6 in icmpv4", router, "0b00 0000 00000000" + "65000028 00010000 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errMalformed},
 		{"quoted ihl too small", router, "0b00 0000 00000000" + "44000028 00010000 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errMalformed},
@@ -256,5 +258,56 @@ func FuzzParseICMP(f *testing.F) {
 	f.Fuzz(func(_ *testing.T, b []byte) {
 		_, _ = parseICMPv4(dst4, b)
 		_, _ = parseICMPv6(dst6, b)
+		_, _ = parseTCP(dst4, b)
 	})
+}
+
+func TestParseTCP(t *testing.T) {
+	tests := []struct {
+		name string
+		seg  string
+		want icmpReply
+		err  error
+	}{
+		// 443 -> 33434, seq 0x11111111, ack 0x00070001 (probe id 7 + 1), SYN|ACK.
+		{"syn-ack", "01bb829a 11111111 00070001 5012 ffff 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"rst-ack", "01bb829a 00000000 00070001 5014 0000 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"ack wraps into the id", "01bb829a 00000000 00080000 5014 0000 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"incoming syn ignored", "01bb829a 11111111 00000000 5002 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"plain ack ignored", "01bb829a 11111111 00070001 5010 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"rst without ack ignored", "01bb829a 11111111 00000000 5004 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"data offset too small", "01bb829a 11111111 00070001 4012 ffff 0000 0000", icmpReply{}, errMalformed},
+		{"data offset past end", "01bb829a 11111111 00070001 6012 ffff 0000 0000", icmpReply{}, errMalformed},
+		{"truncated", "01bb829a 11111111 0007", icmpReply{}, errTruncated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseTCP(dst4, unhex(t, tt.seg))
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("err = %v, want %v", err, tt.err)
+			}
+			if tt.err == nil && got != tt.want {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuotedTCPKey(t *testing.T) {
+	syn := buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(0x1234))
+	msg := append(unhex(t, "0b00 0000 00000000"), buildIPv4(src4, dst4, protoTCP, 1, 1, len(syn))...)
+	msg = append(msg, syn[:8]...)
+	r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 0x1234}); r.kind != kindTimeExceeded || r.key != want {
+		t.Errorf("got %+v, want key %+v", r, want)
+	}
+	if s := verifySum(src4, dst4, protoTCP, syn); s != 0xffff {
+		t.Errorf("syn checksum does not verify (sum %#x)", s)
+	}
 }

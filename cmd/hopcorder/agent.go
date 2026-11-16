@@ -68,7 +68,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&f.timeout, "timeout", 0, "per-probe timeout (default 1s)")
 	fs.IntVar(&f.maxTTL, "max-ttl", 0, "highest TTL probed (default 30)")
 	fs.IntVar(&f.probePast, "probe-past", 0, "TTLs kept beyond the last responding hop of an unreached target (default 2)")
-	fs.StringVar(&f.protocol, "protocol", "", "default probe protocol: icmp or udp (default icmp)")
+	fs.StringVar(&f.protocol, "protocol", "", "default probe protocol: icmp, udp or tcp (default icmp)")
 	fs.BoolVar(&f.paris, "paris", true, "keep the flow identifier constant across TTLs (paris traceroute)")
 	fs.IntVar(&f.af, "af", 0, "address family (4 or 6) for targets given as arguments")
 	fs.StringVar(&f.spoolDir, "spool-dir", "", "spool directory")

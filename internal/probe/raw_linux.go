@@ -31,6 +31,10 @@ const recvBufferBytes = 1 << 20
 //     reply, plus a send-only raw UDP socket (with a drop-all BPF filter so
 //     it never queues incoming UDP). The hop limit and source address are
 //     passed per packet as ancillary data.
+//   - TCP probes additionally need one raw TCP socket per family, because
+//     the destination answers with a TCP SYN-ACK or RST rather than ICMP.
+//     A BPF filter lets only those two through, so ordinary TCP traffic is
+//     never copied to user space. On IPv6 the same socket sends the SYNs.
 //
 // Sockets are opened on first use, so a host without IPv6 works as long as
 // it has no IPv6 targets. Call Check at startup to fail early when raw
@@ -49,12 +53,14 @@ type Raw struct {
 type raw4 struct {
 	send *net.IPConn
 	recv *net.IPConn
+	tcp  *net.IPConn // receives SYN-ACK/RST; nil until the first TCP probe
 }
 
 type raw6 struct {
 	icmpConn *net.IPConn
 	icmp     *ipv6.PacketConn
 	udp      *ipv6.PacketConn // nil until the first IPv6 UDP probe
+	tcp      *ipv6.PacketConn // sends SYNs, receives SYN-ACK/RST; nil until the first IPv6 TCP probe
 }
 
 // NewRaw returns a raw-socket prober. It opens no sockets yet.
@@ -99,11 +105,17 @@ func (r *Raw) Close() error {
 	var errs []error
 	if r.v4 != nil {
 		errs = append(errs, r.v4.send.Close(), r.v4.recv.Close())
+		if r.v4.tcp != nil {
+			errs = append(errs, r.v4.tcp.Close())
+		}
 	}
 	if r.v6 != nil {
 		errs = append(errs, r.v6.icmp.Close())
 		if r.v6.udp != nil {
 			errs = append(errs, r.v6.udp.Close())
+		}
+		if r.v6.tcp != nil {
+			errs = append(errs, r.v6.tcp.Close())
 		}
 	}
 	r.mu.Unlock()
@@ -157,11 +169,77 @@ func (r *Raw) open4() (*raw4, error) {
 	}
 	r.v4 = &raw4{send: send, recv: recv}
 	r.wg.Add(1)
-	go r.recvLoop(recv)
+	go r.recvLoop(recv, r.eng.handle)
 	return r.v4, nil
 }
 
+// TCP answers to SYN probes: ACK set and SYN or RST set. Everything else a
+// raw TCP socket would receive (every inbound segment on the host) is
+// dropped in the kernel.
+var (
+	// IPv4 raw sockets see the packet from the IP header.
+	tcpFilter4 = []bpf.Instruction{
+		bpf.LoadMemShift{Off: 0},           // X = IP header length
+		bpf.LoadIndirect{Off: 13, Size: 1}, // A = TCP flags
+		bpf.JumpIf{Cond: bpf.JumpBitsNotSet, Val: tcpACK, SkipTrue: 2},
+		bpf.JumpIf{Cond: bpf.JumpBitsNotSet, Val: tcpSYN | tcpRST, SkipTrue: 1},
+		bpf.RetConstant{Val: 0xffff},
+		bpf.RetConstant{Val: 0},
+	}
+	// IPv6 raw sockets see the packet from the transport header.
+	tcpFilter6 = []bpf.Instruction{
+		bpf.LoadAbsolute{Off: 13, Size: 1},
+		bpf.JumpIf{Cond: bpf.JumpBitsNotSet, Val: tcpACK, SkipTrue: 2},
+		bpf.JumpIf{Cond: bpf.JumpBitsNotSet, Val: tcpSYN | tcpRST, SkipTrue: 1},
+		bpf.RetConstant{Val: 0xffff},
+		bpf.RetConstant{Val: 0},
+	}
+)
+
+type bpfSetter interface {
+	SetBPF([]bpf.RawInstruction) error
+}
+
+func setFilter(c bpfSetter, prog []bpf.Instruction) error {
+	raw, err := bpf.Assemble(prog)
+	if err != nil {
+		return err
+	}
+	return c.SetBPF(raw)
+}
+
+// open4TCP opens the IPv4 TCP listener (the sockets for sending are shared).
+func (r *Raw) open4TCP() error {
+	if _, err := r.open4(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return errClosed
+	}
+	if r.v4.tcp != nil {
+		return nil
+	}
+	c, err := listen("ip4:tcp", "0.0.0.0")
+	if err != nil {
+		return err
+	}
+	if err := setFilter(ipv4.NewPacketConn(c), tcpFilter4); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("tcp listener filter: %w", err)
+	}
+	r.v4.tcp = c
+	r.wg.Add(1)
+	go r.recvLoop(c, r.eng.handleTCP)
+	return nil
+}
+
 func (r *Raw) open6(needUDP bool) (*raw6, error) {
+	return r.open6For(needUDP, false)
+}
+
+func (r *Raw) open6For(needUDP, needTCP bool) (*raw6, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -186,7 +264,21 @@ func (r *Raw) open6(needUDP bool) (*raw6, error) {
 		}
 		r.v6 = &raw6{icmpConn: c, icmp: pc}
 		r.wg.Add(1)
-		go r.recvLoop(c)
+		go r.recvLoop(c, r.eng.handle)
+	}
+	if needTCP && r.v6.tcp == nil {
+		c, err := listen("ip6:tcp", "::")
+		if err != nil {
+			return nil, err
+		}
+		pc := ipv6.NewPacketConn(c)
+		if err := setFilter(pc, tcpFilter6); err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("tcp listener filter: %w", err)
+		}
+		r.v6.tcp = pc
+		r.wg.Add(1)
+		go r.recvLoop(c, r.eng.handleTCP)
 	}
 	if needUDP && r.v6.udp == nil {
 		c, err := listen("ip6:udp", "::")
@@ -206,8 +298,8 @@ func (r *Raw) open6(needUDP bool) (*raw6, error) {
 	return r.v6, nil
 }
 
-// recvLoop feeds every ICMP message received on c to the engine.
-func (r *Raw) recvLoop(c *net.IPConn) {
+// recvLoop feeds every message received on c to handle.
+func (r *Raw) recvLoop(c *net.IPConn, handle func(netip.Addr, []byte, time.Time)) {
 	defer r.wg.Done()
 	buf := make([]byte, 1500) // ICMP errors are at most 576 (v4) / 1280 (v6) bytes
 	for {
@@ -227,7 +319,7 @@ func (r *Raw) recvLoop(c *net.IPConn) {
 		if !ok {
 			continue
 		}
-		r.eng.handle(addr.WithZone(from.Zone), buf[:n], at)
+		handle(addr.WithZone(from.Zone), buf[:n], at)
 	}
 }
 
@@ -266,16 +358,24 @@ func (r *Raw) send(p *outPacket) error {
 		if s, err = r.open4(); err != nil {
 			return err
 		}
+		if p.proto == protoTCP {
+			if err = r.open4TCP(); err != nil {
+				return err
+			}
+		}
 		pkt := append(buildIPv4(p.src, p.dst, p.proto, p.ttl, p.ipID, len(p.l4)), p.l4...)
 		_, err = s.send.WriteToIP(pkt, &net.IPAddr{IP: p.dst.AsSlice()})
 	} else {
 		var s *raw6
-		if s, err = r.open6(p.proto == protoUDP); err != nil {
+		if s, err = r.open6For(p.proto == protoUDP, p.proto == protoTCP); err != nil {
 			return err
 		}
 		conn := s.icmp
-		if p.proto == protoUDP {
+		switch p.proto {
+		case protoUDP:
 			conn = s.udp
+		case protoTCP:
+			conn = s.tcp
 		}
 		cm := &ipv6.ControlMessage{HopLimit: int(p.ttl)}
 		if !p.src.IsLinkLocalUnicast() {

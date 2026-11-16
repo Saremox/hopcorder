@@ -24,6 +24,7 @@ type Protocol string
 const (
 	ICMP Protocol = "icmp"
 	UDP  Protocol = "udp"
+	TCP  Protocol = "tcp"
 )
 
 // DefaultFlowID is the ICMP identifier / UDP source port used when a target
@@ -35,6 +36,10 @@ const DefaultFlowID = 33434
 // DefaultUDPPort is the UDP destination port when none is configured.
 const DefaultUDPPort = 33434
 
+// DefaultTCPPort is the TCP destination port when none is configured: the
+// port most likely to be let through on the way to a server.
+const DefaultTCPPort = 443
+
 // MaxTTL is the largest TTL a request may ask for.
 const MaxTTL = 255
 
@@ -42,13 +47,14 @@ const MaxTTL = 255
 type TraceRequest struct {
 	Target   netip.Addr
 	Protocol Protocol
-	// Port is the UDP destination port. Ignored for ICMP.
+	// Port is the UDP or TCP destination port. Ignored for ICMP.
 	Port uint16
-	// FlowID is the ICMP identifier (icmp) or UDP source port (udp).
+	// FlowID is the ICMP identifier (icmp) or the source port (udp, tcp).
 	FlowID uint16
 	// Paris keeps every header field that ECMP routers hash on constant
 	// across the TTLs of a cycle. With Paris false, probes vary the ICMP
-	// checksum or UDP destination port per TTL like classic traceroute.
+	// checksum, the UDP destination port or the TCP source port per TTL
+	// like classic traceroute.
 	Paris bool
 	// MinTTL and MaxTTL bound the TTLs probed; MinTTL..MaxTTL are sent at
 	// once. MinTTL 0 means 1. A cycle normally probes from 1; a higher
@@ -67,12 +73,12 @@ func (r TraceRequest) Validate() error {
 	}
 	switch r.Protocol {
 	case ICMP:
-	case UDP:
+	case UDP, TCP:
 		if r.Port == 0 {
-			return errors.New("probe: udp requires a destination port")
+			return fmt.Errorf("probe: %s requires a destination port", r.Protocol)
 		}
 		if r.FlowID == 0 {
-			return errors.New("probe: udp requires a non-zero source port (flow id)")
+			return fmt.Errorf("probe: %s requires a non-zero source port (flow id)", r.Protocol)
 		}
 	default:
 		return fmt.Errorf("probe: unsupported protocol %q", r.Protocol)

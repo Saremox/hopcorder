@@ -160,8 +160,11 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 	probes := make([]*pendingProbe, n)
 
 	fk := flowKey{dst: target, proto: protoUDP, flow: req.FlowID}
-	if req.Protocol == ICMP {
+	switch req.Protocol {
+	case ICMP:
 		fk.proto = protoICMP
+	case TCP:
+		fk.proto = protoTCP
 	}
 	e.mu.Lock()
 	for i := range pkts {
@@ -185,6 +188,16 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 			p.proto = protoUDP
 			p.l4 = buildUDP(src, target, req.FlowID, dport, id)
 			k = probeKey{dst: target, proto: protoUDP, a: req.FlowID, b: dport, c: id}
+		case TCP:
+			// The destination port is the service being reached, so
+			// classic mode walks the source port instead.
+			sport := req.FlowID
+			if !req.Paris {
+				sport += uint16(ttl - 1) //nolint:gosec // wraps like classic traceroute
+			}
+			p.proto = protoTCP
+			p.l4 = buildTCPSyn(src, target, sport, req.Port, tcpSeq(id))
+			k = probeKey{dst: target, proto: protoTCP, a: sport, b: req.Port, c: id}
 		}
 		pkts[i], keys[i] = p, k
 		probes[i] = &pendingProbe{tr: tr, ttl: ttl}
@@ -293,10 +306,21 @@ func (e *engine) handle(from netip.Addr, msg []byte, at time.Time) {
 	} else {
 		r, err = parseICMPv6(from, msg)
 	}
-	if err != nil {
-		return
+	if err == nil {
+		e.resolve(from, r, at)
 	}
+}
 
+// handleTCP processes one received TCP segment (without IP header): the
+// destination's SYN-ACK or RST answering a TCP probe.
+func (e *engine) handleTCP(from netip.Addr, seg []byte, at time.Time) {
+	from = from.Unmap().WithZone("")
+	if r, err := parseTCP(from, seg); err == nil {
+		e.resolve(from, r, at)
+	}
+}
+
+func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p, ok := e.pending[r.key]
@@ -321,13 +345,15 @@ func (e *engine) handle(from netip.Addr, msg []byte, at time.Time) {
 	res := &tr.results[p.ttl-tr.first]
 	res.From, res.RTT = from, rtt
 	switch r.kind {
-	case kindEchoReply:
+	case kindEchoReply, kindTCPReply:
 		res.Status = record.StatusReply
 	case kindTimeExceeded:
 		res.Status = record.StatusTTLExpired
 	case kindUnreachable:
 		portUnreach := (from.Is4() && r.code == icmp4PortUnreach) || (from.Is6() && r.code == icmp6PortUnreach)
-		if tr.req.Protocol == UDP && from == tr.target && portUnreach {
+		// For UDP this is the normal answer; for TCP it is a REJECTing
+		// firewall on the destination itself. Either way it answered.
+		if tr.req.Protocol != ICMP && from == tr.target && portUnreach {
 			res.Status = record.StatusReply
 		} else {
 			res.Status, res.Code = record.StatusUnreachable, int(r.code)
