@@ -361,3 +361,41 @@ added in the commit that introduced it.
   raw ICMPv4 or ICMPv6 code, interpreted per `af`).
 - **`ts`** is the cycle start (first probe sent), UTC, truncated to
   milliseconds.
+- **Probe identification** (§4.2/§4.4): every probe carries a 16-bit probe id
+  from one process-wide counter (1..0xfffe). ICMP puts it in the echo sequence
+  number; in paris mode the first payload word is `^seq`, which keeps the ICMP
+  checksum constant. UDP makes the probe id the **UDP checksum** (paris
+  technique): the first payload word is chosen so the checksum comes out to the
+  id. This works identically for IPv4 and IPv6 (IPv6 has no IP ID) and the
+  checksum is in the 8 quoted bytes. Demux key: (dst, proto, icmp id, seq) or
+  (dst, udp, sport, dport, checksum).
+- **`flow_id`** is the ICMP identifier (icmp) or UDP source port (udp),
+  default 33434, constant across TTLs *and* cycles so paris keeps a target on
+  one ECMP path over time; per-target configurable. Classic mode
+  (`paris: false`) varies the ICMP checksum or walks the UDP destination port.
+- **Sockets** (Linux only; other OSes get a stub that fails clearly): IPv4
+  sends through one `IPPROTO_RAW` (`IP_HDRINCL`) socket, so TTL and IP ID are
+  per packet with no `setsockopt` races between targets; one ICMP socket
+  receives. IPv6 uses one ICMPv6 socket for echo send + all receive and a
+  send-only raw UDP socket (drop-all BPF), with hop limit and source passed
+  as ancillary data. Sockets open lazily per family; `Check()` opens IPv4
+  eagerly at startup to fail fast without `CAP_NET_RAW`.
+- **Timing**: a reply counts only if it arrives within `timeout` of its own
+  probe; a cycle ends when every probe is answered or at last-send + `timeout`
+  + 20ms grace. Keys of unanswered probes are kept as tombstones for 30s, so
+  later replies count as late instead of being mistaken for foreign traffic.
+  No goroutine per probe or per trace: one receive loop per socket.
+- **No route** (`ErrNoRoute`, e.g. uplink down) is not a skipped cycle: the
+  agent records a cycle in which nothing responded, so an outage is visible as
+  data rather than a gap indistinguishable from the agent being down.
+- **Destination answering for UDP** = ICMP port unreachable from the target
+  address. Unreachable from any other address, or with another code, is
+  `unreachable`.
+- **Known limitations**: RTTs use user-space receive timestamps (tens of µs of
+  scheduling noise; kernel `SO_TIMESTAMPNS` is a possible refinement). MPLS
+  label extensions (RFC 4950) are not parsed. All TTLs up to `max_ttl` are
+  probed every cycle; TTLs beyond the destination each draw a reply from it.
+- **Testing**: the demux engine sits behind a small socket interface and is
+  tested in the default run against an in-memory network that answers with
+  real ICMP bytes. The `rawsock` tests build a four-namespace routed topology
+  (veth + `ip netns`) for real TTL expiry, plus a real two-router loop.
