@@ -415,6 +415,9 @@ added in the commit that introduced it.
   (veth + `ip netns`) for real TTL expiry, plus a real two-router loop. The
   loop is made with host routes (`/32`, `/128`) on r2: an IPv6 `/64` added
   with `ip route replace` gets metric 1024 and loses to the connected `/64`.
+  On IPv6, r1 answers the first pass from its agent-facing address and the
+  loop legs from its r1–r2 address (Linux sources ICMPv6 errors from the
+  inbound interface), so the test accepts either.
 - **Spool = bbolt** (§5.2 left the choice open). Why: appending a record,
   bumping `seq` and enforcing the bounds is one ACID, fsynced transaction, and
   so is advancing a cursor and deleting what every output has delivered. A

@@ -120,6 +120,10 @@ next to a running agent.
   destination. Rate limiting does not propagate.
 - **Loops are a floor.** A heavily rate-limited router in a loop answers only
   some cycles, so loop counts undercount.
+- **One router, two addresses.** Routers may source ICMP errors from the
+  interface the packet arrived on (Linux does for IPv6), so a looping router
+  can appear under one address on the first pass and another on the loop
+  legs. Loop detection still finds it, because the loop-leg address repeats.
 - **ECMP.** In paris mode a target is pinned to one ECMP member; other flows
   (including your real traffic) may take other members. Compare with
   `paris: false` or a second `flow_id` if you suspect a single bad member.
