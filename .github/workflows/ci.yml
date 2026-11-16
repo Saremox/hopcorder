@@ -18,7 +18,7 @@ jobs:
       - name: vet
         run: |
           go vet ./...
-          go vet -tags rawsock ./...
+          go vet -tags rawsock,clickhouse ./...
       - name: test
         run: go test -race ./...
       - name: build
@@ -34,6 +34,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
+          args: --build-tags=rawsock,clickhouse
 
   rawsock:
     # GitHub-hosted runners grant passwordless sudo, so the raw-socket tests can
@@ -48,3 +49,27 @@ jobs:
         run: go test -c -tags rawsock -race -o probe.test ./internal/probe
       - name: run with capabilities
         run: sudo ./probe.test -test.v -test.count=1
+
+  clickhouse:
+    # Server tests against a real ClickHouse: migrations, every query, and
+    # the agent -> server -> ClickHouse path.
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: test against ClickHouse
+        env:
+          HOPCORDER_CLICKHOUSE_URL: http://127.0.0.1:8123
+        run: go test -tags clickhouse -race -count=1 ./internal/server/... ./cmd/hopcorder/...

@@ -11,8 +11,9 @@ limiting on routers and shows 80–97% "loss" on hops that forward traffic fine.
 hopcorder sends **one probe per TTL per cycle, all TTLs in parallel**, and
 writes one record per cycle with the responding address at every TTL.
 
-Status: milestone 1 (agent). The ingest server (ClickHouse), Grafana dashboards
-and a topology UI are planned; see [`docs/HANDOFF.md`](docs/HANDOFF.md).
+Status: milestone 2. The agent and the ingest server (ClickHouse) are done;
+Grafana dashboards and a topology UI are planned. See
+[`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Install
 
@@ -266,6 +267,56 @@ hop addresses.
 - **Spool disk use** tracks the high-water mark of `max_bytes` plus database
   overhead; the file reuses free space but does not shrink.
 
+## Server
+
+`hopcorder server` receives the agents' batches and stores them in
+ClickHouse. It needs no privileges and no ClickHouse client library: it talks
+to ClickHouse's HTTP interface, creates the database and applies migrations on
+startup, and retries until ClickHouse is reachable (`/readyz` and ingest
+answer 503 meanwhile; agents keep spooling).
+
+```bash
+hopcorder server --clickhouse-url http://127.0.0.1:8123
+```
+
+Point agents at it with `outputs.http.url`. For production use
+[`deploy/server.example.yaml`](deploy/server.example.yaml) and
+[`deploy/hopcorder-server.service`](deploy/hopcorder-server.service).
+hopcorder does **no authentication**: it listens on localhost by default; put a
+reverse proxy in front and secure the path prefixes separately.
+
+| Path | For | |
+| --- | --- | --- |
+| `POST /api/v1/ingest` | agents | zstd/gzip/plain NDJSON of wire records |
+| `GET /api/v1/query/targets` | readers | streams seen, with last state and reach ratio |
+| `GET /api/v1/query/cycles` | readers | full cycles with enriched hops (`agent`, `target` required) |
+| `GET /api/v1/query/path-changes` | readers | route changes with the TTLs and addresses that changed |
+| `GET /api/v1/query/loops` | readers | looping addresses per cycle |
+| `GET /api/v1/query/outages` | readers | reachability-loss windows (open ones have `end_ts: null`) |
+| `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
+
+Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
+ms; default the last 24h), `limit` (default 1000, max 10000).
+
+**Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
+batch is stored once. Invalid records are rejected for good and reported in the
+response (`{"accepted", "duplicates", "rejected", "errors"}`); a storage
+failure returns 503 and the agent retries. Agents must never reuse seqs: if you
+wipe an agent's spool, also change its `agent_id`, or its new records are
+dropped as duplicates (the server logs a warning).
+
+**Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
+the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on
+disk (or a file you maintain), and its reverse DNS name, resolved in the
+background so ingest never waits on DNS.
+
+**Tables** (database `hopcorder`): `cycles` (one row per cycle, hops as Nested
+columns), `hops` (one row per hop per cycle, the table to query for latency
+and loss), `loop_events`, `path_changes` and `outages` (both
+`ReplacingMergeTree`: query them with `FINAL`), `agent_seq`. Route changes use
+the same rule as the agent's metric: silent hops match anything, so a
+rate-limited router flickering does not count.
+
 ## Development
 
 ```bash
@@ -290,6 +341,16 @@ sudo setcap cap_net_raw+ep probe.test
 Run as root (or with `CAP_SYS_ADMIN`) and with iproute2 installed, they also
 build a four-namespace routed topology to check real TTL expiry and a real
 routing loop.
+
+Server tests against a real ClickHouse live behind the `clickhouse` build tag:
+
+```bash
+docker run -d --network host -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
+```
+
+```bash
+HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123 go test -tags clickhouse ./internal/server/... ./cmd/hopcorder/...
+```
 
 ## License
 

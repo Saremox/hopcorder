@@ -3,7 +3,7 @@
 // Usage:
 //
 //	hopcorder agent [flags] [target ...]
-//	hopcorder server            (milestone 2)
+//	hopcorder server [flags]
 //	hopcorder version
 package main
 
@@ -30,8 +30,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "agent":
 		return runAgent(args[1:], stdout, stderr)
 	case "server":
-		fmt.Fprintln(stderr, "hopcorder server: not implemented yet (milestone 2)")
-		return 1
+		return runServer(args[1:], stderr)
 	case "version", "-version", "--version":
 		fmt.Fprintln(stdout, "hopcorder", versionString())
 		return 0
@@ -50,10 +49,10 @@ func usage(w io.Writer) {
 
 Usage:
   hopcorder agent [flags] [target ...]   run the probing agent
-  hopcorder server                       run the ingest server (not yet implemented)
+  hopcorder server [flags]               run the ingest server (ClickHouse)
   hopcorder version                      print version information
 
-Run "hopcorder agent -h" for agent flags.
+Run "hopcorder agent -h" or "hopcorder server -h" for flags.
 `)
 }
 
