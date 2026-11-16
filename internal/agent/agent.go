@@ -249,8 +249,9 @@ func (r *runner) address(ctx context.Context, now time.Time) (netip.Addr, error)
 		if stale && !r.resolving {
 			r.resolving = true
 			r.bg.Go(func() {
-				// Detached from the cycle; bounded by its own timeout.
-				rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.resolveTimeout())
+				// Runs beside the cycles, bounded by its own timeout, and
+				// abandoned at shutdown so a dead resolver cannot delay it.
+				rctx, cancel := context.WithTimeout(ctx, r.resolveTimeout())
 				defer cancel()
 				_, _ = r.resolve(rctx)
 			})
@@ -289,6 +290,9 @@ func (r *runner) resolve(ctx context.Context) (netip.Addr, error) {
 	defer r.mu.Unlock()
 	r.resolving = false
 	if err != nil {
+		if r.ip.IsValid() && ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled) {
+			return r.ip, nil // shutting down; not a resolver failure
+		}
 		if r.ip.IsValid() {
 			r.a.opts.Observer.ResolveFailed(r.t)
 			r.log.Warn("re-resolving target failed; keeping previous address", "ip", r.ip, "err", err)
