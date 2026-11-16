@@ -1,6 +1,13 @@
 # Keeps pinned dependencies current: GitHub Actions (pinned to commits), the
-# Go base image (pinned by digest), Go modules and the UI's npm packages.
-# Minor and patch updates are grouped into one PR per ecosystem and week.
+# Go base image (pinned by digest), Go modules, the UI's npm packages and the
+# images of the docker-compose try-out stack. Minor and patch updates are
+# grouped into one PR per ecosystem and week.
+#
+# Not covered, updated by hand: go.mod's toolchain line (it must name the Go
+# release of the Dockerfile's image, which ci checks, so an update of that
+# image needs it too), the BuildKit image in images.yml (driver-opts), the
+# tool versions given to actions (golangci-lint, helm) and govulncheck in
+# ci.yml, and ClickHouse (below).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -21,3 +28,13 @@ updates:
     schedule: {interval: weekly}
     groups:
       ui: {update-types: [minor, patch]}
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule: {interval: weekly}
+    groups:
+      compose: {update-types: [minor, patch]}
+    ignore:
+      # 25.8 is the LTS line every test runs against (ci.yml's services,
+      # deploy/helm/ci); its tag follows the line's patch releases. Moving to
+      # another line is a decision for all of them at once.
+      - dependency-name: clickhouse/clickhouse-server

@@ -27,7 +27,9 @@ hostNetwork: false
 server:
   url: http://hopcorder-server:8080
   # Credentials for your ingress, from existing Secrets (the chart refuses
-  # inline credentials in config: they would land in a ConfigMap).
+  # inline credentials in config, credential-like headers such as
+  # Authorization, Cookie or X-Api-Key included: they would land in a
+  # ConfigMap).
   bearerTokenSecret:
     name: ""
     key: token

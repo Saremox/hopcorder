@@ -1,4 +1,7 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- if not .Values.networkPolicy.from }}
+{{- fail "networkPolicy.from: list who may connect (the agents' namespace, the ingress controller, Prometheus), e.g. by kubernetes.io/metadata.name; see the chart's values.yaml" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -9,6 +9,16 @@
 set -euo pipefail
 version=${1:?usage: release-build.sh <version without the leading v>}
 cd "$(dirname "$0")/.."
+
+# Releases are built with go.mod's toolchain (the Go release of the images,
+# with its security fixes), not whatever Go happens to be installed.
+want=$(sed -n 's/^toolchain //p' go.mod)
+have=$(go env GOVERSION)
+if [ -z "$want" ] || [ "$have" != "$want" ]; then
+  echo "release-build: building with $have, go.mod's toolchain is ${want:-missing}" >&2
+  exit 1
+fi
+
 rm -rf dist build
 mkdir -p dist build
 

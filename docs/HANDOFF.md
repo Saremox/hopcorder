@@ -388,6 +388,9 @@ added in the commit that introduced it.
 
 - **Go version**: `go 1.27.0` in `go.mod` (latest stable at the time; current
   `golang.org/x/net` already requires 1.26).
+  Since round two of the security review also `toolchain go1.27.4`: the Go
+  release that builds the binaries and the images (CI keeps the line and the
+  Dockerfile's `golang:<version>` tag equal).
 - **CLI**: standard library `flag` with a hand-rolled subcommand switch; no CLI
   library.
 - **Path end on `unreachable`** (extends §3.2): the path also ends at the lowest
@@ -810,17 +813,21 @@ added in the commit that introduced it.
   after the security review): a namespace of its own. The server runs as uid
   65532 and fits `restricted`.
 - **Publishing** (`images.yml`): pull requests build both images without
-  pushing; `main` pushes `:main` and `:sha-<commit>`; `v*` tags push
-  `:<version>`, `:<major>.<minor>` and `:latest`, and package the charts with
-  that version and appVersion into `oci://ghcr.io/saremox/charts`. Charts
-  default to their appVersion as the image tag, so a chart runs the images of
-  its own release.
-- **Releases**: after the images and charts of a `v*` tag are published, the
-  `release` job creates the GitHub release: static Linux binaries (amd64,
+  pushing; `main` pushes `:main` and `:sha-<commit>` (built with the GitHub
+  Actions layer cache). A `v*` tag that passes `verify-tag` is built without
+  caches and pushed as `:sha-<full commit>` only; the `publish` job, in the
+  `release` environment, then adds `:<version>`, `:<major>.<minor>` and
+  `:latest` (a pre-release only `:<version>`) and pushes the charts with
+  that version and appVersion to `oci://ghcr.io/saremox/charts`. Charts
+  default to their appVersion as the image tag, so a chart runs the images
+  of its own release.
+- **Releases**: `release-assets` builds the static Linux binaries (amd64,
   arm64; with the license, README, example configs and systemd units), the
   chart packages and `SHA256SUMS`, with the tag's section of `CHANGELOG.md`
-  as the notes (the job fails without one). On pull requests and `main` the
-  job builds and packages everything as a dry run. The binaries carry the
+  as the notes (it fails without one), using
+  `scripts/release-build.sh` with go.mod's toolchain. On pull requests and
+  `main` that is a dry run; for a tag the files go to `publish`, which
+  creates the GitHub release from them. The binaries and images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -955,20 +962,21 @@ fixes. The decisions:
   and the UI's npm packages current (weekly, minor and patch grouped).
 - **Write tokens only where they are used**: pull requests build images and
   release assets in jobs without write permissions (`image-check`,
-  `release-check`); `packages: write` is only on the push job for main and
-  tags, `contents: write` only on the tag's release job. No checkout keeps
-  its credentials (`persist-credentials: false`). Release builds use no
-  caches (no Go module or build cache, no Docker layer cache), so nothing
-  another run wrote ends up in a release. The registry token is passed in an
+  `release-assets`); `packages: write` is only on the `image` job (main, and
+  the `:sha-` push of a tag) and on `publish`, `contents: write` only on
+  `publish`, which builds nothing (round two). No checkout keeps its
+  credentials (`persist-credentials: false`). Release builds use no caches
+  (no Go module or build cache, no Docker layer cache), so nothing another
+  run wrote ends up in a release. The registry token is passed in an
   environment variable.
-- **Releases**: a `v*` tag is only built if its commit is on main
-  (`verify-tag`), and the chart and release jobs run in the `release`
-  environment, where required reviewers can be added. The release build is
+- **Releases**: a `v*` tag is checked by `scripts/release-verify.sh` (see
+  round two) before anything is built, and published only by the `publish`
+  job in the `release` environment. The release build is
   `scripts/release-build.sh`, shared with the dry run.
 - **When workflows run**: `ci` runs on pull requests, on main and by hand,
   not on every branch push (a pull request's branch ran everything twice,
-  once per event) and not on tags (a release tag is a commit of main, which
-  it ran on). A new commit on a pull request cancels the older runs of both
+  once per event) and not on tags (a release tag must be a commit of main
+  whose ci run succeeded, which `verify-tag` checks). A new commit on a pull request cancels the older runs of both
   workflows. `images` runs one at a time per ref: two merges in a row would
   otherwise race to push, and whichever finished last would own `:main`. A
   run still waiting is replaced by a newer one, so that commit gets no
@@ -983,9 +991,10 @@ fixes. The decisions:
   environment.
 - **Exposure in the docs**: the server's `docker run` example and the
   development ClickHouse publish on 127.0.0.1 only (the ClickHouse one had
-  host networking with a passwordless default user).
-- **Helm**: the server chart gets an optional NetworkPolicy (off by default:
-  turning it on without listing the ingress controller would cut it off);
+  host networking with a passwordless default user); since round two the
+  development ClickHouse also needs a password).
+- **Helm**: the server chart gets an optional NetworkPolicy (off by default;
+  enabling it requires `networkPolicy.from`, round two);
   neither chart mounts a service-account token; the agent chart takes basic
   auth and TLS material from Secrets and refuses inline credentials (they
   would land in a ConfigMap, readable with the built-in `view` role); its
@@ -1213,3 +1222,134 @@ decisions:
   rows of the spoofed seqs can be deleted the same way). Deleting only the
   `agent_seq` row would reset the mark to 0, and the agent's retries of
   stored batches would be stored again.
+
+**CI, release and deployment**
+- **Releases are published only after the `release` environment.** A
+  tag's images used to be pushed as `:<version>`, `:<major>.<minor>` and
+  `:latest` by the `image` job, which had no environment. Anyone who could
+  push a `v*` tag could therefore publish any commit of main without
+  approval, an old one before the fixes included, or replace the images of
+  an existing version. Now:
+  - `verify-tag` runs `scripts/release-verify.sh --wait-for-ci` before
+    anything of the tag is built. It checks that the tag is
+    `v<major>.<minor>.<patch>[-<pre-release>]`, points at the commit the run
+    builds, and that commit is on main. It checks that the `ci` workflow
+    succeeded on that commit, on main or run by hand; it waits up to 25
+    minutes for a run still in progress, and a pull request's run does not
+    count because it tested a merge commit. No release of the tag may exist
+    yet, drafts included. The latest release must be older: its commit an
+    ancestor, its version lower.
+  - The `image` job then builds the tag without caches and pushes only
+    `:sha-<full commit>`. That is the long form, so it never overwrites the
+    `:sha-<short>` of main's build of the same commit, which used the
+    cache and prints `main`. It hands its digests to `publish` as job
+    outputs.
+  - `release-assets` (no write token, no caches) builds the binaries, chart
+    packages, `SHA256SUMS` and notes and uploads them as an artifact. On
+    pull requests and main it is the dry run.
+  - `publish` is the only job in the `release` environment and builds
+    nothing. It runs the same checks again without waiting, because a
+    release may have appeared during the approval. It then tags the image
+    digests with `docker buildx imagetools create` (a pre-release gets only
+    `:<version>`), pushes the chart packages that are attached to the
+    release, and creates the GitHub release (`--prerelease` for
+    pre-releases).
+  - One approval covers all of it, and `publish` runs one at a time across
+    tags, so two approved tags cannot both pass the checks.
+  - A version is released once. To fix a release, release the next version
+    (or delete the release, and its tag, by hand).
+- **One Go release for binaries and images.**
+  - `go.mod` has `toolchain go1.27.4`. The release binaries and CI used to
+    build with Go 1.27.0, because setup-go installs the version from the
+    `go` line when there is no toolchain line (`parseGoVersionFile`,
+    checked in setup-go v7.0.0). The images built with the Go image's
+    1.27.4.
+  - The Dockerfile's image is now `golang:1.27.4@sha256:…`, so its tag names
+    the release. ci's `test` job checks that the toolchain line, the
+    Dockerfile tag and the installed Go agree. A Dependabot update of the
+    image therefore needs the toolchain line in the same pull request;
+    Dependabot does not update that line.
+  - `scripts/release-build.sh` refuses to build with any other Go.
+  - The `go` line stays `1.27.0`: it is the minimum for `go install`.
+    Locally, `GOTOOLCHAIN=auto` switches to the toolchain line.
+- **govulncheck** runs in ci (`vuln` job): pinned v1.9.0 via `go run`, which
+  leaves `go.mod` alone, under the toolchain line's Go. It fails on known
+  vulnerabilities in the modules or the standard library. Updated by hand.
+- **No moving images in the build.**
+  - The Dockerfile has no `# syntax=` line. That line made every build pull
+    `docker/dockerfile:1` by tag and run it as the frontend; now the
+    builder's own frontend is used, and it supports `RUN --mount`.
+  - setup-buildx runs BuildKit pinned by digest in `driver-opts`
+    (`moby/buildkit:v0.34.2@sha256:…`, until now the moving
+    `buildx-stable-1`). The pin is updated by hand: Dependabot does not read
+    `driver-opts`.
+- **Dependabot** also covers the compose stack (`docker-compose` ecosystem,
+  `/deploy`), but not ClickHouse. 25.8 is the LTS line every test uses
+  (ci.yml's services, deploy/helm/ci, compose), and its tag follows that
+  line's patch releases; moving to another line is a decision for all of
+  them at once. The CI service images, tool versions given to actions
+  (golangci-lint, helm) and govulncheck are also updated by hand.
+- **Server chart: the server's ingest limits.** `values.yaml` had set
+  `max_body_bytes` 64 MiB and `max_decoded_bytes` 512 MiB, written before
+  the review lowered the defaults. A request holds up to about twice its
+  decompressed size while it is parsed (measured: 255 MiB of NDJSON held
+  507 MiB of records). So one 119 KiB zstd body that expands to 512 MiB
+  went past the pod's 1 GiB limit. The block is gone: the defaults apply,
+  with a comment to raise the memory limit together with
+  `max_decoded_bytes × max_concurrent`.
+- **No credentials in ConfigMaps.**
+  - The agent chart's check used to catch only a header named exactly
+    `Authorization`. It now compares header names in any case and refuses
+    `Authorization`, `Proxy-Authorization`, `Cookie` and any name with a
+    `-`/`_`-separated part such as key, api-key, token, secret, password,
+    pass, auth, credential(s), session or signature (`X-Api-Key`,
+    `X-Auth-Token`, `Private-Token`, …). It also refuses credentials in
+    `server.url`; the agent refuses them at startup anyway.
+  - There is no Secret-backed way to set headers, because the agent has no
+    header-from-file option. Header-based ingress auth therefore needs
+    bearer or basic auth or mTLS instead.
+  - The server chart refuses `config.clickhouse.password`; use
+    `clickhouse.passwordSecret`.
+  - ci's helm job checks each refusal.
+- **NetworkPolicy without self-assigned labels.** The default `from` let
+  in pods labelled `app.kubernetes.io/name: hopcorder-agent` in any
+  namespace, a label anyone who may create a pod can set. `from` now
+  defaults to `[]`, and the chart fails when the policy is enabled
+  without peers. `values.yaml` has an example that selects peers by
+  `kubernetes.io/metadata.name`, which Kubernetes sets and namespace users
+  cannot change. ci lints the policy with `deploy/helm/ci/server-netpol-values.yaml`.
+- **Secrets under systemd.**
+  - The example configs used to advise inline secrets "then keep this file
+    unreadable to others", and put the mTLS key in
+    `/etc/hopcorder/client.key`. The shipped units run as a dynamic user,
+    which reads only world-readable files, so following that advice made
+    the secret readable by every local user.
+  - The examples and units now take every secret, the client key included,
+    as a credential (`LoadCredential=`, `/run/credentials/<unit>/<name>`).
+    systemd reads credentials when the unit starts, so the unit must be
+    restarted after a change.
+- **Development ClickHouse with a password.** Binding to 127.0.0.1 does not
+  stop a web page in the developer's browser. ClickHouse 25.8 answers a
+  plain-text POST from any origin with `Access-Control-Allow-Origin: *`
+  (confirmed), so a page could run SQL as the passwordless `default` user
+  and read the result.
+  - The Makefile and README now start the test ClickHouse with a random
+    `CLICKHOUSE_PASSWORD`. `make clickhouse` passes
+    `HOPCORDER_CLICKHOUSE_URL`, `_USER` (default `default`) and `_PASSWORD`
+    to both packages' tests (the cmd/hopcorder end-to-end test now reads
+    them too).
+  - CI keeps its passwordless service: runners are single-use and the
+    browser tests only load hopcorder's UI.
+- **Docs**: install instructions, `docker run` examples and chart versions
+  point at 0.1.1. v0.1.0 was withdrawn: its tag and release are deleted, and
+  it predated both reviews. The `docker run` examples use the release
+  image, not `:main`, which is built with the shared Actions cache. Chart
+  version and appVersion in `Chart.yaml` are 0.1.1, so installs from a
+  checkout run 0.1.1 images too.
+- **Still to do in the repository settings**:
+  - Add required reviewers to the `release` environment; until then
+    `publish` runs without approval, though after all the checks.
+  - Restrict it to `v*` tags (deployment tag policy).
+  - Enforce the main ruleset with `ci` as a required check.
+  - Add a tag ruleset for `v*`.
+  - Optionally turn on immutable releases.

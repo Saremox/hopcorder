@@ -11,7 +11,9 @@ fullnameOverride: ""
 
 # The server's configuration file (see deploy/server.example.yaml for every
 # key; unknown keys are rejected). The chart sets listen, the ASN cache file
-# and, with clickhouse.passwordSecret, clickhouse.password_file.
+# and, with clickhouse.passwordSecret, clickhouse.password_file; it refuses
+# clickhouse.password (it would land in a ConfigMap, readable with the
+# built-in view role).
 config:
   log:
     level: info
@@ -22,9 +24,12 @@ config:
     user: default
     timeout: 30s
     retention_days: 90        # 0 keeps data forever
-  ingest:
-    max_body_bytes: 64MiB
-    max_decoded_bytes: 512MiB
+  # ingest: the server's defaults (deploy/server.example.yaml) fit
+  # resources.limits.memory below. A request holds up to about twice its
+  # decompressed size in memory while it is processed, so raise the memory
+  # limit with max_decoded_bytes x max_concurrent, e.g.
+  #   max_decoded_bytes: 32MiB
+  #   max_concurrent: 4
   enrich:
     rdns:
       enabled: true
@@ -72,20 +77,32 @@ ingress:
 # Who may connect to the server. Clients inside the cluster reach the
 # Service directly, around whatever authentication the ingress does; with a
 # CNI that enforces NetworkPolicy, this limits them to the peers listed in
-# `from` (NetworkPolicy "from" entries).
+# `from` (NetworkPolicy "from" entries), which must then not be empty.
+# Select peers by namespace: Kubernetes sets kubernetes.io/metadata.name to
+# the namespace's name, and no one can change it, while anyone who may create
+# a pod in some namespace can give it any pod label. For example:
+#   from:
+#     # the agents, in their own namespace
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: hopcorder-agent
+#       podSelector:
+#         matchLabels:
+#           app.kubernetes.io/name: hopcorder-agent
+#     # the ingress controller and Prometheus
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: ingress-nginx
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: monitoring
+#     # agents with hostNetwork (mode: daemonset) come from the nodes'
+#     # addresses, e.g.
+#     - ipBlock:
+#         cidr: 192.0.2.0/24
 networkPolicy:
   enabled: false
-  from:
-    # hopcorder agents in any namespace (pod network; agents with
-    # hostNetwork come from node addresses: add an ipBlock for those).
-    - namespaceSelector: {}
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: hopcorder-agent
-    # Add your ingress controller and Prometheus, e.g.
-    # - namespaceSelector:
-    #     matchLabels:
-    #       kubernetes.io/metadata.name: ingress-nginx
+  from: []
 
 # Prometheus Operator ServiceMonitor for /metrics (config.metrics: true).
 serviceMonitor:

@@ -39,15 +39,19 @@ outputs:                        # at least one
 
   # http:
   #   url: https://hopcorder.example.net     # POSTs to <url>/api/v1/ingest
-  #   # Under systemd: LoadCredential=token:... in the unit, then
+  #   # Secrets come from files. Under systemd the unit's dynamic user can
+  #   # only read world-readable files (this one included), so pass each
+  #   # secret as a credential (LoadCredential= in deploy/hopcorder.service)
+  #   # and point here at /run/credentials/hopcorder.service/<name>.
+  #   # (bearer_token and basic_auth.password also take a secret inline: only
+  #   # where no one else can read this file.)
   #   bearer_token_file: /run/credentials/hopcorder.service/token
-  #   # or: bearer_token: "..." (then keep this file unreadable to others)
   #   # or: basic_auth: {username: agent, password_file: /run/credentials/hopcorder.service/password}
-  #   headers: {X-Tenant: lab}
+  #   headers: {X-Tenant: lab}               # sent as written: not for secrets
   #   tls:
   #     ca_file: /etc/hopcorder/ca.pem       # replaces the system roots
   #     cert_file: /etc/hopcorder/client.pem # client certificate (mTLS)
-  #     key_file: /etc/hopcorder/client.key
+  #     key_file: /run/credentials/hopcorder.service/client.key   # its key: a credential too
   #     server_name: ""
   #   timeout: 30s
   #   batch_max_records: 500

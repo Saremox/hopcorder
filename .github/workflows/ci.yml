@@ -30,6 +30,17 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      # setup-go installs go.mod's toolchain line (release binaries are built
+      # with it), the images build on the Dockerfile's Go image: both must be
+      # the same Go release, so a Dependabot update of the image needs the
+      # toolchain line too.
+      - name: one Go release
+        run: |
+          want=$(sed -n 's/^toolchain //p' go.mod)
+          image=$(sed -n 's/^FROM .*golang:\([0-9.]*\)@.*/go\1/p' Dockerfile)
+          have=$(go env GOVERSION)
+          echo "go.mod toolchain: ${want:-none}, Dockerfile: ${image:-no golang:<version>@<digest>}, installed: $have"
+          test -n "$want" && test "$want" = "$image" && test "$have" = "$want"
       - name: test
         run: go test -race ./...
       - name: build
@@ -50,6 +61,22 @@ jobs:
         with:
           version: v2.15.0
           args: --build-tags=rawsock,clickhouse,grafana
+
+  vuln:
+    # Known vulnerabilities (vuln.go.dev) in the modules and in the Go release
+    # of go.mod's toolchain line, which builds the release binaries. The
+    # pinned govulncheck runs with `go run`, outside go.mod; update it by hand.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   rawsock:
     # GitHub-hosted runners grant passwordless sudo, so the raw-socket tests can
@@ -199,17 +226,29 @@ jobs:
       - name: lint
         run: |
           helm lint --strict deploy/helm/hopcorder-server
-          helm lint --strict deploy/helm/hopcorder-server --set networkPolicy.enabled=true
+          helm lint --strict deploy/helm/hopcorder-server -f deploy/helm/ci/server-netpol-values.yaml
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml
           helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
             --set server.basicAuth.username=agent --set server.basicAuth.passwordSecret.name=ba \
-            --set server.tls.secretName=mtls --set server.tls.caKey=ca.crt >/dev/null
-          # Inline credentials would land in a ConfigMap: the chart refuses them.
-          if helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
-            --set config.outputs.http.bearer_token=x >/dev/null 2>&1; then
-            echo "inline credentials accepted"; exit 1
-          fi
+            --set server.tls.secretName=mtls --set server.tls.caKey=ca.crt \
+            --set config.outputs.http.headers.X-Tenant=lab >/dev/null
+          # The charts refuse what would put a credential into a ConfigMap
+          # (readable with the built-in view role), and a NetworkPolicy
+          # without peers.
+          refused() {
+            if helm template a "$@" >/dev/null 2>&1; then
+              echo "accepted: $*"; exit 1
+            fi
+          }
+          agent=(deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml)
+          refused "${agent[@]}" --set config.outputs.http.bearer_token=x
+          refused "${agent[@]}" --set server.url=https://agent:pw@hopcorder.example.net
+          for h in Authorization authorization Proxy-Authorization Cookie X-Api-Key x-auth-token Private-Token X-Vault-Token; do
+            refused "${agent[@]}" --set "config.outputs.http.headers.$h=x"
+          done
+          refused deploy/helm/hopcorder-server --set config.clickhouse.password=x
+          refused deploy/helm/hopcorder-server --set networkPolicy.enabled=true
       - name: build images
         run: |
           docker build --target server -t hopcorder-server:ci .

@@ -25,8 +25,9 @@ TimeoutStopSec=15s
 DynamicUser=yes
 StateDirectory=hopcorder-server
 ConfigurationDirectory=hopcorder
-# The ClickHouse password: not in the world-readable config. Keep it in a
-# root-only file, pass it as a credential and set
+# The ClickHouse password: not in the config, which the dynamic user can
+# only read if it is world-readable. Keep it in a root-only file, pass it as
+# a credential and set (restart the unit after changing it)
 #   password_file: /run/credentials/hopcorder-server.service/clickhouse-password
 #LoadCredential=clickhouse-password:/etc/hopcorder/secrets/clickhouse-password
 

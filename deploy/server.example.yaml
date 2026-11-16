@@ -24,9 +24,11 @@ clickhouse:                     # the HTTP interface
   url: http://127.0.0.1:8123
   database: hopcorder           # created on startup if missing; migrations run automatically
   user: default
-  # password: ""                # then keep this file unreadable to others
-  # Under systemd: LoadCredential=clickhouse-password:... in the unit, then
+  # The password from a file. Under systemd the unit's dynamic user can only
+  # read world-readable files (this one included): pass it as a credential
+  # (LoadCredential= in deploy/hopcorder-server.service), then
   # password_file: /run/credentials/hopcorder-server.service/clickhouse-password
+  # (password: "..." also works, only where no one else can read this file)
   timeout: 30s
   retention_days: 90            # like the prototype; 0 keeps data forever
 

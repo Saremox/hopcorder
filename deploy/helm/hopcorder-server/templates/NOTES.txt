@@ -12,5 +12,5 @@ Point agents at http://{{ include "hopcorder-server.fullname" . }}.{{ .Release.N
 hopcorder does no authentication: secure ingest and the UI at your ingress.
 Clients inside the cluster reach the Service directly, around the ingress:
 {{- if .Values.networkPolicy.enabled }} the NetworkPolicy limits them to networkPolicy.from.
-{{- else }} set networkPolicy.enabled=true to limit them (needs a CNI that enforces it).
+{{- else }} set networkPolicy.enabled=true and networkPolicy.from to limit them (needs a CNI that enforces it).
 {{- end }}
