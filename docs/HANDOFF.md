@@ -346,3 +346,18 @@ added in the commit that introduced it.
   `golang.org/x/net` already requires 1.26).
 - **CLI**: standard library `flag` with a hand-rolled subcommand switch; no CLI
   library.
+- **Path end on `unreachable`** (extends §3.2): the path also ends at the lowest
+  TTL that got ICMP destination-unreachable. That hop is kept, higher TTLs are
+  dropped. Without this, a router answering "host unreachable" for every TTL
+  beyond it would count as a responding hop at every TTL and defeat the
+  `probe_past` trimming. Within one paris cycle every higher-TTL probe crosses
+  the same router, so nothing beyond it is observable anyway.
+- **`path_len`** is the number of hops in the trimmed `hops` array, which is
+  always contiguous from TTL 1. For reached paths that is the destination's
+  distance; for unreached ones it includes the `probe_past` silent hops.
+- **`loops`** and **`hops`** are always present (`[]` when empty), never `null`.
+- **`rtt_us`** is at least 1 for responding hops, so `omitempty` only ever drops
+  it on `no-reply`. **`code`** is present exactly on `unreachable` hops (as a
+  raw ICMPv4 or ICMPv6 code, interpreted per `af`).
+- **`ts`** is the cycle start (first probe sent), UTC, truncated to
+  milliseconds.
