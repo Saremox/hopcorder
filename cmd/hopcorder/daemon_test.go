@@ -458,6 +458,16 @@ func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
 		t.Fatalf("supervisor exited: %v", err)
 	default:
 	}
+	// Stop it and wait, so no daemon outlives the test.
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("supervisor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
 }
 
 func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Config {
