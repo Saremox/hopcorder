@@ -19,7 +19,8 @@ func TestServerDefaults(t *testing.T) {
 	if c.Listen != DefaultServerListen || c.ClickHouse.URL != DefaultClickHouseURL || c.ClickHouse.Database != "hopcorder" ||
 		!*c.Metrics || !*c.Enrich.RDNS.Enabled || *c.Enrich.ASN.URL != DefaultASNURL ||
 		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes ||
-		*c.ClickHouse.RetentionDays != 90 || !*c.UI {
+		*c.ClickHouse.RetentionDays != 90 || !*c.UI || c.Ingest.MaxConcurrent != 4 || c.Query.MaxConcurrent != 8 ||
+		c.Ingest.MaxStreams != DefaultMaxStreams || c.Ingest.StreamIdleTimeout.D() != time.Hour {
 		t.Errorf("defaults %+v", c)
 	}
 }
@@ -60,6 +61,14 @@ enrich:
 	}
 	if _, err := ParseServer([]byte("lisen: x")); err == nil {
 		t.Error("unknown key accepted")
+	}
+
+	c, err = ParseServer([]byte(`clickhouse: {url: "http://default:s3cret@ch:8123"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Finalize(); err == nil || !strings.Contains(err.Error(), "not in the URL") || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("credentials in the URL: %v", err)
 	}
 }
 

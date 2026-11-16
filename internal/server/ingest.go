@@ -4,12 +4,14 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/saremox/hopcorder/internal/clickhouse"
@@ -42,16 +44,49 @@ type Ingester struct {
 	log     *slog.Logger
 	metrics *serverMetrics
 
-	mu     sync.Mutex
-	agents map[string]*agentState
+	// State is kept per agent and per stream, keyed by what agents send, so
+	// it is bounded: streams idle for idleTTL are dropped (a stream that
+	// comes back is restored from storage, as after a restart), and beyond
+	// maxStreams the least recently used ones go first.
+	maxStreams int
+	idleTTL    time.Duration
+	now        func() time.Time
+	nstreams   atomic.Int64
+
+	mu        sync.Mutex
+	agents    map[string]*agentState
+	lastSweep time.Time
 }
 
 type agentState struct {
 	mu        sync.Mutex
+	evicted   bool // dropped from Ingester.agents; look the agent up again
 	loaded    bool
 	highWater uint64
 	streams   map[streamKey]*stream
+	used      time.Time
 }
+
+// Defaults for the ingester's state bounds.
+const (
+	DefaultMaxStreams    = 100000
+	DefaultStreamIdleTTL = time.Hour
+	sweepInterval        = time.Minute
+	// staleWindow: a batch whose seqs all lie this far below the agent's
+	// stored ones is not a retry but a reset spool or a second agent with
+	// the same agent_id.
+	staleWindow = 100000
+	// insertTimeout bounds a cycles insert, which is not cancelled when the
+	// agent disconnects: an insert that ClickHouse committed must be
+	// accounted for.
+	insertTimeout = 30 * time.Second
+)
+
+// ErrStaleBatch is returned for a batch whose records all lie far below the
+// agent's stored seqs; storing nothing and reporting success would make the
+// agent discard them silently.
+var ErrStaleBatch = errors.New("seqs far below the ones stored for this agent_id: was the agent's spool reset, " +
+	"or does another agent use the same agent_id? Give it a new agent_id")
 
 // IngestResult is returned to the agent.
 type IngestResult struct {
@@ -72,24 +107,86 @@ func NewIngester(store Store, en Enricher, log *slog.Logger, m *serverMetrics) *
 	if m == nil {
 		m = newServerMetrics(nil)
 	}
-	return &Ingester{store: store, enrich: en, log: log, metrics: m, agents: map[string]*agentState{}}
+	return &Ingester{store: store, enrich: en, log: log, metrics: m, agents: map[string]*agentState{},
+		maxStreams: DefaultMaxStreams, idleTTL: DefaultStreamIdleTTL, now: time.Now}
 }
 
-func (in *Ingester) agent(id string) *agentState {
+// lockAgent returns the agent's state, locked.
+func (in *Ingester) lockAgent(id string) *agentState {
+	for {
+		in.mu.Lock()
+		a, ok := in.agents[id]
+		if !ok {
+			a = &agentState{streams: map[streamKey]*stream{}}
+			in.agents[id] = a
+		}
+		in.mu.Unlock()
+		a.mu.Lock()
+		if !a.evicted {
+			return a
+		}
+		a.mu.Unlock() // swept between lookup and lock
+	}
+}
+
+// sweep drops idle streams and agents, and the least recently used streams
+// beyond maxStreams. Agents being ingested right now are skipped.
+func (in *Ingester) sweep() {
+	now := in.now()
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	a, ok := in.agents[id]
-	if !ok {
-		a = &agentState{streams: map[streamKey]*stream{}}
-		in.agents[id] = a
+	over := in.nstreams.Load() > int64(in.maxStreams)
+	// Every sweepInterval, or every second while over the limit.
+	if since := now.Sub(in.lastSweep); since < sweepInterval && (!over || since < time.Second) {
+		return
 	}
-	return a
+	in.lastSweep = now
+	cutoff := now.Add(-in.idleTTL)
+	type lru struct {
+		a    *agentState
+		k    streamKey
+		used time.Time
+	}
+	var live []lru
+	for id, a := range in.agents {
+		if !a.mu.TryLock() {
+			continue
+		}
+		for k, s := range a.streams {
+			if s.used.Before(cutoff) {
+				delete(a.streams, k)
+				in.nstreams.Add(-1)
+			} else if over {
+				live = append(live, lru{a, k, s.used})
+			}
+		}
+		if len(a.streams) == 0 && a.used.Before(cutoff) {
+			a.evicted = true
+			delete(in.agents, id)
+		}
+		a.mu.Unlock()
+	}
+	if excess := in.nstreams.Load() - int64(in.maxStreams)*9/10; over && excess > 0 {
+		slices.SortFunc(live, func(x, y lru) int { return x.used.Compare(y.used) })
+		for _, l := range live[:min(int(excess), len(live))] {
+			if l.a.mu.TryLock() {
+				if _, ok := l.a.streams[l.k]; ok {
+					delete(l.a.streams, l.k)
+					in.nstreams.Add(-1)
+				}
+				l.a.mu.Unlock()
+			}
+		}
+		in.log.Warn("tracking too many streams; dropped the least recently used (they are restored from storage when they come back)",
+			"max_streams", in.maxStreams)
+	}
 }
 
 // Ingest stores recs (already validated). It returns an error only when
 // storage failed, in which case nothing was stored for the failing agent
 // and the batch should be retried.
 func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestResult, error) {
+	in.sweep()
 	var res IngestResult
 	byAgent := map[string][]*record.Record{}
 	for _, r := range recs {
@@ -112,9 +209,10 @@ func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestRe
 }
 
 func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.Record) (accepted, dups int, err error) {
-	a := in.agent(id)
-	a.mu.Lock()
+	a := in.lockAgent(id)
 	defer a.mu.Unlock()
+	now := in.now()
+	a.used = now
 	if !a.loaded {
 		hw, err := in.loadHighWater(ctx, id)
 		if err != nil {
@@ -135,9 +233,10 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 		last = r.Seq
 	}
 	if len(fresh) == 0 {
-		if n := len(recs); n > 0 && recs[n-1].Seq+100000 < a.highWater {
-			in.log.Warn("agent sends seqs far below what is stored; was its spool reset? Its records are dropped as duplicates",
+		if n := len(recs); n > 0 && recs[n-1].Seq < a.highWater && a.highWater-recs[n-1].Seq > staleWindow {
+			in.log.Warn("agent sends seqs far below what is stored; refusing the batch so the agent keeps it",
 				"agent_id", id, "batch_max_seq", recs[n-1].Seq, "stored_max_seq", a.highWater)
+			return 0, 0, ErrStaleBatch
 		}
 		in.metrics.records(0, dups)
 		return 0, dups, nil
@@ -149,9 +248,16 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 			return 0, dups, fmt.Errorf("encode record %s/%d: %w", id, r.Seq, err)
 		}
 	}
+	// Not cancelled with the request: if the agent disconnects after
+	// ClickHouse committed, the high-water mark must still move.
+	ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
+	defer cancel()
 	start := time.Now()
-	if err := in.store.InsertJSON(ctx, "cycles", rows); err != nil {
+	if err := in.store.InsertJSON(ictx, "cycles", rows); err != nil {
 		in.metrics.insertError("cycles")
+		// The insert may have been committed all the same: re-read the
+		// high-water mark before the next batch rather than trusting ours.
+		a.loaded = false
 		return 0, dups, fmt.Errorf("insert cycles: %w", err)
 	}
 	in.metrics.insertDuration(time.Since(start))
@@ -163,21 +269,24 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 	// re-sending) a batch that is already stored.
 	var ev events
 	for _, r := range fresh {
-		s := a.stream(keyOf(r))
+		s := in.stream(a, keyOf(r))
+		s.used = now
 		if !s.loaded {
-			in.restore(ctx, s, r.Seq)
+			in.restore(ictx, s, r.Seq)
 		}
 		s.observe(r, &ev)
 	}
-	in.insertEvents(ctx, ev)
+	in.insertEvents(ictx, ev)
 	return len(fresh), dups, nil
 }
 
-func (a *agentState) stream(k streamKey) *stream {
+// stream returns a's stream k, creating it; a must be locked.
+func (in *Ingester) stream(a *agentState, k streamKey) *stream {
 	s, ok := a.streams[k]
 	if !ok {
 		s = &stream{key: k}
 		a.streams[k] = s
+		in.nstreams.Add(1)
 	}
 	return s
 }

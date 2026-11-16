@@ -395,8 +395,22 @@ edges are capped (`truncated: true`).
 batch is stored once. Invalid records are rejected for good and reported in the
 response (`{"accepted", "duplicates", "rejected", "errors"}`); a storage
 failure returns 503 and the agent retries. Agents must never reuse seqs: if you
-wipe an agent's spool, also change its `agent_id`, or its new records are
-dropped as duplicates (the server logs a warning).
+wipe an agent's spool, also change its `agent_id`. A batch whose seqs all lie
+far below the stored ones is refused with 409, so the agent keeps it and its
+errors show what happened.
+
+**Limits.** Ingest takes `Content-Type: application/x-ndjson` (agents send it;
+the content types a web page can send without a CORS preflight are refused),
+bodies up to `ingest.max_body_bytes` (8 MiB) and `max_decoded_bytes` (32 MiB),
+at most 16 agents and 4096 streams per request, and `ingest.max_concurrent`
+requests at once. Records are validated against the schema's limits:
+`agent_id` from `[A-Za-z0-9._:-]` (at most 128 characters), targets from
+`[A-Za-z0-9._:%-]` (255), protocol `icmp`, `udp` or `tcp`, at most 255 hops and
+16 MPLS labels per hop. The server keeps state for at most
+`ingest.max_streams` streams and drops idle ones after `stream_idle_timeout`
+(they are restored from ClickHouse when they return). Read-API queries are
+limited to `query.max_concurrent` at once, and each is stopped in ClickHouse
+after the client timeout or when the client goes away.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
 the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on

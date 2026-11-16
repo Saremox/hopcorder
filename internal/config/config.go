@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/saremox/hopcorder/internal/record"
 )
 
 // Defaults.
@@ -224,8 +226,9 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 		c.Spool.MaxBytes = DefaultSpoolMaxSize
 	}
 
-	if c.AgentID != "" && (len(c.AgentID) > 128 || strings.ContainsFunc(c.AgentID, isSpaceOrControl)) {
-		fail("agent_id %q: must be at most 128 characters without whitespace", c.AgentID)
+	if c.AgentID != "" && !record.ValidAgentID(c.AgentID) {
+		fail("agent_id %q: want 1 to %d characters from [A-Za-z0-9._:-] (the server rejects others)",
+			c.AgentID, record.MaxAgentIDLen)
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
@@ -335,8 +338,11 @@ func (c *Config) defaultTarget(t *Target) {
 func validateTarget(t *Target) []error {
 	var errs []error
 	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
-	if t.Host == "" {
+	switch {
+	case t.Host == "":
 		fail("host: required")
+	case !record.ValidTarget(t.Host):
+		fail("host %q: want a host name or address of at most %d characters", t.Host, record.MaxTargetLen)
 	}
 	switch t.Protocol {
 	case "icmp":

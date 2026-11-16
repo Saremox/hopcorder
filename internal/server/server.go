@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,10 +26,23 @@ import (
 
 // Defaults for request limits.
 const (
-	DefaultMaxBodyBytes    = 64 << 20  // compressed request body
-	DefaultMaxDecodedBytes = 512 << 20 // after decompression
-	maxLineBytes           = 4 << 20   // one record
-	maxReportedErrors      = 5
+	DefaultMaxBodyBytes         = 8 << 20  // compressed request body
+	DefaultMaxDecodedBytes      = 32 << 20 // after decompression
+	DefaultMaxConcurrentIngest  = 4
+	DefaultMaxConcurrentQueries = 8
+	maxLineBytes                = 1 << 20 // one record
+	maxReportedErrors           = 5
+	// maxZstdWindow caps the window a zstd frame may declare, which the
+	// decoder allocates before reading data (an agent's frames are no
+	// larger than its batch, 1 MiB by default).
+	maxZstdWindow = 32 << 20
+	// An agent sends its own records; a request with more agents or
+	// streams than this is not from an agent.
+	maxAgentsPerRequest  = 16
+	maxStreamsPerRequest = 4096
+	// queueWait is how long a request waits for a free slot before the
+	// server answers 503 (agents retry later).
+	queueWait = 10 * time.Second
 )
 
 // Pinger checks that storage is reachable.
@@ -47,6 +61,13 @@ type Options struct {
 	Registry *prometheus.Registry
 	// MaxBodyBytes and MaxDecodedBytes bound one ingest request.
 	MaxBodyBytes, MaxDecodedBytes int64
+	// MaxConcurrentIngest and MaxConcurrentQueries bound the ingest and
+	// read-API requests processed at once; more wait up to 10s, then get 503.
+	MaxConcurrentIngest, MaxConcurrentQueries int
+	// MaxStreams and StreamIdleTTL bound the per-stream state kept in memory
+	// (see Ingester).
+	MaxStreams    int
+	StreamIdleTTL time.Duration
 	// UI serves the web UI under /ui/ (internal/ui); nil serves none.
 	UI http.Handler
 }
@@ -58,11 +79,13 @@ type Options struct {
 // readers, /healthz, /readyz and /metrics for operators. The server itself
 // does no authentication.
 type Server struct {
-	opts     Options
-	log      *slog.Logger
-	ingester *Ingester
-	metrics  *serverMetrics
-	ready    atomic.Bool
+	opts      Options
+	log       *slog.Logger
+	ingester  *Ingester
+	metrics   *serverMetrics
+	ready     atomic.Bool
+	ingestSem chan struct{}
+	querySem  chan struct{}
 }
 
 // New returns a server. Call SetReady once migrations have been applied.
@@ -76,12 +99,57 @@ func New(o Options) *Server {
 	if o.MaxDecodedBytes <= 0 {
 		o.MaxDecodedBytes = DefaultMaxDecodedBytes
 	}
+	if o.MaxConcurrentIngest <= 0 {
+		o.MaxConcurrentIngest = DefaultMaxConcurrentIngest
+	}
+	if o.MaxConcurrentQueries <= 0 {
+		o.MaxConcurrentQueries = DefaultMaxConcurrentQueries
+	}
 	var reg prometheus.Registerer
 	if o.Registry != nil {
 		reg = o.Registry
 	}
 	m := newServerMetrics(reg)
-	return &Server{opts: o, log: o.Logger, metrics: m, ingester: NewIngester(o.Store, o.Enricher, o.Logger, m)}
+	in := NewIngester(o.Store, o.Enricher, o.Logger, m)
+	if o.MaxStreams > 0 {
+		in.maxStreams = o.MaxStreams
+	}
+	if o.StreamIdleTTL > 0 {
+		in.idleTTL = o.StreamIdleTTL
+	}
+	return &Server{opts: o, log: o.Logger, metrics: m, ingester: in,
+		ingestSem: make(chan struct{}, o.MaxConcurrentIngest), querySem: make(chan struct{}, o.MaxConcurrentQueries)}
+}
+
+// acquire takes a slot of sem, waiting up to queueWait.
+func acquire(ctx context.Context, sem chan struct{}) bool {
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+	}
+	t := time.NewTimer(queueWait)
+	defer t.Stop()
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	return false
+}
+
+// limitQueries bounds the read-API requests running at once, so readers
+// cannot crowd out ingest in ClickHouse.
+func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !acquire(r.Context(), s.querySem) {
+			writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
+			return
+		}
+		defer func() { <-s.querySem }()
+		h(w, r)
+	}
 }
 
 // SetReady marks the server ready (storage migrated).
@@ -91,12 +159,12 @@ func (s *Server) SetReady() { s.ready.Store(true) }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/ingest", s.handleIngest)
-	mux.HandleFunc("GET /api/v1/query/targets", s.handleTargets)
-	mux.HandleFunc("GET /api/v1/query/cycles", s.handleCycles)
-	mux.HandleFunc("GET /api/v1/query/path-changes", s.handlePathChanges)
-	mux.HandleFunc("GET /api/v1/query/loops", s.handleLoops)
-	mux.HandleFunc("GET /api/v1/query/outages", s.handleOutages)
-	mux.HandleFunc("GET /api/v1/query/topology", s.handleTopology)
+	mux.HandleFunc("GET /api/v1/query/targets", s.limitQueries(s.handleTargets))
+	mux.HandleFunc("GET /api/v1/query/cycles", s.limitQueries(s.handleCycles))
+	mux.HandleFunc("GET /api/v1/query/path-changes", s.limitQueries(s.handlePathChanges))
+	mux.HandleFunc("GET /api/v1/query/loops", s.limitQueries(s.handleLoops))
+	mux.HandleFunc("GET /api/v1/query/outages", s.limitQueries(s.handleOutages))
+	mux.HandleFunc("GET /api/v1/query/topology", s.limitQueries(s.handleTopology))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	if s.opts.Registry != nil {
@@ -124,7 +192,9 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		if err := s.opts.Pinger.Ping(ctx); err != nil {
-			http.Error(w, "clickhouse unreachable: "+err.Error(), http.StatusServiceUnavailable)
+			// Details stay in the log: they name internal hosts.
+			s.log.Debug("readiness: clickhouse unreachable", "err", err)
+			http.Error(w, "clickhouse unreachable", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -157,11 +227,27 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusServiceUnavailable, "server is starting")
 		return
 	}
+	// Agents send application/x-ndjson. Refusing the content types a web
+	// page can send without a CORS preflight keeps browsers from posting
+	// records to a server they can reach.
+	switch mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt {
+	case "application/x-ndjson", "application/jsonl", "application/json":
+	default:
+		fail(http.StatusUnsupportedMediaType, "Content-Type must be application/x-ndjson")
+		return
+	}
+	if !acquire(r.Context(), s.ingestSem) {
+		fail(http.StatusServiceUnavailable, "server busy; retry later")
+		return
+	}
+	defer func() { <-s.ingestSem }()
 	body := http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
 	var in io.Reader = body
 	switch enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc {
 	case "zstd":
-		dec, err := zstd.NewReader(body, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(uint64(s.opts.MaxDecodedBytes))) //nolint:gosec // positive
+		dec, err := zstd.NewReader(body, zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(s.opts.MaxDecodedBytes)),                     //nolint:gosec // positive
+			zstd.WithDecoderMaxWindow(uint64(min(s.opts.MaxDecodedBytes, maxZstdWindow)))) //nolint:gosec // positive
 		if err != nil {
 			fail(http.StatusBadRequest, "bad zstd stream: "+err.Error())
 			return
@@ -224,6 +310,16 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusRequestEntityTooLarge, "decompressed body too large")
 		return
 	}
+	agents, streams := map[string]bool{}, map[streamKey]bool{}
+	for _, rec := range recs {
+		agents[rec.AgentID] = true
+		streams[keyOf(rec)] = true
+	}
+	if len(agents) > maxAgentsPerRequest || len(streams) > maxStreamsPerRequest {
+		fail(http.StatusBadRequest, fmt.Sprintf("a request may carry at most %d agents and %d streams",
+			maxAgentsPerRequest, maxStreamsPerRequest))
+		return
+	}
 	s.metrics.rejected(res.Rejected)
 	if res.Rejected > 0 {
 		s.log.Warn("rejected invalid records", "count", res.Rejected, "first", res.Errors[0])
@@ -231,7 +327,11 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 	ir, err := s.ingester.Ingest(r.Context(), recs)
 	res.Accepted, res.Duplicates = ir.Accepted, ir.Duplicates
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrStaleBatch):
+		fail(http.StatusConflict, err.Error())
+		return
+	case err != nil:
 		s.log.Error("ingest failed; the agent will retry", "err", err)
 		fail(http.StatusServiceUnavailable, "storage unavailable")
 		return

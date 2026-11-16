@@ -256,3 +256,60 @@ func TestRDNSEviction(t *testing.T) {
 		t.Errorf("%d entries with MaxEntries 20", n)
 	}
 }
+
+// The database is a download: its size, range count and fields are bounded.
+func TestParseBounds(t *testing.T) {
+	// A small gzip that inflates past the uncompressed limit (lowered for
+	// the test).
+	defer func(n int64) { maxASNDecoded = n }(maxASNDecoded)
+	maxASNDecoded = 4 << 20
+	var bomb bytes.Buffer
+	gw, _ := gzip.NewWriterLevel(&bomb, gzip.BestCompression)
+	// Blank lines of 32 KiB: skipped by the parser, cheap to scan.
+	chunk := bytes.Repeat(append(bytes.Repeat([]byte(" "), 32<<10-1), '\n'), 32)
+	for range maxASNDecoded>>20 + 1 {
+		_, _ = gw.Write(chunk)
+	}
+	_ = gw.Close()
+	if bomb.Len() > 64<<10 {
+		t.Fatalf("bomb is %d bytes; the test wants a small one", bomb.Len())
+	}
+	if _, err := ParseIPToASN(bytes.NewReader(bomb.Bytes())); err == nil || !strings.Contains(err.Error(), "uncompressed") {
+		t.Errorf("gzip bomb: %v", err)
+	}
+
+	// Control characters are dropped and names truncated.
+	hostile := "198.51.100.0\t198.51.100.255\t64496\tZZ\t<img src=x>\x1b[31mEVIL\x00" + strings.Repeat("A", 500) + "\n"
+	db, err := ParseIPToASN(strings.NewReader(hostile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok := db.Lookup(netip.MustParseAddr("198.51.100.7"))
+	if !ok || len(info.Name) > maxASNameLen || strings.ContainsAny(info.Name, "\x1b\x00") || !strings.HasPrefix(info.Name, "<img src=x>[31mEVIL") {
+		t.Errorf("name %q (%d bytes)", info.Name, len(info.Name))
+	}
+}
+
+// A redirect from https to plain http is not followed.
+func TestASNDownloadRefusesDowngrade(t *testing.T) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(asnFixture))
+	}))
+	defer plain.Close()
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/db.tsv", http.StatusFound)
+	}))
+	defer tlsSrv.Close()
+	hc := tlsSrv.Client()
+	hc.CheckRedirect = noDowngrade
+	s := &ASNSource{URL: tlsSrv.URL, HTTP: hc}
+	s.defaults()
+	if err := s.download(t.Context()); err == nil || !strings.Contains(err.Error(), "refusing redirect") {
+		t.Errorf("downgrade followed: %v", err)
+	}
+	// Redirects that stay on https are fine.
+	if err := noDowngrade(httptest.NewRequest(http.MethodGet, "https://b.example/x", nil),
+		[]*http.Request{httptest.NewRequest(http.MethodGet, "https://a.example/", nil)}); err != nil {
+		t.Errorf("https to https: %v", err)
+	}
+}

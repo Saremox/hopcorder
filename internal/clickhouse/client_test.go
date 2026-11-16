@@ -98,3 +98,27 @@ func TestTime(t *testing.T) {
 		t.Errorf("Time = %q", got)
 	}
 }
+
+func TestEscapeParam(t *testing.T) {
+	for in, want := range map[string]string{
+		`plain.value-1`:          `plain.value-1`,
+		`corp\lab1`:              `corp\\lab1`,
+		`ends\`:                  `ends\\`,
+		"tab\tnew\nret\rnul\x00": `tab\tnew\nret\rnul\0`,
+		`quote'stays`:            `quote'stays`, // typed parameters need no quoting
+	} {
+		if got := escapeParam(in); got != want {
+			t.Errorf("escapeParam(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNewRejectsCredentialsInURL(t *testing.T) {
+	_, err := New(Config{URL: "http://default:s3cret@127.0.0.1:8123", Database: "d"})
+	if err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("err = %v", err)
+	}
+	if _, err := New(Config{URL: "ftp://u:s3cret@x", Database: "d"}); err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("scheme error leaks the password: %v", err)
+	}
+}

@@ -20,8 +20,14 @@ clickhouse:                     # the HTTP interface
   retention_days: 90            # like the prototype; 0 keeps data forever
 
 ingest:
-  max_body_bytes: 64MiB         # compressed request body
-  max_decoded_bytes: 512MiB     # after decompression
+  max_body_bytes: 8MiB          # compressed request body
+  max_decoded_bytes: 32MiB      # after decompression (an agent's batch is 1MiB by default)
+  max_concurrent: 4             # requests processed at once; more wait, then get 503 (agents retry)
+  max_streams: 100000           # (agent, target, protocol, flow) tracked in memory
+  stream_idle_timeout: 1h       # idle streams are dropped and restored from ClickHouse when they return
+
+query:
+  max_concurrent: 8             # read-API requests at once
 
 enrich:
   rdns:

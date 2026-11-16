@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,17 +29,22 @@ type Config struct {
 	Password string
 	// Timeout bounds each request; default 30s.
 	Timeout time.Duration
+	// MaxExecutionTime bounds each SELECT on the server (ClickHouse's
+	// max_execution_time), so a query outlives neither its caller nor the
+	// request timeout; default Timeout minus 5s, at least 1s.
+	MaxExecutionTime time.Duration
 	// HTTPClient overrides the transport (TLS, proxies); optional.
 	HTTPClient *http.Client
 }
 
 // Client talks to one ClickHouse database.
 type Client struct {
-	base url.URL
-	db   string
-	user string
-	pass string
-	hc   *http.Client
+	base    url.URL
+	db      string
+	user    string
+	pass    string
+	hc      *http.Client
+	maxExec string // seconds
 }
 
 // Error is an exception reported by ClickHouse.
@@ -62,7 +68,10 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("clickhouse url: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("clickhouse url %q: scheme must be http or https", cfg.URL)
+		return nil, fmt.Errorf("clickhouse url %q: scheme must be http or https", u.Redacted())
+	}
+	if u.User != nil {
+		return nil, errors.New("clickhouse url: put credentials in user and password, not in the URL")
 	}
 	if cfg.Database == "" {
 		return nil, errors.New("clickhouse: database is required")
@@ -79,7 +88,12 @@ func New(cfg Config) (*Client, error) {
 		c.Timeout = cfg.Timeout
 		hc = &c
 	}
-	return &Client{base: *u, db: cfg.Database, user: cfg.User, pass: cfg.Password, hc: hc}, nil
+	maxExec := cfg.MaxExecutionTime
+	if maxExec <= 0 {
+		maxExec = max(cfg.Timeout-5*time.Second, time.Second)
+	}
+	return &Client{base: *u, db: cfg.Database, user: cfg.User, pass: cfg.Password, hc: hc,
+		maxExec: strconv.Itoa(max(int(maxExec/time.Second), 1))}, nil
 }
 
 // Database returns the configured database name.
@@ -147,6 +161,10 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 	q.Set("output_format_json_quote_64bit_integers", "0")
 	q.Set("default_format", "JSONEachRow")
 	q.Set("date_time_output_format", "iso") // 2026-11-16T22:14:05.123Z
+	// A query must not keep running after its caller gave up: bound its
+	// time, and cancel it when the connection closes.
+	q.Set("max_execution_time", c.maxExec)
+	q.Set("cancel_http_readonly_queries_on_client_close", "1")
 	return c.do(ctx, true, q, params, strings.NewReader(query), func(r io.Reader) error {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64<<10), 64<<20)
@@ -185,7 +203,7 @@ func (c *Client) do(ctx context.Context, useDB bool, q url.Values, params Params
 		q.Set("database", c.db)
 	}
 	for k, v := range params {
-		q.Set("param_"+k, v)
+		q.Set("param_"+k, escapeParam(v))
 	}
 	u := c.base
 	u.RawQuery = q.Encode()
@@ -225,3 +243,11 @@ func quoteIdent(s string) string {
 
 // Time formats t for DateTime64(3) columns and parameters.
 func Time(t time.Time) string { return t.UTC().Format("2006-01-02 15:04:05.000") }
+
+// paramEscaper escapes a query parameter value for ClickHouse, which parses
+// parameters in its escaped (TSV) format: a backslash starts an escape
+// sequence, so an unescaped `a\tb` would arrive with a tab in it and a value
+// ending in a backslash would fail the query.
+var paramEscaper = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\n", `\n`, "\r", `\r`, "\x00", `\0`)
+
+func escapeParam(v string) string { return paramEscaper.Replace(v) }

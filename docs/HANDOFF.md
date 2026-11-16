@@ -848,3 +848,53 @@ added in the commit that introduced it.
   chart-rendered config files and the charts' security settings (read-only
   root file system, every capability dropped but the agent's `NET_RAW`, no
   privilege escalation): the agent's TCP and UDP cycles reached the server.
+
+### Security review (after v0.1.0)
+
+A review of the whole code base (four areas, each finding re-checked against
+the code; ClickHouse-dependent ones against ClickHouse 25.8) led to four
+fixes. The decisions:
+
+**Server**
+- **Records are bounded and narrowed** (`record.Validate`, shared with the
+  agent's config check): `agent_id` from `[A-Za-z0-9._:-]` (at most 128
+  characters), targets from `[A-Za-z0-9._:%-]` (255), protocol one of
+  `icmp|udp|tcp`, at most 255 hops (TTLs and path lengths are UInt8), loops
+  consistent with the hops (at most one per hop, increasing TTLs within the
+  path), at most 16 MPLS labels per hop, ICMP codes 0-255, RTTs within UInt32,
+  ts 1970-2262, path_hash at most 64 printable characters. Before, loops and
+  hops were unbounded: one 57 KiB request held gigabytes. The character sets
+  also make agent and target names safe to quote anywhere (dashboards, logs).
+- **Bounded request processing**: ingest requires an NDJSON content type
+  (refusing what a web page can send without a CORS preflight), at most 16
+  agents and 4096 streams per request, `ingest.max_concurrent` (4) requests
+  at once (others wait 10 s, then 503); zstd frames may not declare a window
+  above 32 MiB (the decoder allocates it up front); defaults lowered to
+  `max_body_bytes` 8 MiB and `max_decoded_bytes` 32 MiB; the HTTP server has
+  read, write and idle timeouts and a 64 KiB header limit.
+- **Bounded state**: a stream keeps only its previous cycle's seq, path_hash
+  and path_len, not the record; idle streams and agents are dropped after
+  `ingest.stream_idle_timeout` (1 h) and the least recently used beyond
+  `ingest.max_streams` (100,000). A dropped stream is restored from ClickHouse
+  like after a restart, a dropped agent's high-water mark is re-read.
+- **No silent loss on stale batches**: a batch whose seqs all lie more than
+  100,000 below the agent's stored ones gets 409 instead of 200 "duplicates",
+  so the agent keeps it and its errors show the problem (a reset spool, or
+  someone else using the agent_id). A jump limit on seqs was not added: it
+  would not stop a spoofer who stays under it, and authentication of agents is
+  the proxy's job (§2).
+- **Inserts are not cancelled with the request**: if the agent disconnects
+  after ClickHouse committed, the high-water mark still moves; after a failed
+  insert it is re-read from storage before the next batch.
+- **Read API**: at most `query.max_concurrent` (8) requests at once; every
+  SELECT carries `max_execution_time` (the client timeout minus 5 s) and
+  `cancel_http_readonly_queries_on_client_close=1`.
+- **ClickHouse client**: parameter values are escaped for ClickHouse's
+  escaped format (a trailing backslash used to fail the query, `\t` turned
+  into a tab); credentials in `clickhouse.url` are refused (use `user` and
+  `password`); `/readyz` no longer returns ClickHouse's error text.
+- **ASN database**: at most 64 MiB downloaded and 256 MiB uncompressed (it
+  is about 7 and 30 MB), 5 million ranges, AS names cut to 128 bytes without
+  control characters; redirects from https to http are refused; a plain-http
+  URL is warned about at startup.
+
