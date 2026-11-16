@@ -1,0 +1,61 @@
+# systemd unit for the hopcorder agent.
+#
+#   install -m 0755 hopcorder /usr/local/bin/hopcorder
+#   install -D -m 0644 deploy/agent.example.yaml /etc/hopcorder/agent.yaml
+#   install -m 0644 deploy/hopcorder.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hopcorder
+#
+# The agent runs as an unprivileged dynamic user. Its only capability is
+# CAP_NET_RAW (raw ICMP/UDP sockets), granted as an ambient capability, so the
+# binary needs no setcap. The spool lives in StateDirectory (/var/lib/hopcorder)
+# and a JSONL file, if configured, in LogsDirectory (/var/log/hopcorder).
+
+[Unit]
+Description=hopcorder network path recorder (agent)
+Documentation=https://github.com/Saremox/hopcorder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hopcorder agent --config /etc/hopcorder/agent.yaml
+Restart=always
+RestartSec=5s
+# SIGTERM: stop probing, give outputs a few seconds, exit. Spooled records
+# survive; this only bounds how long systemd waits.
+TimeoutStopSec=15s
+
+DynamicUser=yes
+StateDirectory=hopcorder
+LogsDirectory=hopcorder
+ConfigurationDirectory=hopcorder
+
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=yes
+
+# Hardening. Raw sockets need AF_INET/AF_INET6; AF_NETLINK is used by the Go
+# resolver and route lookups, AF_UNIX by the system resolver.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

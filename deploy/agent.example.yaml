@@ -1,0 +1,57 @@
+# hopcorder agent configuration. Every key is optional unless marked required;
+# the values shown are the defaults. Unknown keys are rejected at startup.
+
+# agent_id: lab-01              # default: the hostname
+interval: 5s                    # minimum period between cycles, per target
+timeout: 1s                     # per-probe timeout; must be < interval
+max_ttl: 30                     # TTLs 1..max_ttl are probed at once each cycle
+probe_past: 2                   # silent TTLs kept past the last responder if unreached
+protocol: icmp                  # default for targets: icmp or udp
+paris: true                     # flow-stable probing (keeps ECMP on one path)
+dns_ttl: 5m                     # re-resolve hostnames this often
+
+log:
+  level: info                   # debug, info, warn, error
+  format: text                  # text or json
+
+spool:
+  dir: /var/lib/hopcorder       # required (except with --once)
+  max_age: 168h
+  max_bytes: 1GiB
+
+targets:                        # required: at least one
+  - host: example.net
+  - host: 192.0.2.10
+    protocol: udp
+    port: 33434                 # udp only; default 33434
+  # Per-target overrides: protocol, port, af (4|6), flow_id, paris,
+  # interval, timeout, max_ttl, probe_past.
+  # - host: dual-stack.example.net
+  #   af: 6
+  #   interval: 30s
+
+outputs:                        # at least one
+  jsonl:
+    path: /var/log/hopcorder/records.jsonl   # "-" for stdout
+
+  # http:
+  #   url: https://hopcorder.example.net     # POSTs to <url>/api/v1/ingest
+  #   bearer_token_file: /etc/hopcorder/token
+  #   # or: bearer_token: "..."
+  #   # or: basic_auth: {username: agent, password_file: /etc/hopcorder/password}
+  #   headers: {X-Tenant: lab}
+  #   tls:
+  #     ca_file: /etc/hopcorder/ca.pem       # replaces the system roots
+  #     cert_file: /etc/hopcorder/client.pem # client certificate (mTLS)
+  #     key_file: /etc/hopcorder/client.key
+  #     server_name: ""
+  #   timeout: 30s
+  #   batch_max_records: 500
+  #   batch_max_bytes: 1MiB
+  #   flush_interval: 10s
+  #   retry_min: 1s
+  #   retry_max: 1m
+
+  # metrics:
+  #   listen: 127.0.0.1:9469
+  #   path: /metrics
