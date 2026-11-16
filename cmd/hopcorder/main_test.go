@@ -44,7 +44,7 @@ func TestAgentRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func parseAgentFlags(t *testing.T, args ...string) (*flag.FlagSet, *agentFlags) {
+func parseAgentFlags(t *testing.T, args ...string) (*flag.FlagSet, *agentFlags, []string) {
 	t.Helper()
 	var f agentFlags
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -55,10 +55,18 @@ func parseAgentFlags(t *testing.T, args ...string) (*flag.FlagSet, *agentFlags) 
 	fs.StringVar(&f.jsonl, "jsonl", "", "")
 	fs.IntVar(&f.af, "af", 0, "")
 	fs.BoolVar(&f.paris, "paris", true, "")
-	if err := fs.Parse(args); err != nil {
+	targets, err := parseInterspersed(fs, args)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return fs, &f
+	return fs, &f, targets
+}
+
+func TestFlagsMayFollowTargets(t *testing.T) {
+	_, f, targets := parseAgentFlags(t, "a.example", "-protocol", "udp", "b.example", "--once", "--", "-weird-host")
+	if strings.Join(targets, ",") != "a.example,b.example,-weird-host" || f.protocol != "udp" || !f.once {
+		t.Errorf("targets %v protocol %q once %v", targets, f.protocol, f.once)
+	}
 }
 
 func TestBuildConfigFlagsOverrideFile(t *testing.T) {
@@ -76,8 +84,8 @@ outputs: {jsonl: {path: /var/log/x.jsonl}}
 	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fs, f := parseAgentFlags(t, "-config", p, "-interval", "2s", "-jsonl", "-", "-paris=false")
-	cfg, err := buildConfig(fs, f)
+	fs, f, targets := parseAgentFlags(t, "-config", p, "-interval", "2s", "-jsonl", "-", "-paris=false")
+	cfg, err := buildConfig(fs, f, targets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +97,8 @@ outputs: {jsonl: {path: /var/log/x.jsonl}}
 			cfg.Targets[0].Interval.D(), cfg.Targets[1].Interval.D())
 	}
 
-	fs, f = parseAgentFlags(t, "-config", p, "-once", "-af", "6", "-protocol", "udp", "x.example")
-	cfg, err = buildConfig(fs, f)
+	fs, f, targets = parseAgentFlags(t, "-config", p, "x.example", "-once", "-af", "6", "-protocol", "udp")
+	cfg, err = buildConfig(fs, f, targets)
 	if err != nil {
 		t.Fatal(err)
 	}
