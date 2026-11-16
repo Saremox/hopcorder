@@ -199,20 +199,60 @@ func DetectLoops(hops []Hop) []Loop {
 	return loops
 }
 
+// Limits of a valid record. They match the storage schema (TTLs and path
+// lengths are UInt8, RTTs UInt32, ICMP codes 0-255) and keep one record
+// small, since the server buffers and parses records from untrusted agents.
+const (
+	MaxHops        = 255
+	MaxMPLSLabels  = 16
+	MaxAgentIDLen  = 128
+	MaxTargetLen   = 255
+	maxPathHashLen = 64
+)
+
+// The time range a record's ts must fall into (ClickHouse DateTime64 covers
+// 1900-2299; Go's UnixNano 1678-2262).
+var (
+	minTS = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxTS = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// ValidAgentID reports whether s may be an agent_id: 1 to MaxAgentIDLen
+// characters from [A-Za-z0-9._:-]. The narrow character set keeps the value
+// safe wherever it is shown or quoted (dashboards, logs, URLs).
+func ValidAgentID(s string) bool {
+	return len(s) > 0 && len(s) <= MaxAgentIDLen && !strings.ContainsFunc(s, func(c rune) bool {
+		return !isAlnum(c) && c != '.' && c != '_' && c != ':' && c != '-'
+	})
+}
+
+// ValidTarget reports whether s may be a target: a host name or an IP
+// address (with an IPv6 zone), 1 to MaxTargetLen characters from
+// [A-Za-z0-9._:%-].
+func ValidTarget(s string) bool {
+	return len(s) > 0 && len(s) <= MaxTargetLen && !strings.ContainsFunc(s, func(c rune) bool {
+		return !isAlnum(c) && c != '.' && c != '_' && c != ':' && c != '%' && c != '-'
+	})
+}
+
+func isAlnum(c rune) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
 // Validate checks that r is a well-formed schema-1 record.
 func (r *Record) Validate() error {
 	var errs []error
 	if r.Schema != SchemaVersion {
 		errs = append(errs, fmt.Errorf("schema %d, want %d", r.Schema, SchemaVersion))
 	}
-	if r.AgentID == "" {
-		errs = append(errs, errors.New("agent_id is empty"))
+	if !ValidAgentID(r.AgentID) {
+		errs = append(errs, fmt.Errorf("agent_id: want 1 to %d characters from [A-Za-z0-9._:-]", MaxAgentIDLen))
 	}
-	if r.TS.IsZero() {
-		errs = append(errs, errors.New("ts is zero"))
+	if r.TS.Before(minTS) || !r.TS.Before(maxTS) {
+		errs = append(errs, errors.New("ts out of range"))
 	}
-	if r.Target == "" {
-		errs = append(errs, errors.New("target is empty"))
+	if !ValidTarget(r.Target) {
+		errs = append(errs, fmt.Errorf("target: want a host name or address of 1 to %d characters", MaxTargetLen))
 	}
 	switch {
 	case !r.TargetIP.IsValid():
@@ -222,17 +262,29 @@ func (r *Record) Validate() error {
 	case r.AF != 4 && r.AF != 6:
 		errs = append(errs, fmt.Errorf("af %d, want 4 or 6", r.AF))
 	}
-	if r.Protocol == "" {
-		errs = append(errs, errors.New("protocol is empty"))
+	switch r.Protocol {
+	case "icmp", "udp", "tcp":
+	default:
+		errs = append(errs, errors.New("protocol: want icmp, udp or tcp"))
+	}
+	if len(r.PathHash) > maxPathHashLen || strings.ContainsFunc(r.PathHash, func(c rune) bool { return c < '!' || c > '~' }) {
+		errs = append(errs, errors.New("path_hash: want at most 64 printable characters"))
 	}
 	if r.FlowID < 0 || r.FlowID > 0xffff {
 		errs = append(errs, fmt.Errorf("flow_id %d out of range", r.FlowID))
+	}
+	if len(r.Hops) > MaxHops {
+		// Stop here: the per-hop checks below would only repeat it.
+		return errors.Join(append(errs, fmt.Errorf("%d hops, at most %d", len(r.Hops), MaxHops))...)
 	}
 	if r.PathLen != len(r.Hops) {
 		errs = append(errs, fmt.Errorf("path_len %d but %d hops", r.PathLen, len(r.Hops)))
 	}
 	if r.Loops == nil {
 		errs = append(errs, errors.New("loops is null"))
+	}
+	if err := validateLoops(r.Loops, len(r.Hops)); err != nil {
+		errs = append(errs, err)
 	}
 	for i, h := range r.Hops {
 		if err := h.validate(); err != nil {
@@ -243,6 +295,26 @@ func (r *Record) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// validateLoops checks that loops could have come from hops hops: at most
+// one entry per hop, each a valid address seen at 2 or more distinct,
+// increasing TTLs within the path.
+func validateLoops(loops []Loop, hops int) error {
+	if len(loops) > hops {
+		return fmt.Errorf("%d loops for %d hops", len(loops), hops)
+	}
+	for i, l := range loops {
+		if !l.IP.IsValid() || len(l.TTLs) < 2 || len(l.TTLs) > hops {
+			return fmt.Errorf("loops[%d]: want an address seen at 2 to %d TTLs", i, hops)
+		}
+		for j, ttl := range l.TTLs {
+			if ttl < 1 || ttl > hops || (j > 0 && ttl <= l.TTLs[j-1]) {
+				return fmt.Errorf("loops[%d]: ttls must increase within 1..%d", i, hops)
+			}
+		}
+	}
+	return nil
 }
 
 func (h Hop) validate() error {
@@ -256,11 +328,20 @@ func (h Hop) validate() error {
 		if h.RTTMicros <= 0 {
 			return fmt.Errorf("status %s without rtt_us", h.Status)
 		}
+		if h.RTTMicros > 1<<32-1 {
+			return errors.New("rtt_us out of range")
+		}
 	} else if h.IP.IsValid() || h.RTTMicros != 0 {
 		return errors.New("no-reply hop carries ip or rtt_us")
 	}
 	if (h.Status == StatusUnreachable) != (h.Code != nil) {
 		return errors.New("code must be set exactly for unreachable hops")
+	}
+	if h.Code != nil && (*h.Code < 0 || *h.Code > 255) {
+		return errors.New("code out of range")
+	}
+	if len(h.MPLS) > MaxMPLSLabels {
+		return fmt.Errorf("%d MPLS labels, at most %d", len(h.MPLS), MaxMPLSLabels)
 	}
 	if len(h.MPLS) > 0 && h.Status != StatusTTLExpired && h.Status != StatusUnreachable {
 		return fmt.Errorf("status %s carries an MPLS label stack", h.Status)
