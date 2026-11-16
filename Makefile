@@ -2,7 +2,7 @@ GO      ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test race vet lint rawsock clickhouse setcap clean
+.PHONY: all build test race vet lint rawsock clickhouse grafana up down setcap clean
 
 all: vet lint test build
 
@@ -17,11 +17,11 @@ race:
 
 vet:
 	$(GO) vet ./...
-	$(GO) vet -tags rawsock,clickhouse ./...
+	$(GO) vet -tags rawsock,clickhouse,grafana ./...
 
 lint:
 	golangci-lint run
-	golangci-lint run --build-tags rawsock,clickhouse
+	golangci-lint run --build-tags rawsock,clickhouse,grafana
 
 # Raw-socket tests. They skip themselves unless the test binary has CAP_NET_RAW;
 # the netns test additionally needs CAP_SYS_ADMIN and iproute2.
@@ -33,6 +33,19 @@ rawsock:
 HOPCORDER_CLICKHOUSE_URL ?= http://127.0.0.1:8123
 clickhouse:
 	HOPCORDER_CLICKHOUSE_URL=$(HOPCORDER_CLICKHOUSE_URL) $(GO) test -tags clickhouse -count=1 ./internal/server/... ./cmd/hopcorder/...
+
+# The docker-compose try-out stack (ClickHouse, server, agent, Grafana).
+COMPOSE ?= docker compose -f deploy/docker-compose.yml
+up:
+	$(COMPOSE) up -d --build --wait
+down:
+	$(COMPOSE) down
+
+# Every dashboard query through Grafana and the ClickHouse plugin, against
+# the running stack (make up).
+grafana:
+	HOPCORDER_SERVER_URL=http://127.0.0.1:8080 HOPCORDER_GRAFANA_URL=http://127.0.0.1:3000 \
+		$(GO) test -tags grafana -count=1 ./dashboards/
 
 # Grant the built binary the one capability it needs (no root at runtime).
 setcap: build

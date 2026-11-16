@@ -1,0 +1,86 @@
+# Five-minute try-out on a Linux host: ClickHouse, the hopcorder server, an
+# agent tracing a few public targets and Grafana with the dashboards. From the
+# repository root:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# then open http://localhost:3000 (anonymous read access; admin/admin to edit).
+# The agent's targets are in deploy/compose/agent.yaml. Every published port
+# listens on localhost only, and nothing here has a password: this is not a
+# production setup (see README.md).
+name: hopcorder
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1" # the passwordless default user, as in ClickHouse's own defaults
+    ports: ["127.0.0.1:8123:8123"]
+    volumes: ["clickhouse:/var/lib/clickhouse"]
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+
+  server:
+    build: { context: .., dockerfile: Dockerfile }
+    image: hopcorder:local
+    command: ["server", "--config", "/etc/hopcorder/server.yaml"]
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - ./compose/server.yaml:/etc/hopcorder/server.yaml:ro
+      - server:/var/lib/hopcorder-server
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    restart: unless-stopped
+
+  agent:
+    image: hopcorder:local
+    command: ["agent", "--config", "/etc/hopcorder/agent.yaml"]
+    # Trace from the host's own network rather than through Docker's NAT.
+    network_mode: host
+    # Raw sockets: root with CAP_NET_RAW and nothing else.
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_RAW]
+    volumes:
+      - ./compose/agent.yaml:/etc/hopcorder/agent.yaml:ro
+      - agent:/var/lib/hopcorder
+    depends_on: [server]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.1
+    environment:
+      GF_PLUGINS_PREINSTALL_SYNC: grafana-clickhouse-datasource@4.23.5
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/hopcorder/hopcorder.json
+      # Read by grafana/provisioning/datasources/hopcorder.yaml.
+      HOPCORDER_CLICKHOUSE_HOST: clickhouse
+      HOPCORDER_CLICKHOUSE_PORT: "8123"
+      HOPCORDER_CLICKHOUSE_DATABASE: hopcorder
+      HOPCORDER_CLICKHOUSE_USER: default
+      HOPCORDER_CLICKHOUSE_PASSWORD: ""
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../dashboards:/var/lib/grafana/dashboards/hopcorder:ro
+      - grafana:/var/lib/grafana
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+    restart: unless-stopped
+
+volumes:
+  clickhouse:
+  server:
+  agent:
+  grafana:
