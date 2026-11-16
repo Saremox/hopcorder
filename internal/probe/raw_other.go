@@ -24,6 +24,9 @@ func (*Raw) Trace(context.Context, TraceRequest) ([]HopResult, error) {
 	return nil, errUnsupportedOS
 }
 
+// HoldFlows always fails on this operating system.
+func (*Raw) HoldFlows([]Flow) error { return errUnsupportedOS }
+
 // Stats returns zero counters.
 func (*Raw) Stats() Stats { return Stats{} }
 

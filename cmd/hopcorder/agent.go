@@ -44,6 +44,7 @@ type agentFlags struct {
 	maxTTL        int
 	probePast     int
 	protocol      string
+	flowID        int
 	paris         bool
 	af            int
 	spoolDir      string
@@ -69,6 +70,8 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	fs.IntVar(&f.maxTTL, "max-ttl", 0, "highest TTL probed (default 30)")
 	fs.IntVar(&f.probePast, "probe-past", 0, "TTLs kept beyond the last responding hop of an unreached target (default 2)")
 	fs.StringVar(&f.protocol, "protocol", "", "default probe protocol: icmp, udp or tcp (default icmp)")
+	fs.IntVar(&f.flowID, "flow-id", 0, "default flow_id: ICMP identifier, UDP/TCP source port (default 33434); "+
+		"processes on one host need different ones")
 	fs.BoolVar(&f.paris, "paris", true, "keep the flow identifier constant across TTLs (paris traceroute)")
 	fs.IntVar(&f.af, "af", 0, "address family (4 or 6) for targets given as arguments")
 	fs.StringVar(&f.spoolDir, "spool-dir", "", "spool directory")
@@ -212,6 +215,8 @@ func buildConfig(fs *flag.FlagSet, f *agentFlags, targets []string) (*config.Con
 			cfg.ProbePast = &f.probePast
 		case "protocol":
 			cfg.Protocol = f.protocol
+		case "flow-id":
+			cfg.FlowID = f.flowID
 		case "paris":
 			cfg.Paris = &f.paris
 		case "spool-dir":
@@ -268,9 +273,31 @@ func agentTargets(cfg *config.Config) []agent.Target {
 	return out
 }
 
+// holdFlows makes the prober hold the local identifiers of the targets'
+// flows (see probe.FlowHolder), releasing those of earlier configurations.
+func holdFlows(prober probe.Prober, targets []agent.Target) error {
+	h, ok := prober.(probe.FlowHolder)
+	if !ok {
+		return nil
+	}
+	flows := make([]probe.Flow, len(targets))
+	for i, t := range targets {
+		flows[i] = probe.Flow{Protocol: t.Protocol, ID: t.FlowID}
+	}
+	if err := h.HoldFlows(flows); err != nil {
+		return fmt.Errorf("%w (set another with --flow-id or flow_id in the config)", err)
+	}
+	return nil
+}
+
 func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger, stdout io.Writer) int {
+	targets := agentTargets(cfg)
+	if err := holdFlows(prober, targets); err != nil {
+		logger.Error("cannot start", "err", err)
+		return 1
+	}
 	a, err := agent.New(agent.Options{
-		AgentID: cfg.AgentID, Targets: agentTargets(cfg), DNSTTL: cfg.DNSTTL.D(),
+		AgentID: cfg.AgentID, Targets: targets, DNSTTL: cfg.DNSTTL.D(),
 		Prober: prober, Logger: logger,
 	})
 	if err != nil {
@@ -298,6 +325,12 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 var shutdownGrace = 3 * time.Second
 
 func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger) error {
+	// First, so that a flow another process holds fails the start (or the
+	// reload) before anything else is opened.
+	targets := agentTargets(cfg)
+	if err := holdFlows(prober, targets); err != nil {
+		return err
+	}
 	var outs []output.Output
 	var drainOpts []output.DrainOptions
 	defer func() {
@@ -356,7 +389,6 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		}
 	}()
 
-	targets := agentTargets(cfg)
 	var observer agent.Observer
 	if mc := cfg.Outputs.Metrics; mc != nil {
 		stats, _ := prober.(probe.StatsProvider)

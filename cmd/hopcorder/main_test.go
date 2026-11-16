@@ -56,6 +56,7 @@ func parseAgentFlags(t *testing.T, args ...string) (*flag.FlagSet, *agentFlags, 
 	fs.BoolVar(&f.once, "once", false, "")
 	fs.DurationVar(&f.interval, "interval", 0, "")
 	fs.StringVar(&f.protocol, "protocol", "", "")
+	fs.IntVar(&f.flowID, "flow-id", 0, "")
 	fs.StringVar(&f.jsonl, "jsonl", "", "")
 	fs.IntVar(&f.af, "af", 0, "")
 	fs.BoolVar(&f.paris, "paris", true, "")
@@ -107,7 +108,16 @@ outputs: {jsonl: {path: /var/log/x.jsonl}}
 		t.Fatal(err)
 	}
 	if len(cfg.Targets) != 1 || cfg.Targets[0].Host != "x.example" || cfg.Targets[0].AF != 6 ||
-		cfg.Targets[0].Protocol != "udp" || cfg.Targets[0].Port != 33434 {
+		cfg.Targets[0].Protocol != "udp" || cfg.Targets[0].Port != 33434 || cfg.Targets[0].FlowID != 33434 {
 		t.Errorf("positional targets: %+v", cfg.Targets)
+	}
+
+	// --flow-id sets the default flow_id, e.g. for --once next to the daemon.
+	fs, f, targets = parseAgentFlags(t, "x.example", "-once", "-flow-id", "40000")
+	if cfg, err = buildConfig(fs, f, targets); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Targets[0].FlowID != 40000 {
+		t.Errorf("flow_id %d, want 40000 from --flow-id", cfg.Targets[0].FlowID)
 	}
 }

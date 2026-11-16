@@ -119,6 +119,37 @@ outputs: {jsonl: {path: "-"}}
 		b.FlowID != 4242 || b.AF != 6 || *b.AdaptiveMaxTTL {
 		t.Errorf("target b: %+v", b)
 	}
+	if a.FlowID != DefaultFlowID {
+		t.Errorf("target a flow_id %d, want the default %d", a.FlowID, DefaultFlowID)
+	}
+}
+
+// A global flow_id is the default for targets without their own.
+func TestGlobalFlowID(t *testing.T) {
+	c, err := finalize(t, `
+flow_id: 40000
+targets:
+  - host: example.net
+  - host: example.org
+    flow_id: 4242
+spool: {dir: /tmp/x}
+outputs: {jsonl: {path: "-"}}
+`, FinalizeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Targets[0].FlowID != 40000 || c.Targets[1].FlowID != 4242 {
+		t.Errorf("flow_ids %d %d, want 40000 4242", c.Targets[0].FlowID, c.Targets[1].FlowID)
+	}
+	if _, err := finalize(t, `
+flow_id: 70000
+targets: [{host: example.net, flow_id: 1}]
+spool: {dir: /tmp/x}
+outputs: {jsonl: {path: "-"}}
+`, FinalizeOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "flow_id 70000") {
+		t.Errorf("global flow_id 70000: err = %v", err)
+	}
 }
 
 func TestValidationReportsEverything(t *testing.T) {

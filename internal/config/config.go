@@ -54,7 +54,10 @@ type Config struct {
 	MaxTTL    int      `yaml:"max_ttl"`
 	ProbePast *int     `yaml:"probe_past"`
 	Protocol  string   `yaml:"protocol"`
-	Paris     *bool    `yaml:"paris"`
+	// FlowID is the default flow_id of targets (ICMP identifier, UDP or TCP
+	// source port). Every hopcorder process on a host needs its own.
+	FlowID int   `yaml:"flow_id"`
+	Paris  *bool `yaml:"paris"`
 	// AdaptiveMaxTTL probes only a few TTLs past the destination's last
 	// distance; cycles that fall short are extended in the same cycle.
 	AdaptiveMaxTTL *bool    `yaml:"adaptive_max_ttl"`
@@ -220,6 +223,7 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 	if c.Protocol == "" {
 		c.Protocol = DefaultProtocol
 	}
+	setInt(&c.FlowID, DefaultFlowID)
 	if c.Paris == nil {
 		c.Paris = ptr(true)
 	}
@@ -254,6 +258,9 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 	}
 	if c.DNSTTL.D() < time.Second {
 		fail("dns_ttl %s: must be at least 1s", c.DNSTTL.D())
+	}
+	if c.FlowID < 1 || c.FlowID > 65535 {
+		fail("flow_id %d: out of range 1..65535", c.FlowID)
 	}
 
 	if len(c.Targets) == 0 {
@@ -323,7 +330,7 @@ func (c *Config) defaultTarget(t *Target) {
 		}
 	}
 	if t.FlowID == 0 {
-		t.FlowID = DefaultFlowID
+		t.FlowID = c.FlowID
 	}
 	if t.Paris == nil {
 		t.Paris = c.Paris

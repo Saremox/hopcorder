@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -52,6 +53,11 @@ type Raw struct {
 	v6     *raw6
 	wg     sync.WaitGroup
 
+	// held are the ping sockets holding echo identifiers (see HoldFlows).
+	holdMu     sync.Mutex
+	held       map[heldID]io.Closer
+	holdLogged map[bool]bool // by v6: "cannot hold" was logged
+
 	// kernelStamped counts replies whose receive time came from the kernel.
 	kernelStamped atomic.Uint64
 }
@@ -74,7 +80,7 @@ func NewRaw(logger *slog.Logger) *Raw {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	r := &Raw{log: logger}
+	r := &Raw{log: logger, held: map[heldID]io.Closer{}, holdLogged: map[bool]bool{}}
 	r.eng = newEngine(r)
 	return r
 }
@@ -125,6 +131,12 @@ func (r *Raw) Close() error {
 		}
 	}
 	r.mu.Unlock()
+	r.holdMu.Lock()
+	for h, c := range r.held {
+		errs = append(errs, c.Close())
+		delete(r.held, h)
+	}
+	r.holdMu.Unlock()
 	r.wg.Wait()
 	return errors.Join(errs...)
 }
@@ -201,6 +213,9 @@ var (
 		bpf.RetConstant{Val: 0},
 	}
 )
+
+// dropAll is a socket filter that drops every packet.
+var dropAll = []bpf.Instruction{bpf.RetConstant{Val: 0}}
 
 type bpfSetter interface {
 	SetBPF([]bpf.RawInstruction) error
@@ -292,11 +307,7 @@ func (r *Raw) open6For(needUDP, needTCP bool) (*raw6, error) {
 			return nil, err
 		}
 		pc := ipv6.NewPacketConn(c)
-		drop, err := bpf.Assemble([]bpf.Instruction{bpf.RetConstant{Val: 0}})
-		if err == nil {
-			err = pc.SetBPF(drop)
-		}
-		if err != nil {
+		if err := setFilter(pc, dropAll); err != nil {
 			r.log.Warn("cannot install drop filter on raw UDPv6 socket", "err", err)
 		}
 		r.v6.udp = pc

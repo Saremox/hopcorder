@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net/netip"
 	"reflect"
 	"runtime"
@@ -50,6 +51,9 @@ type simPath struct {
 	dup bool
 	// mpls maps TTL -> label stack the router at that TTL reports.
 	mpls map[int][]record.MPLSLabel
+	// otherIPID makes ICMPv4 errors quote another IP identification than
+	// the probe carried, like those for another process's packet.
+	otherIPID bool
 }
 
 func newSim() *simNet {
@@ -139,6 +143,9 @@ func (s *simNet) reply(path *simPath, p *outPacket, ttl int) (netip.Addr, []byte
 			typ = icmp4TimeExceeded
 		}
 		msg := icmpError(typ, 0, p)
+		if path.otherIPID && v4 {
+			binary.BigEndian.PutUint16(msg[8+4:], p.ipID^0x5a5a)
+		}
 		if l, ok := path.mpls[ttl]; ok {
 			msg = withMPLS(msg, !v4, l)
 		}
@@ -149,7 +156,11 @@ func (s *simNet) reply(path *simPath, p *outPacket, ttl int) (netip.Addr, []byte
 		return p.dst, synAck(p)
 	case p.proto == protoUDP:
 		if v4 {
-			return p.dst, icmpError(icmp4Unreachable, icmp4PortUnreach, p)
+			msg := icmpError(icmp4Unreachable, icmp4PortUnreach, p)
+			if path.otherIPID {
+				binary.BigEndian.PutUint16(msg[8+4:], p.ipID^0x5a5a)
+			}
+			return p.dst, msg
 		}
 		return p.dst, icmpError(icmp6Unreachable, icmp6PortUnreach, p)
 	default: // echo reply: same message with the reply type
@@ -698,6 +709,177 @@ func TestEngineMPLSLabels(t *testing.T) {
 			}
 			if res[1].MPLS != nil {
 				t.Errorf("destination reply carries labels: %+v", res[1])
+			}
+		})
+	}
+}
+
+// An ICMPv4 error must quote the IP identification the probe was sent with.
+// An unprivileged process can send packets with the probe's ports, UDP
+// checksum or echo sequence (and so draw errors that quote its key), but
+// cannot choose the IP ID.
+func TestEngineQuotedIPIDMustMatch(t *testing.T) {
+	for _, proto := range []Protocol{ICMP, UDP, TCP} {
+		t.Run(string(proto), func(t *testing.T) {
+			s := newSim()
+			dst := netip.MustParseAddr("198.51.100.7")
+			s.setPath(dst, &simPath{routers: addrs("10.0.0.1", "10.0.0.2"), otherIPID: true})
+			res, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: proto, Port: 33434, FlowID: 1,
+				Paris: true, MaxTTL: 3, Timeout: 50 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []wantHop{{record.StatusNoReply, "", 0}, {record.StatusNoReply, "", 0}, {record.StatusReply, "198.51.100.7", 0}}
+			if proto == UDP { // the destination's answer is an ICMP error too
+				want[2] = wantHop{record.StatusNoReply, "", 0}
+			}
+			checkResults(t, res, want)
+			s.wg.Wait()
+			wantMismatched := uint64(2)
+			if proto == UDP {
+				wantMismatched = 3
+			}
+			if got := s.eng.stats().MismatchedReplies; got != wantMismatched {
+				t.Errorf("mismatched replies = %d, want %d", got, wantMismatched)
+			}
+			// Every IPv4 probe carries its probe id as IP ID.
+			for _, p := range s.sent {
+				if p.ipID != probeID(p) {
+					t.Errorf("probe id %d sent with IP ID %d", probeID(p), p.ipID)
+				}
+			}
+		})
+	}
+}
+
+// Probe ids are random, so knowing the ids of some probes of a cycle (from
+// the destination's answers) does not reveal the others.
+func TestEngineRandomIDs(t *testing.T) {
+	s := newSim()
+	dst := netip.MustParseAddr("198.51.100.7")
+	s.setPath(dst, &simPath{routers: addrs("*", "*"), blackhole: true})
+	var ids []uint16
+	for range 40 {
+		if _, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: UDP, Port: 33434, FlowID: 1,
+			Paris: true, MaxTTL: 30, Timeout: time.Millisecond}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[uint16]bool{}
+	consecutive := 0
+	for i, p := range s.sent {
+		id := probeID(p)
+		ids = append(ids, id)
+		if id == 0 || id == 0xffff {
+			t.Fatalf("probe id %d", id)
+		}
+		if i > 0 && id == ids[i-1]+1 {
+			consecutive++
+		}
+		seen[id] = true
+	}
+	// Every earlier probe is still tombstoned (nothing answers), so no id
+	// may repeat; 1200 random ids hold ~0.02 consecutive pairs.
+	if len(seen) != len(ids) {
+		t.Errorf("%d probes but %d distinct ids although all were tombstoned", len(ids), len(seen))
+	}
+	if consecutive > 3 {
+		t.Errorf("%d of %d ids follow their predecessor", consecutive, len(ids))
+	}
+}
+
+func TestAllocIDAvoidsInFlightAndTombstonedKeys(t *testing.T) {
+	seed := [32]byte{1, 2, 3}
+	draws := rand.New(rand.NewChaCha8(seed))
+	next := func() uint16 { return uint16(1 + draws.IntN(0xfffe)) }
+	first, second, third := next(), next(), next()
+
+	e := newEngine(nil)
+	e.ids = rand.New(rand.NewChaCha8(seed))
+	keyOf := func(id uint16) probeKey { return probeKey{dst: dst4, proto: protoUDP, a: 1, b: 2, c: id} }
+	e.pending[keyOf(first)] = &pendingProbe{}
+	e.tombs[keyOf(second)] = time.Now().Add(time.Minute)
+	id, k, err := e.allocIDLocked(keyOf)
+	if err != nil || id != third || k != keyOf(third) {
+		t.Fatalf("alloc = %d %+v %v, want %d (draws %d and %d are taken)", id, k, err, third, first, second)
+	}
+
+	// With every id but one in flight, the free one is found.
+	e = newEngine(nil)
+	for id := uint16(1); id < 0xffff; id++ {
+		e.pending[keyOf(id)] = &pendingProbe{}
+	}
+	delete(e.pending, keyOf(4242))
+	if id, _, err := e.allocIDLocked(keyOf); err != nil || id != 4242 {
+		t.Errorf("alloc = %d %v, want 4242", id, err)
+	}
+	// With every id in flight, allocation fails rather than steal one.
+	e.pending[keyOf(4242)] = &pendingProbe{}
+	if _, _, err := e.allocIDLocked(keyOf); err == nil {
+		t.Error("allocated an in-flight id")
+	}
+	// A tombstoned id is reused only when nothing else is free.
+	e = newEngine(nil)
+	for id := uint16(1); id < 0xffff; id++ {
+		e.tombs[keyOf(id)] = time.Now().Add(time.Minute)
+	}
+	e.pending[keyOf(7)] = &pendingProbe{}
+	if id, _, err := e.allocIDLocked(keyOf); err != nil || id == 7 {
+		t.Errorf("alloc = %d %v, want a tombstoned id other than 7", id, err)
+	}
+}
+
+// A reply the kernel received before the probe was sent (its timestamp is
+// moved back to the kernel's) cannot answer it.
+func TestEngineReplyBeforeSendIgnored(t *testing.T) {
+	e := newEngine(nil)
+	tr := &traceState{req: TraceRequest{Protocol: ICMP, Timeout: time.Second}, first: 1,
+		target: dst4, results: NoRepliesRange(1, 2), remaining: 2, done: make(chan struct{})}
+	sent := time.Now()
+	k := probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 7}
+	reply := buildEcho(src4, dst4, 33434, 7, true)
+	reply[0] = icmp4EchoReply
+	e.pending[k] = &pendingProbe{tr: tr, ttl: 2, echo: reply[8:], sent: sent}
+	e.resolve(dst4, icmpReply{kind: kindEchoReply, key: k}, sent.Add(-50*time.Millisecond), reply)
+	if got := tr.results[1]; got.Status != record.StatusNoReply || e.pending[k] == nil {
+		t.Fatalf("early reply accepted: %+v", got)
+	}
+	e.resolve(dst4, icmpReply{kind: kindEchoReply, key: k}, sent.Add(3*time.Millisecond), reply)
+	if got := tr.results[1]; got.Status != record.StatusReply || got.RTT != 3*time.Millisecond {
+		t.Errorf("the real reply was not taken: %+v", got)
+	}
+}
+
+// An echo reply must carry the probe's data: another process can send echo
+// requests with the probe's identifier and sequence number (a ping with a
+// chosen identifier), but its replies echo its own data.
+func TestEngineEchoReplyMustCarryProbeData(t *testing.T) {
+	for _, target := range []string{"198.51.100.7", "2001:db8:1::7"} {
+		t.Run(target, func(t *testing.T) {
+			e := newEngine(nil)
+			dst := netip.MustParseAddr(target)
+			tr := &traceState{req: TraceRequest{Protocol: ICMP, Timeout: time.Second}, first: 1,
+				target: dst, results: NoRepliesRange(1, 1), remaining: 1, done: make(chan struct{})}
+			src, proto, typ := src4, uint8(protoICMP), uint8(icmp4EchoReply)
+			if dst.Is6() {
+				src, proto, typ = src6, protoICMPv6, icmp6EchoReply
+			}
+			probe := buildEcho(src, dst, 33434, 9, true)
+			k := probeKey{dst: dst, proto: proto, a: 33434, c: 9}
+			e.pending[k] = &pendingProbe{tr: tr, ttl: 1, echo: probe[8:], sent: time.Now()}
+
+			other := []byte{typ, 0, 0, 0, 0x82, 0x9a, 0, 9} // same id and seq, a ping's data
+			other = append(other, "0123456789abcdef"...)
+			e.handle(dst, other, time.Now())
+			short := append([]byte{typ, 0, 0, 0, 0x82, 0x9a, 0, 9}, probe[8:12]...) // truncated data
+			e.handle(dst, short, time.Now())
+			if tr.results[0].Status != record.StatusNoReply || e.stats().MismatchedReplies != 2 {
+				t.Fatalf("foreign echo reply taken: %+v, mismatched %d", tr.results[0], e.stats().MismatchedReplies)
+			}
+			ours := append([]byte{typ, 0, 0, 0}, probe[4:]...)
+			e.handle(dst, ours, time.Now())
+			if tr.results[0].Status != record.StatusReply {
+				t.Errorf("the probe's own echo reply was not taken: %+v", tr.results[0])
 			}
 		})
 	}

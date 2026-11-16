@@ -74,6 +74,10 @@ type icmpReply struct {
 	kind replyKind
 	code uint8
 	key  probeKey
+	// ipID is the identification field of a quoted IPv4 header; quotedIPID
+	// says whether there was one (ICMPv4 errors).
+	ipID       uint16
+	quotedIPID bool
 }
 
 // Parse errors. errIgnored marks well-formed ICMP that is simply not a reply
@@ -252,35 +256,38 @@ func parseICMPv4(from netip.Addr, b []byte) (icmpReply, error) {
 		if code != 0 { // code 1 is fragment reassembly time exceeded
 			return icmpReply{}, errIgnored
 		}
-		key, err := parseQuotedIPv4(b[8:])
-		return icmpReply{kind: kindTimeExceeded, key: key}, err
+		key, id, err := parseQuotedIPv4(b[8:])
+		return icmpReply{kind: kindTimeExceeded, key: key, ipID: id, quotedIPID: true}, err
 	case icmp4Unreachable:
-		key, err := parseQuotedIPv4(b[8:])
-		return icmpReply{kind: kindUnreachable, code: code, key: key}, err
+		key, id, err := parseQuotedIPv4(b[8:])
+		return icmpReply{kind: kindUnreachable, code: code, key: key, ipID: id, quotedIPID: true}, err
 	default:
 		return icmpReply{}, errIgnored
 	}
 }
 
-func parseQuotedIPv4(q []byte) (probeKey, error) {
+// parseQuotedIPv4 returns the probe key of a quoted IPv4 packet and its
+// identification field.
+func parseQuotedIPv4(q []byte) (probeKey, uint16, error) {
 	if len(q) < ipv4HeaderLen {
-		return probeKey{}, errTruncated
+		return probeKey{}, 0, errTruncated
 	}
 	if q[0]>>4 != 4 {
-		return probeKey{}, errMalformed
+		return probeKey{}, 0, errMalformed
 	}
 	ihl := int(q[0]&0x0f) * 4
 	if ihl < ipv4HeaderLen {
-		return probeKey{}, errMalformed
+		return probeKey{}, 0, errMalformed
 	}
 	if binary.BigEndian.Uint16(q[6:])&0x1fff != 0 {
-		return probeKey{}, errIgnored // non-first fragment, no L4 header
+		return probeKey{}, 0, errIgnored // non-first fragment, no L4 header
 	}
 	if len(q) < ihl+8 {
-		return probeKey{}, errTruncated
+		return probeKey{}, 0, errTruncated
 	}
 	dst := netip.AddrFrom4([4]byte(q[16:20]))
-	return quotedL4Key(dst, q[9], q[ihl:ihl+8])
+	key, err := quotedL4Key(dst, q[9], q[ihl:ihl+8])
+	return key, binary.BigEndian.Uint16(q[4:]), err
 }
 
 // parseICMPv6 parses an ICMPv6 message received from from.

@@ -73,6 +73,7 @@ enrich:
 	dir := t.TempDir()
 	writeTestFile(t, dir+"/token", "unused")
 	acfg := daemonConfig(t, dir+"/spool", "http://"+addr, freeAddr(t), dir+"/token")
+	base := newSpool(t, dir+"/spool")
 	shutdownGrace = 5 * time.Second
 	stopAgent := startDaemon(t, acfg, fakeNetwork())
 	time.Sleep(1500 * time.Millisecond)
@@ -98,9 +99,10 @@ enrich:
 		t.Fatal(err)
 	}
 	c := rows[0]
-	t.Logf("agent spooled %d records (pending %d); ClickHouse has %d cycles, %d hops", last, pending, c.N, c.Hops)
-	if last < 20 || pending != 0 || c.N != int(last) || c.Distinct != c.N || c.Max != last || c.Hops == 0 {
-		t.Errorf("want all %d records exactly once, got %+v (pending %d)", last, c, pending)
+	produced := last - base
+	t.Logf("agent spooled %d records (pending %d); ClickHouse has %d cycles, %d hops", produced, pending, c.N, c.Hops)
+	if produced < 20 || pending != 0 || c.N != int(produced) || c.Distinct != c.N || c.Max != last || c.Hops == 0 {
+		t.Errorf("want all %d records exactly once, got %+v (pending %d)", produced, c, pending)
 	}
 
 	// The read API serves them back.

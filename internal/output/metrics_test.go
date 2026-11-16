@@ -26,7 +26,9 @@ func (fakeSpoolStats) Pending(string) uint64 { return 5 }
 
 type fakeProbeStats struct{}
 
-func (fakeProbeStats) Stats() probe.Stats { return probe.Stats{ProbesSent: 120, LateReplies: 2} }
+func (fakeProbeStats) Stats() probe.Stats {
+	return probe.Stats{ProbesSent: 120, LateReplies: 2, MismatchedReplies: 3}
+}
 
 func mkRecord(hops ...string) *record.Record {
 	r := &record.Record{Schema: 1, AgentID: "a", TS: time.Now(), Target: "t", TargetIP: netip.MustParseAddr("192.0.2.9"),
@@ -86,6 +88,7 @@ func TestMetrics(t *testing.T) {
 		`hopcorder_spool_records_dropped_total{agent_id="lab"} 3`,
 		`hopcorder_probe_late_replies_total{agent_id="lab"} 2`,
 		`hopcorder_probes_sent_total{agent_id="lab"} 120`,
+		`hopcorder_probe_mismatched_replies_total{agent_id="lab"} 3`,
 		`hopcorder_build_info{agent_id="lab",goversion=`,
 		`go_goroutines `,
 	} {

@@ -143,11 +143,11 @@ func TestParseICMPv4(t *testing.T) {
 		err  error
 	}{
 		{"time exceeded / echo", router, timeExceeded4Echo,
-			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}}, nil},
+			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}, ipID: 1, quotedIPID: true}, nil},
 		{"port unreachable / udp", dst4, portUnreach4UDP,
-			icmpReply{kind: kindUnreachable, code: 3, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}}, nil},
+			icmpReply{kind: kindUnreachable, code: 3, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 0x1234, quotedIPID: true}, nil},
 		{"quoted header with options", router, timeExceeded4Options,
-			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}}, nil},
+			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 1, quotedIPID: true}, nil},
 		{"echo reply", dst4, echoReply4,
 			icmpReply{kind: kindEchoReply, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}}, nil},
 		{"echo request ignored", dst4, "0800 0000 829a 0001", icmpReply{}, errIgnored},

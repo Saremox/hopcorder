@@ -339,6 +339,22 @@ func TestRawNetns(t *testing.T) {
 		}
 	}
 	t.Run("path", func(t *testing.T) { inner(t, "TestInnerPath|TestRawNoRoute") })
+	t.Run("hold-and-forge", func(t *testing.T) {
+		if _, err := exec.LookPath("iptables"); err != nil {
+			t.Skip("iptables not installed")
+		}
+		in := func(i int, args ...string) { run(t, append([]string{"ip", "netns", "exec", topo.ns[i]}, args...)...) }
+		// Ping sockets for every group in the agent namespace (systemd's
+		// default), so the echo identifier can be held, and could be
+		// claimed by an unprivileged process otherwise.
+		in(0, "sysctl", "-qw", "net.ipv4.ping_group_range=0 2147483647")
+		// r2 stays silent, like many routers: a forgery has no race to win.
+		rule := []string{"OUTPUT", "-p", "icmp", "--icmp-type", "time-exceeded", "-j", "DROP"}
+		in(2, append([]string{"iptables", "-A"}, rule...)...)
+		defer in(2, append([]string{"iptables", "-D"}, rule...)...)
+		in(3, "sysctl", "-qw", "net.ipv4.icmp_ratelimit=0")
+		inner(t, "TestInnerHoldFlows|TestInnerForgeRefused")
+	})
 	t.Run("loop", func(t *testing.T) {
 		// Make r2 send target traffic back to r1: a two-router loop. Host
 		// routes, because the longest prefix beats r2's connected route to
