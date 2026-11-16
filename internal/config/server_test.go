@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -80,5 +81,65 @@ func TestClickHousePasswordFile(t *testing.T) {
 	c := &ServerConfig{ClickHouse: ClickHouseConfig{PasswordFile: p}}
 	if pw, err := c.ClickHousePassword(); err != nil || pw != "s3cret" {
 		t.Errorf("password %q %v", pw, err)
+	}
+}
+
+func TestServerQueryLimits(t *testing.T) {
+	c := &ServerConfig{}
+	if err := c.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Query.MaxResponseBytes != 32<<20 || c.Query.MaxMemoryBytes != 1<<30 {
+		t.Errorf("query defaults %+v", c.Query)
+	}
+	c, err := ParseServer([]byte(`query: {max_response_bytes: 64KiB, max_memory_bytes: 1MiB}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Finalize(); err == nil || !strings.Contains(err.Error(), "max_response_bytes") {
+		t.Errorf("tiny query limits: %v", err)
+	}
+}
+
+// Without allowed_hosts, a server on loopback answers the localhost names
+// only (DNS rebinding); elsewhere it cannot know its names and checks none.
+func TestHostAllowlist(t *testing.T) {
+	local := []string{"localhost", "127.0.0.1", "::1"}
+	for _, tc := range []struct {
+		listen string
+		hosts  []string
+		want   []string
+	}{
+		{"127.0.0.1:8080", nil, local},
+		{"localhost:8080", nil, local},
+		{"[::1]:8080", nil, local},
+		{"127.0.0.2:8080", nil, append(local, "127.0.0.2")},
+		{"0.0.0.0:8080", nil, nil},
+		{":8080", nil, nil},
+		{"[::]:8080", nil, nil},
+		{"192.0.2.10:8080", nil, nil},
+		{"127.0.0.1:8080", []string{"*"}, nil},
+		{"0.0.0.0:8080", []string{"localhost", "hopcorder.example"}, []string{"localhost", "hopcorder.example"}},
+	} {
+		c := &ServerConfig{Listen: tc.listen, AllowedHosts: tc.hosts}
+		if err := c.Finalize(); err != nil {
+			t.Fatalf("%+v: %v", tc, err)
+		}
+		if got := c.HostAllowlist(); !slices.Equal(got, tc.want) {
+			t.Errorf("listen %s, allowed_hosts %v: %v, want %v", tc.listen, tc.hosts, got, tc.want)
+		}
+	}
+	c, err := ParseServer([]byte(`allowed_hosts: ["hopcorder.example:8080", "http://x", "", "[::1]", "192.0.2.1", "*"]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Finalize()
+	for _, bad := range []string{`"hopcorder.example:8080"`, `"http://x"`, `""`} {
+		if err == nil || !strings.Contains(err.Error(), "allowed_hosts "+bad) {
+			t.Errorf("%s accepted: %v", bad, err)
+		}
+	}
+	if err != nil && (strings.Contains(err.Error(), `"[::1]"`) || strings.Contains(err.Error(), `"192.0.2.1"`)) {
+		t.Errorf("addresses refused: %v", err)
 	}
 }

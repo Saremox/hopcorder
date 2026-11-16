@@ -122,7 +122,7 @@ func TestIngestEndToEndClickHouse(t *testing.T) {
 	checks := map[string]int{
 		"SELECT count() AS n FROM cycles":                                                7,
 		"SELECT count() AS n FROM hops":                                                  3 + 3 + 6 + 3 + 4 + 4 + 3,
-		"SELECT count() AS n FROM hops WHERE hop_asn = 64510":                             1 + 4 + 1 + 2 + 1, // 198.18.x hops
+		"SELECT count() AS n FROM hops WHERE hop_asn = 64510":                            1 + 4 + 1 + 2 + 1, // 198.18.x hops
 		"SELECT count() AS n FROM hops WHERE hop_name = 'gw.lan'":                        7,
 		"SELECT count() AS n FROM hops WHERE length(mpls) = 1 AND mpls[1].label = 24005": 1,
 		"SELECT count() AS n FROM loop_events":                                           2,

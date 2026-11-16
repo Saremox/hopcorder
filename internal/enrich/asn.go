@@ -182,7 +182,9 @@ func (s *ASNSource) Age() time.Duration {
 }
 
 // cleanField removes control characters and invalid UTF-8 from a field of
-// the downloaded database and truncates it to limit bytes.
+// the downloaded database and truncates it to limit bytes. The result is a
+// copy: a substring would keep the whole line (up to 64 KiB) in memory for
+// as long as the database is in use.
 func cleanField(s string, limit int) string {
 	s = strings.Map(func(r rune) rune {
 		if r < ' ' || r == 0x7f || r == utf8.RuneError {
@@ -193,7 +195,7 @@ func cleanField(s string, limit int) string {
 	if len(s) > limit {
 		s = strings.ToValidUTF8(s[:limit], "")
 	}
-	return strings.TrimSpace(s)
+	return strings.Clone(strings.TrimSpace(s))
 }
 
 func (s *ASNSource) defaults() {

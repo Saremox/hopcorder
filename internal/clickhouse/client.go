@@ -151,10 +151,33 @@ func (c *Client) InsertJSON(ctx context.Context, table string, rows [][]byte) er
 	return c.do(ctx, true, q, nil, &body, nil)
 }
 
+// Settings are ClickHouse settings for the queries of one caller, sent as
+// URL parameters (e.g. max_memory_usage).
+type Settings map[string]string
+
+type settingsKey struct{}
+
+// WithSettings returns a context whose Query calls also send s (after the
+// client's own settings, so s may override them). The server uses it to
+// bound the read API's queries without changing what the ingester's
+// queries may use.
+func WithSettings(ctx context.Context, s Settings) context.Context {
+	return context.WithValue(ctx, settingsKey{}, s)
+}
+
+// SettingsFrom returns the settings WithSettings put into ctx, if any.
+func SettingsFrom(ctx context.Context) Settings {
+	s, _ := ctx.Value(settingsKey{}).(Settings)
+	return s
+}
+
 // Query runs a SELECT and calls row for every result row (JSONEachRow,
-// 64-bit integers as numbers, date-times as ISO 8601 in UTC). It waits for the end of the query before
-// streaming, so a failure part-way is reported as an error rather than
-// as truncated output.
+// 64-bit integers as numbers, date-times as ISO 8601 in UTC). It waits for
+// the end of the query before streaming, so a failure part-way is reported
+// as an error rather than as truncated output. row gets its own copy of
+// each row and may keep it. Queries run with readonly = 2: they cannot
+// write, and only read-only queries are cancelled when the connection
+// closes.
 func (c *Client) Query(ctx context.Context, query string, params Params, row func(json.RawMessage) error) error {
 	q := url.Values{}
 	q.Set("wait_end_of_query", "1")
@@ -162,9 +185,16 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 	q.Set("default_format", "JSONEachRow")
 	q.Set("date_time_output_format", "iso") // 2026-11-16T22:14:05.123Z
 	// A query must not keep running after its caller gave up: bound its
-	// time, and cancel it when the connection closes.
+	// time, and cancel it when the connection closes. ClickHouse applies
+	// the cancel setting only to queries with readonly > 0, which a POST
+	// does not get by default; readonly = 2 still lets the URL set the
+	// other settings.
+	q.Set("readonly", "2")
 	q.Set("max_execution_time", c.maxExec)
 	q.Set("cancel_http_readonly_queries_on_client_close", "1")
+	for k, v := range SettingsFrom(ctx) {
+		q.Set(k, v)
+	}
 	return c.do(ctx, true, q, params, strings.NewReader(query), func(r io.Reader) error {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64<<10), 64<<20)
@@ -173,7 +203,9 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 			if len(line) == 0 {
 				continue
 			}
-			if err := row(json.RawMessage(line)); err != nil {
+			// The scanner reuses its buffer for the next lines; callers
+			// keep rows (the read API did), so each gets its own copy.
+			if err := row(json.RawMessage(bytes.Clone(line))); err != nil {
 				return err
 			}
 		}

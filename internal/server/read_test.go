@@ -1,0 +1,274 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/saremox/hopcorder/internal/clickhouse"
+)
+
+// funcStore answers every query with q.
+type funcStore struct {
+	*fakeStore
+	q func(ctx context.Context, query string, row func(json.RawMessage) error) error
+}
+
+func (f funcStore) Query(ctx context.Context, query string, _ clickhouse.Params, row func(json.RawMessage) error) error {
+	return f.q(ctx, query, row)
+}
+
+func readServer(t *testing.T, st Store, o Options) *httptest.Server {
+	t.Helper()
+	o.Store, o.Enricher, o.Logger = st, fakeEnrich{}, quietLogger()
+	s := New(o)
+	s.SetReady()
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func bigRow(i int) string { return fmt.Sprintf(`{"i":%d,"pad":"%s"}`, i, strings.Repeat("x", 1000)) }
+
+// A response stops at its byte budget, as valid JSON that says it was cut.
+func TestReadResponseBudget(t *testing.T) {
+	const n = 300 // about 300 KB of rows
+	st := funcStore{newFakeStore(), func(_ context.Context, _ string, row func(json.RawMessage) error) error {
+		for i := range n {
+			if err := row(json.RawMessage(bigRow(i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}}
+	for _, tc := range []struct {
+		budget    int64
+		truncated bool
+	}{{100 << 10, true}, {1 << 20, false}} {
+		ts := readServer(t, st, Options{MaxResponseBytes: tc.budget})
+		for _, path := range []string{"/api/v1/query/targets", "/api/v1/query/loops"} {
+			resp, err := http.Get(ts.URL + path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			var body struct {
+				Rows []struct {
+					I int `json:"i"`
+				} `json:"rows"`
+				Truncated bool `json:"truncated"`
+			}
+			if err := json.Unmarshal(b, &body); err != nil {
+				t.Fatalf("budget %d %s: %v", tc.budget, path, err)
+			}
+			want, left := 0, tc.budget // each row takes its length and a comma
+			for want < n && int64(len(bigRow(want))+1) <= left {
+				left -= int64(len(bigRow(want)) + 1)
+				want++
+			}
+			if body.Truncated != tc.truncated || len(body.Rows) != want || int64(len(b)) > tc.budget+100 ||
+				body.Rows[len(body.Rows)-1].I != want-1 {
+				t.Errorf("budget %d %s: truncated %v, %d rows (want %d), %d bytes", tc.budget, path, body.Truncated,
+					len(body.Rows), want, len(b))
+			}
+		}
+	}
+}
+
+// Rows reach the client while the query still delivers them: the server
+// keeps 64 KiB at a time, not the response.
+func TestReadResponseStreams(t *testing.T) {
+	release := make(chan struct{})
+	st := funcStore{newFakeStore(), func(ctx context.Context, _ string, row func(json.RawMessage) error) error {
+		for i := range 200 { // about 200 KB
+			if err := row(json.RawMessage(bigRow(i))); err != nil {
+				return err
+			}
+		}
+		select { // the client must have the first rows by now
+		case <-release:
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		return row(json.RawMessage(bigRow(200)))
+	}}
+	ts := readServer(t, st, Options{})
+	resp, err := http.Get(ts.URL + "/api/v1/query/targets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	first := make([]byte, 64<<10)
+	start := time.Now()
+	if _, err := io.ReadFull(resp.Body, first); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Error("the first rows arrived only when the query ended")
+	}
+	close(release)
+	rest, _ := io.ReadAll(resp.Body)
+	var body struct {
+		Rows      []json.RawMessage `json:"rows"`
+		Truncated bool              `json:"truncated"`
+	}
+	if err := json.Unmarshal(append(first, rest...), &body); err != nil || len(body.Rows) != 201 || body.Truncated {
+		t.Errorf("%d rows, truncated %v, %v", len(body.Rows), body.Truncated, err)
+	}
+}
+
+// A query that fails before anything was sent gets 502; one that fails
+// after rows went out breaks the response instead of ending it cleanly.
+func TestReadQueryFailure(t *testing.T) {
+	failAfter := 0
+	st := funcStore{newFakeStore(), func(_ context.Context, _ string, row func(json.RawMessage) error) error {
+		for i := range failAfter {
+			if err := row(json.RawMessage(bigRow(i))); err != nil {
+				return err
+			}
+		}
+		return errors.New("clickhouse: connection reset")
+	}}
+	ts := readServer(t, st, Options{})
+	var e errorBody
+	if code := getJSON(t, ts.URL+"/api/v1/query/targets", &e); code != http.StatusBadGateway || e.Error != "query failed" {
+		t.Errorf("%d %q", code, e.Error)
+	}
+	failAfter = 200
+	resp, err := http.Get(ts.URL + "/api/v1/query/outages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Error("a response that failed part-way ended cleanly")
+	}
+}
+
+// Read queries run with the memory and result-size settings; the
+// ingester's do not get them.
+func TestReadQuerySettings(t *testing.T) {
+	var mu sync.Mutex
+	var got []clickhouse.Settings
+	st := funcStore{newFakeStore(), func(ctx context.Context, _ string, _ func(json.RawMessage) error) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, clickhouse.SettingsFrom(ctx))
+		return nil
+	}}
+	ts := readServer(t, st, Options{MaxResponseBytes: 4 << 20, MaxQueryMemory: 512 << 20})
+	for _, p := range []string{"/api/v1/query/targets", "/api/v1/query/topology?agent=lab&target=dc1.example"} {
+		if resp, err := http.Get(ts.URL + p); err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("%d queries", len(got))
+	}
+	for _, s := range got {
+		if s["max_memory_usage"] != "536870912" || s["max_result_bytes"] != "8388608" || s["result_overflow_mode"] != "break" {
+			t.Errorf("settings %v", s)
+		}
+	}
+}
+
+// Topology stays within the budget too: the timeline comes first, and the
+// parts after the one that filled the budget are empty.
+func TestTopologyByteBudget(t *testing.T) {
+	ts := readServer(t, funcStore{newFakeStore(), func(_ context.Context, q string, row func(json.RawMessage) error) error {
+		n, mk := 1, func(i int) string { return fmt.Sprintf(`{"t":"2026-11-16T00:00:00.000Z","cycles":%d}`, i) }
+		if !strings.Contains(q, "toStartOfInterval") {
+			n, mk = 2000, func(i int) string { return fmt.Sprintf(`{"ttl":1,"ip":"%d","name":"%s"}`, i, strings.Repeat("n", 500)) }
+		}
+		for i := range n {
+			if err := row(json.RawMessage(mk(i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}}, Options{MaxResponseBytes: 64 << 10})
+	var body struct {
+		Truncated bool              `json:"truncated"`
+		Nodes     []json.RawMessage `json:"nodes"`
+		Edges     []json.RawMessage `json:"edges"`
+		Timeline  []json.RawMessage `json:"timeline"`
+	}
+	if code := getJSON(t, ts.URL+"/api/v1/query/topology?agent=lab&target=dc1.example", &body); code != 200 ||
+		!body.Truncated || len(body.Timeline) != 1 || len(body.Nodes) == 0 || len(body.Nodes) > 130 || len(body.Edges) != 0 {
+		t.Errorf("%d: truncated %v, %d nodes, %d edges, %d buckets", code, body.Truncated, len(body.Nodes),
+			len(body.Edges), len(body.Timeline))
+	}
+}
+
+// With allowed hosts, other Host headers get 421 (DNS rebinding), except on
+// the health and metrics endpoints; without, every host is served.
+func TestHostCheck(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	s := New(Options{Store: newFakeStore(), Logger: quietLogger(), Registry: reg, UI: http.NotFoundHandler(),
+		AllowedHosts: []string{"localhost", "127.0.0.1", "::1", "Hopcorder.Example."}})
+	s.SetReady()
+	h := s.Handler()
+	for _, tc := range []struct {
+		host, path string
+		want       int
+	}{
+		{"localhost:8080", "/api/v1/query/targets", 200},
+		{"127.0.0.1", "/api/v1/query/targets", 200},
+		{"[::1]:8080", "/api/v1/query/targets", 200},
+		{"hopcorder.example", "/api/v1/query/targets", 200},
+		{"HOPCORDER.example.:443", "/api/v1/query/targets", 200},
+		{"rebind.attacker.example:8080", "/api/v1/query/targets", 421},
+		{"rebind.attacker.example", "/api/v1/ingest", 421},
+		{"rebind.attacker.example", "/ui/", 421},
+		{"127.0.0.2:8080", "/", 421},
+		{"", "/api/v1/query/targets", 421},
+		{"10.1.2.3:8080", "/healthz", 200},
+		{"10.1.2.3:8080", "/readyz", 200},
+		{"10.1.2.3:8080", "/metrics", 200},
+	} {
+		r := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		if tc.path == "/api/v1/ingest" {
+			r = httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader("\n"))
+			r.Header.Set("Content-Type", "application/x-ndjson")
+		}
+		r.Host = tc.host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != tc.want {
+			t.Errorf("Host %q %s: %d, want %d", tc.host, tc.path, rec.Code, tc.want)
+		}
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := -1.0
+	for _, mf := range mfs {
+		if mf.GetName() == "hopcorder_server_host_refused_total" {
+			refused = mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	if refused != 5 {
+		t.Errorf("hopcorder_server_host_refused_total = %v, want 5", refused)
+	}
+
+	open := New(Options{Store: newFakeStore(), Logger: quietLogger()}).Handler()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/query/targets", nil)
+	r.Host = "rebind.attacker.example"
+	rec := httptest.NewRecorder()
+	open.ServeHTTP(rec, r)
+	if rec.Code != 200 {
+		t.Errorf("without allowed hosts: %d", rec.Code)
+	}
+}

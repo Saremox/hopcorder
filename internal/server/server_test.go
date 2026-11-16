@@ -579,6 +579,7 @@ func TestQueryAPI(t *testing.T) {
 		t.Errorf("hops %v", hops)
 	}
 	for _, p := range []string{"/api/v1/query/cycles?agent=lab", "/api/v1/query/targets?limit=0",
+		"/api/v1/query/cycles?agent=lab&target=dc1.example&limit=1001",
 		"/api/v1/query/targets?from=yesterday", "/api/v1/query/targets?from=2026-11-17T00:00:00Z&to=2026-11-16T00:00:00Z"} {
 		if code, _ := get(p); code != http.StatusBadRequest {
 			t.Errorf("%s: %d, want 400", p, code)

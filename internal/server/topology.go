@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -40,8 +41,10 @@ func timelineBucket(from, to time.Time) time.Duration {
 // time bucket (timeline; rtt_p50_us is 0 in a bucket without a reached
 // cycle). agent and target are required; give protocol too,
 // or streams of several protocols are merged. limit is ignored: nodes and
-// edges are capped (truncated: true says so), and the bucket size keeps the
-// timeline to at most topologyMaxBuckets points.
+// edges are capped, and so are the bytes of the whole response
+// (MaxResponseBytes; parts after the one that filled it stay empty);
+// truncated: true says so. The bucket size keeps the timeline to at most
+// topologyMaxBuckets points.
 func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 	qp, err := parseQuery(r, true)
 	if err != nil {
@@ -58,6 +61,11 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 		name, sql string
 		max       int
 	}{
+		{"timeline", `SELECT toStartOfInterval(ts, INTERVAL {bucket:UInt32} second) AS t, count() AS cycles,
+			countIf(reached) AS reached_cycles, countIf(length(loops.ip) > 0) AS loop_cycles, max(path_len) AS max_path_len,
+			toUInt32(ifNotFinite(quantileIf(0.5)(arrayFirst((rtt, st) -> st = 'reply', hops.rtt_us, hops.status), reached), 0)) AS rtt_p50_us
+			FROM cycles WHERE ` + window + `
+			GROUP BY t ORDER BY t`, topologyMaxBuckets + 1},
 		{"nodes", `SELECT ttl, hop_ip AS ip, anyIf(hop_name, hop_name != '') AS name,
 			anyIf(hop_asn, hop_asn != 0) AS asn, anyIf(hop_as_name, hop_as_name != '') AS as_name,
 			count() AS cycles, toUInt32(ifNotFinite(quantile(0.5)(rtt_us), 0)) AS rtt_p50_us,
@@ -76,30 +84,33 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 			ARRAY JOIN arrayMap(k -> (rt[k], ri[k], rt[k + 1], ri[k + 1]), arrayEnumerate(arrayPopBack(rt))) AS e
 			GROUP BY from_ttl, from_ip, to_ttl, to_ip ORDER BY cycles DESC, from_ttl, from_ip, to_ip
 			LIMIT {edges:UInt32}`, topologyMaxEdges},
-		{"timeline", `SELECT toStartOfInterval(ts, INTERVAL {bucket:UInt32} second) AS t, count() AS cycles,
-			countIf(reached) AS reached_cycles, countIf(length(loops.ip) > 0) AS loop_cycles, max(path_len) AS max_path_len,
-			toUInt32(ifNotFinite(quantileIf(0.5)(arrayFirst((rtt, st) -> st = 'reply', hops.rtt_us, hops.status), reached), 0)) AS rtt_p50_us
-			FROM cycles WHERE ` + window + `
-			GROUP BY t ORDER BY t`, topologyMaxBuckets + 1},
 	}
-	out := map[string]any{"bucket_ms": bucket.Milliseconds(), "truncated": false}
+	// The timeline first: it is small and the UI needs it whole. The response
+	// is kept until all three parts are in (at most the byte budget), so a
+	// failure in any of them is still a clean 502.
+	js := newJSONStream(w, s.opts.MaxResponseBytes, 0)
+	js.number("bucket_ms", bucket.Milliseconds())
 	for _, q := range queries {
-		rows := []json.RawMessage{}
-		err := s.opts.Store.Query(r.Context(), q.sql, qp.params, func(m json.RawMessage) error {
-			rows = append(rows, m)
-			return nil
-		})
-		if err != nil {
-			s.metrics.queryErrors.Inc()
-			s.log.Error("query failed", "path", r.URL.Path, "part", q.name, "err", err)
-			writeJSON(w, http.StatusBadGateway, errorBody{Error: "query failed"})
-			return
+		js.beginArray(q.name)
+		n := 0
+		if !js.full() {
+			err := s.opts.Store.Query(r.Context(), q.sql, qp.params, func(m json.RawMessage) error {
+				if n == q.max {
+					js.truncated = true
+					return errPartFull
+				}
+				n++
+				return js.row(m)
+			})
+			if err != nil && !errors.Is(err, errPartFull) && !errors.Is(err, errResponseFull) {
+				s.queryFailed(r, js, q.name, err)
+				return
+			}
 		}
-		if len(rows) > q.max {
-			rows = rows[:q.max]
-			out["truncated"] = true
-		}
-		out[q.name] = rows
+		js.endArray()
 	}
-	writeJSON(w, http.StatusOK, out)
+	js.finish()
 }
+
+// errPartFull ends a topology query at its row cap.
+var errPartFull = errors.New("row cap reached")

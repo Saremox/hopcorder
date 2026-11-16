@@ -17,6 +17,7 @@ type serverMetrics struct {
 	changes     prometheus.Counter
 	outagesVec  *prometheus.CounterVec
 	queryErrors prometheus.Counter
+	hostRefused prometheus.Counter
 }
 
 // newServerMetrics creates the metrics and registers them with reg (if not
@@ -45,12 +46,17 @@ func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
 		queryErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hopcorder_server_query_errors_total", Help: "Failed read-API queries.",
 		}),
+		hostRefused: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hopcorder_server_host_refused_total",
+			Help: "Requests refused because their Host header is not in allowed_hosts.",
+		}),
 	}
 	for _, r := range []string{"accepted", "duplicate", "rejected"} {
 		m.recordsVec.WithLabelValues(r)
 	}
 	if reg != nil {
-		reg.MustRegister(m.requests, m.recordsVec, m.insertErrs, m.insertSecs, m.changes, m.outagesVec, m.queryErrors)
+		reg.MustRegister(m.requests, m.recordsVec, m.insertErrs, m.insertSecs, m.changes, m.outagesVec, m.queryErrors,
+			m.hostRefused)
 	}
 	return m
 }

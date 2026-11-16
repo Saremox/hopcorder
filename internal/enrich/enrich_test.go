@@ -5,11 +5,13 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,8 +57,8 @@ func TestParseAndLookup(t *testing.T) {
 				{"198.18.120.1", 64510, "EXAMPLE-TRANSIT Example Transit"},
 				{"198.19.80.226", 64500, "EXAMPLE-DC"},
 				{"198.19.88.0", 0, ""}, // just past a range
-				{"0.0.0.1", 0, ""},    // before the first
-				{"255.1.1.1", 0, ""},  // after the last
+				{"0.0.0.1", 0, ""},     // before the first
+				{"255.1.1.1", 0, ""},   // after the last
 				{"::ffff:198.18.1.1", 64510, "EXAMPLE-TRANSIT Example Transit"},
 				{"2001:db8:1002::1", 64510, "EXAMPLE-TRANSIT Example Transit"},
 				{"2606:4700:4700::1111", 13335, "CLOUDFLARENET"},
@@ -288,6 +290,38 @@ func TestParseBounds(t *testing.T) {
 	if !ok || len(info.Name) > maxASNameLen || strings.ContainsAny(info.Name, "\x1b\x00") || !strings.HasPrefix(info.Name, "<img src=x>[31mEVIL") {
 		t.Errorf("name %q (%d bytes)", info.Name, len(info.Name))
 	}
+}
+
+// The parsed database does not keep the lines its names came from: a name
+// that is a substring of a 60 KB line keeps all of it, so a small, highly
+// compressible download held up to the whole 256 MiB it inflates to.
+func TestParseDoesNotPinLines(t *testing.T) {
+	const lines, pad = 500, 60000
+	var src strings.Builder
+	tail := strings.Repeat("A", pad)
+	for i := range lines {
+		fmt.Fprintf(&src, "10.%d.%d.0\t10.%d.%d.255\t%d\tZZ\tAS-%d\t%s\n", i/256, i%256, i/256, i%256, 64512+i, i, tail)
+	}
+	raw := gz(t, src.String())
+	src.Reset()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	db, err := ParseIPToASN(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if info, ok := db.Lookup(netip.MustParseAddr("10.0.7.1")); !ok || info.Name != "AS-7" {
+		t.Fatalf("lookup: %+v %v", info, ok)
+	}
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	t.Logf("%d ranges keep %d bytes", db.Len(), retained)
+	if retained > lines*pad/8 { // 3.75 MB; the lines are 30 MB
+		t.Errorf("the database of %d ranges keeps %d bytes", db.Len(), retained)
+	}
+	runtime.KeepAlive(db)
 }
 
 // A redirect from https to plain http is not followed.

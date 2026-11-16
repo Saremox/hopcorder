@@ -6,6 +6,16 @@
 # /api/v1/query/ (readers: e.g. OIDC). Hence the localhost default.
 listen: 127.0.0.1:8080
 
+# Host names the server answers (the Host header, any port), so a web page
+# cannot reach it through DNS rebinding (its own name resolving to the
+# server's address). Default: on a loopback listen address, localhost,
+# 127.0.0.1, ::1 and the listen host; on any other address no check, as the
+# server cannot know its service, pod and ingress names. A reverse proxy on
+# the same host that passes the client's Host header on (Caddy, Traefik; not
+# nginx's default) needs its public names listed here. "*" turns the check
+# off. /healthz, /readyz and /metrics answer every host.
+# allowed_hosts: [localhost, 127.0.0.1, "::1"]
+
 log:
   level: info                   # debug, info, warn, error
   format: text                  # text or json
@@ -29,6 +39,8 @@ ingest:
 
 query:
   max_concurrent: 8             # read-API requests at once
+  max_response_bytes: 32MiB     # rows per response; beyond it rows are left out and "truncated": true
+  max_memory_bytes: 1GiB        # ClickHouse max_memory_usage of each read-API query
 
 enrich:
   rdns:
