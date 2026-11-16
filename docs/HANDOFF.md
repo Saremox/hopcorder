@@ -810,8 +810,15 @@ added in the commit that introduced it.
   pushing; `main` pushes `:main` and `:sha-<commit>`; `v*` tags push
   `:<version>`, `:<major>.<minor>` and `:latest`, and package the charts with
   that version and appVersion into `oci://ghcr.io/saremox/charts`. Charts
-  default to their appVersion as the image tag, so before the first release
-  `image.tag=main` is needed. No release has been tagged.
+  default to their appVersion as the image tag, so a chart runs the images of
+  its own release.
+- **Releases**: after the images and charts of a `v*` tag are published, the
+  `release` job creates the GitHub release: static Linux binaries (amd64,
+  arm64; with the license, README, example configs and systemd units), the
+  chart packages and `SHA256SUMS`, with the tag's section of `CHANGELOG.md`
+  as the notes (the job fails without one). On pull requests and `main` the
+  job builds and packages everything as a dry run. The binaries carry the
+  version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
   (restored from ClickHouse on start), so two servers receiving one agent's
