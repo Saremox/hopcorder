@@ -216,14 +216,18 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 // shutdownGrace bounds how long the agent waits for outputs to stop after
 // SIGINT/SIGTERM. Nothing is lost by cutting it short: undelivered records
 // stay in the spool.
-const shutdownGrace = 3 * time.Second
+var shutdownGrace = 3 * time.Second
 
 func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger) error {
-	if cfg.Outputs.HTTP != nil || cfg.Outputs.Metrics != nil {
-		return errors.New("http and metrics outputs are not implemented yet")
-	}
 	var outs []output.Output
 	var drainOpts []output.DrainOptions
+	defer func() {
+		for _, o := range outs {
+			if err := o.Close(); err != nil {
+				logger.Warn("closing output", "output", o.Name(), "err", err)
+			}
+		}
+	}()
 	if j := cfg.Outputs.JSONL; j != nil {
 		o, err := output.NewJSONL(j.Path)
 		if err != nil {
@@ -232,13 +236,25 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		outs = append(outs, o)
 		drainOpts = append(drainOpts, output.DrainOptions{Logger: logger})
 	}
-	defer func() {
-		for _, o := range outs {
-			if err := o.Close(); err != nil {
-				logger.Warn("closing output", "output", o.Name(), "err", err)
-			}
+	if h := cfg.Outputs.HTTP; h != nil {
+		hc := output.HTTPConfig{
+			URL: h.URL, Headers: h.Headers, BearerToken: h.BearerToken, BearerTokenFile: h.BearerTokenFile,
+			CAFile: h.TLS.CAFile, CertFile: h.TLS.CertFile, KeyFile: h.TLS.KeyFile, ServerName: h.TLS.ServerName,
+			Timeout: h.Timeout.D(), UserAgent: "hopcorder/" + versionString(),
 		}
-	}()
+		if b := h.BasicAuth; b != nil {
+			hc.BasicUser, hc.BasicPassword, hc.BasicPasswordFile = b.Username, b.Password, b.PasswordFile
+		}
+		o, err := output.NewHTTP(hc)
+		if err != nil {
+			return err
+		}
+		outs = append(outs, o)
+		drainOpts = append(drainOpts, output.DrainOptions{
+			MaxRecords: h.BatchRecords, MaxBytes: int(h.BatchBytes), FlushInterval: h.FlushInterval.D(),
+			RetryMin: h.RetryMin.D(), RetryMax: h.RetryMax.D(), Logger: logger,
+		})
+	}
 
 	names := make([]string, len(outs))
 	for i, o := range outs {
@@ -257,9 +273,26 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		}
 	}()
 
+	targets := agentTargets(cfg)
+	var observer agent.Observer
+	if mc := cfg.Outputs.Metrics; mc != nil {
+		stats, _ := prober.(probe.StatsProvider)
+		m := output.NewMetrics(output.MetricsOptions{
+			AgentID: cfg.AgentID, Version: versionString(), Targets: targets, Outputs: names,
+			Spool: sp, Prober: stats,
+		})
+		if err := m.Serve(ctx, mc.Listen, mc.Path, logger); err != nil {
+			return err
+		}
+		for i := range drainOpts {
+			drainOpts[i].OnError = m.OutputError(names[i])
+		}
+		observer = m
+	}
+
 	a, err := agent.New(agent.Options{
-		AgentID: cfg.AgentID, Targets: agentTargets(cfg), DNSTTL: cfg.DNSTTL.D(),
-		Prober: prober, Sink: sp, Logger: logger,
+		AgentID: cfg.AgentID, Targets: targets, DNSTTL: cfg.DNSTTL.D(),
+		Prober: prober, Sink: sp, Observer: observer, Logger: logger,
 	})
 	if err != nil {
 		return err
