@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -399,5 +400,64 @@ func TestCrashChild(t *testing.T) {
 				os.Exit(1)
 			}
 		}
+	}
+}
+
+// A damaged spool file (bit rot, a torn page) must not stop the agent for
+// good: it is moved aside and a new spool starts, with seqs above any the old
+// one used.
+func TestCorruptFileIsQuarantined(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, "a")
+	appendN(t, s, 200)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fileName)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Garbage over everything after the two meta pages and the freelist.
+	for i := 3 * 4096; i < len(b); i++ {
+		b[i] = byte(i*31 + 7)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	before := time.Now()
+	s = open(t, dir, "a")
+	defer s.Close()
+	if st := s.Stats(); st.Records != 0 {
+		t.Errorf("new spool holds %d records", st.Records)
+	}
+	seqs := appendN(t, s, 1)
+	if seqs[0] < uint64(before.UnixMicro()) { //nolint:gosec // positive
+		t.Errorf("first seq %d, want one above %d", seqs[0], before.UnixMicro())
+	}
+	moved, _ := filepath.Glob(path + ".corrupt-*")
+	if len(moved) != 1 {
+		t.Errorf("corrupt file kept as %v", moved)
+	}
+}
+
+// A healthy file is never moved aside, whatever else fails.
+func TestHealthyFileIsKept(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, "a")
+	appendN(t, s, 3)
+	// A second open while the first holds the lock fails without touching it.
+	if _, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 20, Consumers: []string{"a"}}); !errors.Is(err, ErrLocked) {
+		t.Errorf("second open: %v", err)
+	}
+	_ = s.Close()
+	if moved, _ := filepath.Glob(filepath.Join(dir, fileName) + ".corrupt-*"); len(moved) != 0 {
+		t.Errorf("healthy file moved: %v", moved)
+	}
+	s = open(t, dir, "a")
+	defer s.Close()
+	if seqs := appendN(t, s, 1); seqs[0] != 4 {
+		t.Errorf("seq after reopen %d, want 4", seqs[0])
 	}
 }

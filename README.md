@@ -354,6 +354,14 @@ hop addresses.
   record carries `target_ip`.
 - **Spool disk use** tracks the high-water mark of `max_bytes` plus database
   overhead; the file reuses free space but does not shrink.
+- **A corrupt spool file** (failed consistency check at start) is renamed to
+  `spool.db.corrupt-<time>` and an empty spool starts, with seqs taken from
+  the clock so they stay above the old ones; the error is logged. The records
+  in the old file are not delivered.
+- **The HTTP output never follows redirects**: point `url` at the server
+  itself. A 3xx is logged as an error and the batch retried. With a plain
+  `http://` URL the agent warns at startup if credentials or headers are
+  configured, and refuses `tls` settings.
 
 ## Server
 
