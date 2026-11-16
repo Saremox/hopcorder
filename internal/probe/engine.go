@@ -61,11 +61,19 @@ type engine struct {
 	pending   map[probeKey]*pendingProbe
 	tombs     map[probeKey]time.Time // key -> expiry
 	lastPrune time.Time
-	nextID    uint16
+	nextID    map[flowKey]uint16
 
 	sent     atomic.Uint64
 	sendErrs atomic.Uint64
 	late     atomic.Uint64
+}
+
+// flowKey identifies a probe flow for id allocation: probes of different
+// flows can never be confused, so each flow counts on its own.
+type flowKey struct {
+	dst   netip.Addr
+	proto uint8
+	flow  uint16
 }
 
 type pendingProbe struct {
@@ -90,7 +98,7 @@ func newEngine(io netIO) *engine {
 		now:          time.Now,
 		pending:      make(map[probeKey]*pendingProbe),
 		tombs:        make(map[probeKey]time.Time),
-		nextID:       uint16(rand.N(0xfffe)) + 1, //nolint:gosec // not security relevant
+		nextID:       make(map[flowKey]uint16),
 	}
 }
 
@@ -105,16 +113,22 @@ func (e *engine) pendingLen() int {
 	return len(e.pending)
 }
 
-// allocIDLocked returns the next probe identifier in 1..0xfffe. The range
-// suits both ICMP sequence numbers and UDP checksums (where 0 and 0xffff are
-// reserved). Identifiers are shared by all flows, so two probes can only
-// collide after 65534 newer probes, long after either has expired.
-func (e *engine) allocIDLocked() uint16 {
-	e.nextID++
-	if e.nextID == 0 || e.nextID == 0xffff {
-		e.nextID = 1
+// allocIDLocked returns the next probe identifier of a flow, in 1..0xfffe.
+// The range suits both ICMP sequence numbers and UDP checksums (where 0 and
+// 0xffff are reserved). Each flow counts separately from a random start, so
+// an id is reused only after 65534 newer probes of the same flow (hours at
+// any sane interval), long after the old probe's tombstone has expired.
+func (e *engine) allocIDLocked(fk flowKey) uint16 {
+	id, ok := e.nextID[fk]
+	if !ok {
+		id = uint16(rand.N(0xfffe)) //nolint:gosec // not security relevant
 	}
-	return e.nextID
+	id++
+	if id == 0 || id == 0xffff {
+		id = 1
+	}
+	e.nextID[fk] = id
+	return id
 }
 
 func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, error) {
@@ -142,10 +156,14 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 	keys := make([]probeKey, req.MaxTTL)
 	probes := make([]*pendingProbe, req.MaxTTL)
 
+	fk := flowKey{dst: target, proto: protoUDP, flow: req.FlowID}
+	if req.Protocol == ICMP {
+		fk.proto = protoICMP
+	}
 	e.mu.Lock()
 	for i := range pkts {
 		ttl := i + 1
-		id := e.allocIDLocked()
+		id := e.allocIDLocked(fk)
 		p := outPacket{src: src, dst: target, zone: req.Target.Zone(), ttl: uint8(ttl), ipID: id} //nolint:gosec // ttl <= MaxTTL (255), checked by Validate
 		var k probeKey
 		switch req.Protocol {

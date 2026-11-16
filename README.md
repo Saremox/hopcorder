@@ -128,6 +128,9 @@ next to a running agent.
 - **NAT** in front of the agent usually rewrites and restores the probe
   headers transparently; a NAT that does not restore the quoted header breaks
   reply matching (every hop beyond it shows `no-reply`).
+- **Two hopcorder processes on one host** (say `--once` next to the daemon)
+  probing the same target with the same `flow_id` can occasionally pick up
+  each other's replies. Use a different `flow_id` for side-by-side runs.
 - **Beyond the destination**, every TTL up to `max_ttl` is still probed and
   answered by the destination (trimmed from the record). Keep `max_ttl` near
   your longest path if destination rate limiting matters (UDP port-unreachable
