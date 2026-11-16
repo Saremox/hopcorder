@@ -151,6 +151,18 @@ sudo setcap cap_net_raw+ep "$(command -v hopcorder)"
 or run it under systemd with `AmbientCapabilities=CAP_NET_RAW` (the shipped
 unit does). Without the capability the agent exits at startup and says so.
 
+**Other processes on the host.** Replies to probes reach every process that
+asks for them, so the agent keeps other local users from passing their
+packets off as answers: probe ids are random, ICMPv4 errors must quote the IP
+ID the probe was sent with, echo replies must echo its data, and the agent
+holds its ICMP echo identifier (`flow_id`) with an unprivileged "ping"
+socket, so no other process can claim it. That last part needs ping sockets
+for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
+every group); where other groups have them but the agent's does not, it
+logs so at startup. A second hopcorder (or `ping`) using the same echo
+identifier makes the agent fail at startup; give every process its own
+`flow_id` (`--flow-id`).
+
 ## Quick start
 
 Trace a few targets once and print the records:
@@ -214,7 +226,10 @@ and in `agent.example.yaml` show.
 ### The record
 
 One JSON record per (target, cycle). `seq` is monotonic per agent and survives
-restarts; `(agent_id, seq)` is the idempotency key. Per hop, `status` is
+restarts; `(agent_id, seq)` is the idempotency key. A new spool (the first
+start, or after the spool was deleted) begins at the current time in
+microseconds, so its seqs lie above anything an earlier spool of the same
+`agent_id` sent, as long as the clock is right. Per hop, `status` is
 `reply` (the destination answered; for UDP, its port-unreachable),
 `ttl-expired`, `unreachable` (with the ICMP `code`) or `no-reply`; `ip` and
 `rtt_us` are present unless `no-reply`. Routers inside an MPLS tunnel often
@@ -238,7 +253,8 @@ Derived per cycle:
 - **`loops`**: addresses that answered *time exceeded* at more than one TTL.
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
-next to a running agent.
+next to a running agent with another `flow_id` (`--once --flow-id 40000
+example.net`); with the daemon's ICMP `flow_id` it fails at startup.
 
 ## Caveats when reading the data
 
@@ -266,8 +282,10 @@ next to a running agent.
   443 answered at TTL 2 behind a proxy). Compare with an ICMP or UDP trace to
   the same target when TCP distances look short.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
-  probing the same target with the same `flow_id` can occasionally pick up
-  each other's replies. Use a different `flow_id` for side-by-side runs.
+  need different `flow_id`s. For ICMP the second one fails at startup (the
+  first holds the echo identifier, where ping sockets are permitted); with
+  UDP or TCP, or without ping sockets, it starts, and the two can
+  occasionally pick up each other's replies.
 - **Beyond the destination**: with `adaptive_max_ttl` (default), once a
   target has been reached, cycles probe only 3 TTLs past its distance. If such
   a cycle neither reaches the destination nor hits an unreachable (the path
@@ -292,6 +310,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
 | `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
+| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own |
 | `paris` | `true` | `--paris` | Flow-stable probing |
 | `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
@@ -305,7 +324,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 overrides `protocol`, `port` (destination port: default 33434 for UDP, 443
 for TCP), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
-arguments), `flow_id` (default 33434), `paris`, `adaptive_max_ttl`,
+arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
 `interval`, `timeout`, `max_ttl`, `probe_past`.
 
 **Outputs** (at least one):
@@ -347,6 +366,7 @@ hop addresses.
 | `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
 | `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
+| `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe but quoting another IPv4 ID or echoing other data, dropped: answers to another process's packets, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 
@@ -383,8 +403,8 @@ hop addresses.
 - **Spool disk use** tracks the high-water mark of `max_bytes` plus database
   overhead; the file reuses free space but does not shrink.
 - **A corrupt spool file** (failed consistency check at start) is renamed to
-  `spool.db.corrupt-<time>` and an empty spool starts, with seqs taken from
-  the clock so they stay above the old ones; the error is logged. The records
+  `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from
+  the clock like any new spool's; the error is logged. The records
   in the old file are not delivered.
 - **The HTTP output never follows redirects**: point `url` at the server
   itself. A 3xx is logged as an error and the batch retried. With a plain
@@ -447,8 +467,10 @@ edges are capped. Every response is bounded by `query.max_response_bytes`
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the
 response (`{"accepted", "duplicates", "rejected", "errors"}`); a storage
-failure returns 503 and the agent retries. Agents must never reuse seqs: if you
-wipe an agent's spool, also change its `agent_id`. A batch whose seqs all lie
+failure returns 503 and the agent retries. Agents must never reuse seqs: a new
+spool starts its seqs at the clock (time in microseconds), above anything an
+earlier spool of the same agent sent; only on a host whose clock is wrong does
+a wiped spool also need a new `agent_id`. A batch whose seqs all lie
 far below the stored ones is refused with 409, so the agent keeps it and its
 errors show what happened.
 

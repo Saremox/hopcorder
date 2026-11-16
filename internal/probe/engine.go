@@ -1,7 +1,9 @@
 package probe
 
 import (
+	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -61,24 +63,19 @@ type engine struct {
 	pending   map[probeKey]*pendingProbe
 	tombs     map[probeKey]time.Time // key -> expiry
 	lastPrune time.Time
-	nextID    map[flowKey]uint16
+	ids       *rand.Rand // probe ids; guarded by mu
 
-	sent     atomic.Uint64
-	sendErrs atomic.Uint64
-	late     atomic.Uint64
-}
-
-// flowKey identifies a probe flow for id allocation: probes of different
-// flows can never be confused, so each flow counts on its own.
-type flowKey struct {
-	dst   netip.Addr
-	proto uint8
-	flow  uint16
+	sent       atomic.Uint64
+	sendErrs   atomic.Uint64
+	late       atomic.Uint64
+	mismatched atomic.Uint64
 }
 
 type pendingProbe struct {
 	tr   *traceState
 	ttl  int
+	ipID uint16    // the IPv4 header's identification field
+	echo []byte    // an echo request's data, which the reply must carry
 	sent time.Time // zero until the probe has been handed to the socket
 }
 
@@ -92,6 +89,8 @@ type traceState struct {
 }
 
 func newEngine(io netIO) *engine {
+	var seed [32]byte
+	_, _ = cryptorand.Read(seed[:]) // never fails
 	return &engine{
 		io:           io,
 		grace:        defaultGrace,
@@ -99,12 +98,13 @@ func newEngine(io netIO) *engine {
 		now:          time.Now,
 		pending:      make(map[probeKey]*pendingProbe),
 		tombs:        make(map[probeKey]time.Time),
-		nextID:       make(map[flowKey]uint16),
+		ids:          rand.New(rand.NewChaCha8(seed)),
 	}
 }
 
 func (e *engine) stats() Stats {
-	return Stats{ProbesSent: e.sent.Load(), SendErrors: e.sendErrs.Load(), LateReplies: e.late.Load()}
+	return Stats{ProbesSent: e.sent.Load(), SendErrors: e.sendErrs.Load(), LateReplies: e.late.Load(),
+		MismatchedReplies: e.mismatched.Load()}
 }
 
 // pendingLen reports the number of in-flight probes, for leak tests.
@@ -114,22 +114,45 @@ func (e *engine) pendingLen() int {
 	return len(e.pending)
 }
 
-// allocIDLocked returns the next probe identifier of a flow, in 1..0xfffe.
-// The range suits both ICMP sequence numbers and UDP checksums (where 0 and
-// 0xffff are reserved). Each flow counts separately from a random start, so
-// an id is reused only after 65534 newer probes of the same flow (hours at
-// any sane interval), long after the old probe's tombstone has expired.
-func (e *engine) allocIDLocked(fk flowKey) uint16 {
-	id, ok := e.nextID[fk]
-	if !ok {
-		id = uint16(rand.N(0xfffe)) //nolint:gosec // not security relevant
+// maxIDTries bounds the random draws for a free probe id before
+// allocIDLocked falls back to scanning.
+const maxIDTries = 16
+
+// allocIDLocked returns a probe identifier in 1..0xfffe (the range suits
+// both ICMP sequence numbers and UDP checksums, where 0 and 0xffff are
+// reserved) and the probe's key, built by keyOf. Ids are drawn at random
+// from a cryptographically strong generator, so the ids of one probe tell
+// nothing about the others: a local process that learns the ids of the
+// probes reaching the destination (from their answers) cannot predict those
+// of the silent hops before them. An id whose key is in flight or
+// tombstoned is never chosen while a free one exists; a tombstoned key is
+// reused only if every id of the flow is taken, and an in-flight one never.
+func (e *engine) allocIDLocked(keyOf func(id uint16) probeKey) (uint16, probeKey, error) {
+	free := func(k probeKey, tombs bool) bool {
+		if _, busy := e.pending[k]; busy {
+			return false
+		}
+		_, tomb := e.tombs[k]
+		return !tombs || !tomb
 	}
-	id++
-	if id == 0 || id == 0xffff {
-		id = 1
+	id := uint16(1 + e.ids.IntN(0xfffe)) //nolint:gosec // 1..0xfffe
+	for range maxIDTries {
+		if k := keyOf(id); free(k, true) {
+			return id, k, nil
+		}
+		id = uint16(1 + e.ids.IntN(0xfffe)) //nolint:gosec // 1..0xfffe
 	}
-	e.nextID[fk] = id
-	return id
+	for _, tombs := range []bool{true, false} {
+		for range 0xfffe {
+			if k := keyOf(id); free(k, tombs) {
+				return id, k, nil
+			}
+			if id++; id == 0xffff {
+				id = 1
+			}
+		}
+	}
+	return 0, probeKey{}, errors.New("probe: every probe id of the flow is in flight")
 }
 
 func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, error) {
@@ -159,48 +182,56 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 	keys := make([]probeKey, n)
 	probes := make([]*pendingProbe, n)
 
-	fk := flowKey{dst: target, proto: protoUDP, flow: req.FlowID}
-	switch req.Protocol {
-	case ICMP:
-		fk.proto = protoICMP
-	case TCP:
-		fk.proto = protoTCP
-	}
 	e.mu.Lock()
 	for i := range pkts {
 		ttl := first + i
-		id := e.allocIDLocked(fk)
-		p := outPacket{src: src, dst: target, zone: req.Target.Zone(), ttl: uint8(ttl), ipID: id} //nolint:gosec // ttl <= MaxTTL (255), checked by Validate
-		var k probeKey
+		p := outPacket{src: src, dst: target, zone: req.Target.Zone(), ttl: uint8(ttl)} //nolint:gosec // ttl <= MaxTTL (255), checked by Validate
+		// key fields other than the probe id
+		var a, b uint16
 		switch req.Protocol {
 		case ICMP:
 			p.proto = protoICMP
 			if target.Is6() {
 				p.proto = protoICMPv6
 			}
-			p.l4 = buildEcho(src, target, req.FlowID, id, req.Paris)
-			k = probeKey{dst: target, proto: p.proto, a: req.FlowID, c: id}
+			a = req.FlowID
 		case UDP:
-			dport := req.Port
-			if !req.Paris {
-				dport += uint16(ttl - 1) //nolint:gosec // classic traceroute port walk; wraps like it does
-			}
 			p.proto = protoUDP
-			p.l4 = buildUDP(src, target, req.FlowID, dport, id)
-			k = probeKey{dst: target, proto: protoUDP, a: req.FlowID, b: dport, c: id}
+			a, b = req.FlowID, req.Port
+			if !req.Paris {
+				b += uint16(ttl - 1) //nolint:gosec // classic traceroute port walk; wraps like it does
+			}
 		case TCP:
 			// The destination port is the service being reached, so
 			// classic mode walks the source port instead.
-			sport := req.FlowID
-			if !req.Paris {
-				sport += uint16(ttl - 1) //nolint:gosec // wraps like classic traceroute
-			}
 			p.proto = protoTCP
-			p.l4 = buildTCPSyn(src, target, sport, req.Port, tcpSeq(id))
-			k = probeKey{dst: target, proto: protoTCP, a: sport, b: req.Port, c: id}
+			a, b = req.FlowID, req.Port
+			if !req.Paris {
+				a += uint16(ttl - 1) //nolint:gosec // wraps like classic traceroute
+			}
+		}
+		id, k, err := e.allocIDLocked(func(id uint16) probeKey {
+			return probeKey{dst: target, proto: p.proto, a: a, b: b, c: id}
+		})
+		if err != nil {
+			e.mu.Unlock()
+			e.finish(tr, keys[:i], probes[:i], false)
+			return nil, fmt.Errorf("trace %s: %w", target, err)
+		}
+		p.ipID = id
+		switch req.Protocol {
+		case ICMP:
+			p.l4 = buildEcho(src, target, req.FlowID, id, req.Paris)
+		case UDP:
+			p.l4 = buildUDP(src, target, a, b, id)
+		case TCP:
+			p.l4 = buildTCPSyn(src, target, a, b, tcpSeq(id))
 		}
 		pkts[i], keys[i] = p, k
-		probes[i] = &pendingProbe{tr: tr, ttl: ttl}
+		probes[i] = &pendingProbe{tr: tr, ttl: ttl, ipID: id}
+		if req.Protocol == ICMP {
+			probes[i].echo = p.l4[8:]
+		}
 		e.pending[k] = probes[i]
 		delete(e.tombs, k)
 	}
@@ -335,9 +366,30 @@ func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time, msg []byte)
 	if p.sent.IsZero() {
 		return // cannot be a reply to a probe that has not been sent
 	}
+	rtt := at.Sub(p.sent)
+	if rtt < 0 {
+		// Received (kernel timestamp) before the probe left: not an answer
+		// to it, though it was read afterwards. The probe stays pending.
+		return
+	}
+	if r.quotedIPID && r.ipID != p.ipID {
+		// An ICMP error quoting the probe's key but not its IPv4
+		// identification: someone else's packet (an unprivileged process
+		// can choose ports, UDP checksum and echo sequence, but not the IP
+		// ID), or a middlebox that rewrites IP IDs. Not an answer.
+		e.mismatched.Add(1)
+		return
+	}
+	if r.kind == kindEchoReply && (len(msg) < 8 || !bytes.HasPrefix(msg[8:], p.echo)) {
+		// The destination echoes the request's data; this reply carries
+		// other data, so it answers someone else's echo with the probe's
+		// identifier and sequence number (a ping run with a chosen
+		// identifier, say).
+		e.mismatched.Add(1)
+		return
+	}
 	tr := p.tr
 	delete(e.pending, r.key)
-	rtt := at.Sub(p.sent)
 	if rtt > tr.req.Timeout {
 		e.late.Add(1)
 		e.tombs[r.key] = at.Add(e.tombstoneTTL)

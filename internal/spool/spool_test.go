@@ -3,8 +3,10 @@ package spool
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,45 +52,56 @@ func seqsOf(es []Entry) []uint64 {
 	return out
 }
 
+// rel numbers seqs from a spool's start: base is its Stats().LastSeq when
+// it was new (its first seq minus one), so its first record is 1.
+func rel(base uint64, seqs []uint64) []uint64 {
+	out := make([]uint64, len(seqs))
+	for i, s := range seqs {
+		out[i] = s - base
+	}
+	return out
+}
+
 func TestAppendReadAck(t *testing.T) {
 	s := open(t, t.TempDir(), "jsonl", "http")
 	defer s.Close()
+	base := s.Stats().LastSeq
 	seqs := appendN(t, s, 5)
-	if fmt.Sprint(seqs) != "[1 2 3 4 5]" {
+	if fmt.Sprint(rel(base, seqs)) != "[1 2 3 4 5]" {
 		t.Fatalf("seqs %v", seqs)
 	}
 	es, err := s.Read("http", 3, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(seqsOf(es)) != "[1 2 3]" || !bytes.HasPrefix(es[0].Data, []byte(`{"seq":1,`)) {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[1 2 3]" || !bytes.HasPrefix(es[0].Data, fmt.Appendf(nil, `{"seq":%d,`, base+1)) {
 		t.Fatalf("read %v %q", seqsOf(es), es[0].Data)
 	}
-	if err := s.Ack("http", 3); err != nil {
+	if err := s.Ack("http", base+3); err != nil {
 		t.Fatal(err)
 	}
 	es, _ = s.Read("http", 10, 1<<20)
-	if fmt.Sprint(seqsOf(es)) != "[4 5]" {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[4 5]" {
 		t.Errorf("after ack: %v", seqsOf(es))
 	}
 	// jsonl has acknowledged nothing, so nothing may be deleted yet.
-	if st := s.Stats(); st.Records != 5 || st.LastSeq != 5 {
+	if st := s.Stats(); st.Records != 5 || st.LastSeq != base+5 {
 		t.Errorf("stats %+v", st)
 	}
 	if p := s.Pending("http"); p != 2 {
 		t.Errorf("pending http = %d", p)
 	}
-	if err := s.Ack("jsonl", 4); err != nil {
+	if err := s.Ack("jsonl", base+4); err != nil {
 		t.Fatal(err)
 	}
 	if st := s.Stats(); st.Records != 2 {
 		t.Errorf("records after both acked through 3: %+v", st)
 	}
-	if err := s.Ack("http", 2); err != nil { // going backwards is a no-op
+	if err := s.Ack("http", base+2); err != nil { // going backwards is a no-op
 		t.Fatal(err)
 	}
 	es, _ = s.Read("http", 10, 1<<20)
-	if fmt.Sprint(seqsOf(es)) != "[4 5]" {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[4 5]" {
 		t.Errorf("cursor moved backwards: %v", seqsOf(es))
 	}
 	if _, err := s.Read("nope", 1, 1); err == nil {
@@ -113,8 +126,9 @@ func TestReadMaxBytes(t *testing.T) {
 func TestSeqAndCursorsPersist(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir, "a")
+	base := s.Stats().LastSeq
 	appendN(t, s, 3)
-	if err := s.Ack("a", 2); err != nil {
+	if err := s.Ack("a", base+2); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -122,11 +136,11 @@ func TestSeqAndCursorsPersist(t *testing.T) {
 	}
 	s = open(t, dir, "a")
 	defer s.Close()
-	if seqs := appendN(t, s, 1); seqs[0] != 4 {
-		t.Errorf("seq after reopen = %d, want 4", seqs[0])
+	if seqs := appendN(t, s, 1); seqs[0] != base+4 {
+		t.Errorf("seq after reopen = %d, want %d", seqs[0], base+4)
 	}
 	es, _ := s.Read("a", 10, 1<<20)
-	if fmt.Sprint(seqsOf(es)) != "[3 4]" {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[3 4]" {
 		t.Errorf("read after reopen: %v", seqsOf(es))
 	}
 }
@@ -134,6 +148,7 @@ func TestSeqAndCursorsPersist(t *testing.T) {
 func TestConsumerChanges(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir, "old")
+	base := s.Stats().LastSeq
 	appendN(t, s, 3)
 	_ = s.Close()
 
@@ -148,7 +163,7 @@ func TestConsumerChanges(t *testing.T) {
 	}
 	appendN(t, s, 1)
 	es, _ = s.Read("new", 10, 1<<20)
-	if fmt.Sprint(seqsOf(es)) != "[4]" {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[4]" {
 		t.Errorf("new consumer: %v", seqsOf(es))
 	}
 	_ = s.Close()
@@ -156,7 +171,7 @@ func TestConsumerChanges(t *testing.T) {
 	// No consumers: records are not kept, but seq still advances.
 	s = open(t, dir)
 	defer s.Close()
-	if seqs := appendN(t, s, 2); fmt.Sprint(seqs) != "[5 6]" {
+	if seqs := appendN(t, s, 2); fmt.Sprint(rel(base, seqs)) != "[5 6]" {
 		t.Errorf("seqs %v", seqs)
 	}
 	if st := s.Stats(); st.Records != 0 || st.Bytes != 0 {
@@ -170,6 +185,7 @@ func TestSizeBoundDropsOldest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	base := s.Stats().LastSeq
 	appendN(t, s, 50)
 	st := s.Stats()
 	if st.Bytes > 1000 || st.Records == 0 || st.Records >= 50 {
@@ -179,7 +195,7 @@ func TestSizeBoundDropsOldest(t *testing.T) {
 		t.Errorf("dropped %d, want %d", st.Dropped, 50-st.Records)
 	}
 	es, _ := s.Read("c", 100, 1<<20)
-	if es[len(es)-1].Seq != 50 || es[0].Seq != uint64(51-st.Records) {
+	if es[len(es)-1].Seq != base+50 || es[0].Seq != base+uint64(51-st.Records) {
 		t.Errorf("kept %v; the newest must survive", seqsOf(es))
 	}
 }
@@ -193,6 +209,7 @@ func TestAgeBoundDropsOldest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	base := s.Stats().LastSeq
 	for i := range 3 {
 		ts := now.Add(time.Duration(i) * 40 * time.Minute)
 		if _, err := s.Append(ts, func(uint64) ([]byte, error) { return []byte("{}"), nil }); err != nil {
@@ -206,7 +223,7 @@ func TestAgeBoundDropsOldest(t *testing.T) {
 		t.Fatal(err)
 	}
 	es, _ := s.Read("c", 10, 1<<20)
-	if fmt.Sprint(seqsOf(es)) != "[3 4]" {
+	if fmt.Sprint(rel(base, seqsOf(es))) != "[3 4]" {
 		t.Errorf("after age bound: %v", seqsOf(es))
 	}
 	if d := s.Stats().Dropped; d != 2 {
@@ -232,26 +249,28 @@ func TestDeliveredRecordsAreNotCountedAsDropped(t *testing.T) {
 func TestEncodeErrorConsumesNothing(t *testing.T) {
 	s := open(t, t.TempDir(), "c")
 	defer s.Close()
+	base := s.Stats().LastSeq
 	if _, err := s.Append(time.Now(), func(uint64) ([]byte, error) { return nil, errors.New("boom") }); err == nil {
 		t.Fatal("encode error swallowed")
 	}
-	if seqs := appendN(t, s, 1); seqs[0] != 1 {
-		t.Errorf("seq %d after failed append, want 1", seqs[0])
+	if seqs := appendN(t, s, 1); seqs[0] != base+1 {
+		t.Errorf("seq %d after failed append, want %d", seqs[0], base+1)
 	}
 }
 
 func TestCorruptRecordIsSkipped(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir, "c")
+	base := s.Stats().LastSeq
 	appendN(t, s, 3)
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketRecords).Put(seqKey(2), []byte("\x00\x00\x00\x00\x00\x00\x00\x01garbage"))
+		return tx.Bucket(bucketRecords).Put(seqKey(base+2), []byte("\x00\x00\x00\x00\x00\x00\x00\x01garbage"))
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	es, err := s.Read("c", 10, 1<<20)
-	if err != nil || fmt.Sprint(seqsOf(es)) != "[1 3]" {
+	if err != nil || fmt.Sprint(rel(base, seqsOf(es))) != "[1 3]" {
 		t.Errorf("read %v, %v", seqsOf(es), err)
 	}
 	_ = s.Close()
@@ -286,6 +305,7 @@ func TestLocked(t *testing.T) {
 func TestConcurrentAppends(t *testing.T) {
 	s := open(t, t.TempDir(), "c")
 	defer s.Close()
+	base := s.Stats().LastSeq
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() { appendN(t, s, 25) })
@@ -296,7 +316,7 @@ func TestConcurrentAppends(t *testing.T) {
 		t.Fatalf("%d records", len(es))
 	}
 	for i, e := range es {
-		if e.Seq != uint64(i+1) || !bytes.HasPrefix(e.Data, []byte(fmt.Sprintf(`{"seq":%d,`, e.Seq))) {
+		if e.Seq != base+uint64(i+1) || !bytes.HasPrefix(e.Data, []byte(fmt.Sprintf(`{"seq":%d,`, e.Seq))) {
 			t.Fatalf("entry %d: seq %d data %q", i, e.Seq, e.Data)
 		}
 	}
@@ -446,6 +466,7 @@ func TestCorruptFileIsQuarantined(t *testing.T) {
 func TestHealthyFileIsKept(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir, "a")
+	base := s.Stats().LastSeq
 	appendN(t, s, 3)
 	// A second open while the first holds the lock fails without touching it.
 	if _, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 20, Consumers: []string{"a"}}); !errors.Is(err, ErrLocked) {
@@ -457,7 +478,147 @@ func TestHealthyFileIsKept(t *testing.T) {
 	}
 	s = open(t, dir, "a")
 	defer s.Close()
-	if seqs := appendN(t, s, 1); seqs[0] != 4 {
-		t.Errorf("seq after reopen %d, want 4", seqs[0])
+	if seqs := appendN(t, s, 1); seqs[0] != base+4 {
+		t.Errorf("seq after reopen %d, want %d", seqs[0], base+4)
+	}
+}
+
+// Damage inside a leaf page used to crash the agent instead of being
+// quarantined: bbolt's consistency check runs in a goroutine of its own,
+// where a fault on the mapped file is fatal. The check never reads values,
+// so a value pointing outside the file went unnoticed until a drain read it
+// (faulting or not, depending on the bytes). Each case opens the damaged
+// file in a child process, so a regression fails this test instead of
+// killing the test binary.
+func TestDamagedLeafIsQuarantined(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	cases := []struct {
+		name  string
+		field int // byte offset in a leaf element: flags 0, pos 4, ksize 8, vsize 12
+	}{
+		{"key outside the mapping", 4},    // faults in tx.Check's key order check
+		{"value outside the mapping", 12}, // never read by tx.Check
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := open(t, dir, "a")
+			appendN(t, s, 400)
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, fileName)
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const pageSize = 4096
+			damaged := false
+			for pg := 2; (pg+1)*pageSize <= len(b) && !damaged; pg++ {
+				p := b[pg*pageSize:]
+				// A leaf page (flags 0x02) of the records bucket: many elements.
+				if binary.LittleEndian.Uint16(p[8:]) == 0x02 && binary.LittleEndian.Uint16(p[10:]) > 10 {
+					binary.LittleEndian.PutUint32(p[16+c.field:], 0x7ff00000)
+					damaged = true
+				}
+			}
+			if !damaged {
+				t.Fatal("no records leaf page found")
+			}
+			if err := os.WriteFile(path, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(os.Args[0], "-test.run=^TestOpenDamagedChild$")
+			cmd.Env = append(os.Environ(), "HOPCORDER_SPOOL_DAMAGED_DIR="+dir)
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "opened, records 0") {
+				t.Fatalf("child: %v\n%s", err, out)
+			}
+			if moved, _ := filepath.Glob(path + ".corrupt-*"); len(moved) != 1 {
+				t.Errorf("damaged file kept as %v", moved)
+			}
+		})
+	}
+}
+
+// TestOpenDamagedChild is the child half of TestDamagedLeafIsQuarantined:
+// it opens the spool and reads it the way a drain does.
+func TestOpenDamagedChild(t *testing.T) {
+	dir := os.Getenv("HOPCORDER_SPOOL_DAMAGED_DIR")
+	if dir == "" {
+		t.Skip("helper process for TestDamagedLeafIsQuarantined")
+	}
+	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}})
+	if err != nil {
+		fmt.Println("open failed:", err)
+		os.Exit(1)
+	}
+	done := make(chan error, 1)
+	go func() { // drains read in goroutines of their own
+		_, err := s.Read("a", 1000, 1<<30)
+		done <- err
+	}()
+	err = <-done
+	_ = s.Close()
+	if err != nil {
+		fmt.Println("read failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("opened, records %d\n", s.Stats().Records)
+}
+
+// A new spool starts its seqs at the clock in microseconds, so records of a
+// spool that was deleted and recreated under the same agent_id lie above
+// everything the old one sent (the server drops seqs at or below its
+// high-water mark as duplicates). An existing spool keeps counting.
+func TestNewSpoolStartsAtTheClock(t *testing.T) {
+	dir := t.TempDir()
+	before := time.Now()
+	s := open(t, dir, "a")
+	first := appendN(t, s, 1)[0]
+	if first < uint64(before.UnixMicro()) || first > uint64(time.Now().UnixMicro()) { //nolint:gosec // positive
+		t.Errorf("first seq %d, want the time in microseconds (%d)", first, before.UnixMicro())
+	}
+	last := appendN(t, s, 2)[1]
+	_ = s.Close()
+
+	// Reopened much later, it continues where it was.
+	later := func() time.Time { return time.Now().Add(24 * time.Hour) }
+	s, err := Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Now: later})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq := appendN(t, s, 1)[0]; seq != last+1 {
+		t.Errorf("seq after reopen %d, want %d", seq, last+1)
+	}
+	_ = s.Close()
+
+	// Deleted and recreated, it starts above the old one.
+	if err := os.Remove(filepath.Join(dir, fileName)); err != nil {
+		t.Fatal(err)
+	}
+	s = open(t, dir, "a")
+	if seq := appendN(t, s, 1)[0]; seq <= last+1 {
+		t.Errorf("seq of a recreated spool %d, not above the old %d", seq, last+1)
+	}
+	_ = s.Close()
+
+	// A spool created before seqs came from the clock (counting from 1)
+	// keeps its counter.
+	old := t.TempDir()
+	o := Options{Dir: old, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Logger: slog.Default(), Now: time.Now}
+	s, err = openDB(o, filepath.Join(old, fileName), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendN(t, s, 3)
+	_ = s.Close()
+	s = open(t, old, "a")
+	defer s.Close()
+	if seq := appendN(t, s, 1)[0]; seq != 4 {
+		t.Errorf("seq of a pre-existing spool after reopen %d, want 4", seq)
 	}
 }

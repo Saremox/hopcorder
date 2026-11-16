@@ -122,6 +122,12 @@ type Stats struct {
 	ProbesSent  uint64
 	SendErrors  uint64
 	LateReplies uint64
+	// MismatchedReplies counts replies that matched an in-flight probe's
+	// addresses, ports and id but not the rest of it: an ICMPv4 error
+	// quoting another IP identification, or an echo reply with other data.
+	// They answer another process's packets, or a middlebox on the path
+	// rewrote IP IDs (hops beyond it then stay silent on IPv4).
+	MismatchedReplies uint64
 }
 
 // StatsProvider is implemented by probers that expose Stats.
@@ -134,6 +140,30 @@ type StatsProvider interface {
 // sense that nothing could have answered; callers should record it as a cycle
 // in which no hop responded rather than as a gap.
 var ErrNoRoute = errors.New("no route to target")
+
+// Flow is the local identifier a target's probes are sent with: the ICMP
+// echo identifier, or the UDP or TCP source port (the target's flow_id).
+type Flow struct {
+	Protocol Protocol
+	ID       uint16
+}
+
+// FlowHolder is implemented by probers that hold their flows' local
+// identifiers with ordinary sockets so that no other process on the host
+// can claim them. An unprivileged process holding one could otherwise see
+// the answers to the probes and send packets that pass for probes. Raw
+// holds ICMP echo identifiers (see its HoldFlows for why not ports).
+type FlowHolder interface {
+	// HoldFlows makes flows the set held, releasing identifiers of flows
+	// no longer listed. If an identifier cannot be held, nothing changes
+	// and the error wraps ErrFlowInUse when another process holds it.
+	HoldFlows(flows []Flow) error
+}
+
+// ErrFlowInUse is returned (wrapped) by HoldFlows when another process holds
+// a flow's identifier, for example another hopcorder probing with the same
+// flow_id.
+var ErrFlowInUse = errors.New("in use by another process")
 
 // ErrPermission is returned (wrapped) when raw sockets cannot be opened.
 var ErrPermission = errors.New("raw sockets need CAP_NET_RAW: run `sudo setcap cap_net_raw+ep $(which hopcorder)` " +

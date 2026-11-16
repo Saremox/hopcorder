@@ -10,11 +10,13 @@
 package spool
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"math"
 	"os"
@@ -80,7 +82,7 @@ type Spool struct {
 	opts     Options
 	enc      *zstd.Encoder
 	dec      *zstd.Decoder
-	firstSeq uint64 // seq of an empty spool's first record
+	firstSeq uint64 // seq of a new spool's first record
 
 	mu         sync.Mutex
 	notify     map[string]chan struct{}
@@ -112,22 +114,31 @@ func Open(o Options) (*Spool, error) {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
 	path := filepath.Join(o.Dir, fileName)
-	s, err := openDB(o, path, 0)
+	s, err := openDB(o, path, clockSeq(o.Now()))
 	if errors.Is(err, errCorrupt) {
 		// A corrupt file must not stop the agent for good (bbolt can even
-		// fault on one): keep it for inspection and start over. The new
-		// spool's seqs start at the current time in microseconds, above any
-		// the old one can have used, so the server neither drops the new
-		// records as duplicates nor refuses them as stale.
+		// fault on one): keep it for inspection and start over, with seqs
+		// from the clock like any new spool.
 		bad := fmt.Sprintf("%s.corrupt-%d", path, o.Now().Unix())
 		if rerr := os.Rename(path, bad); rerr != nil {
 			return nil, fmt.Errorf("%w (and cannot move it aside: %w)", err, rerr)
 		}
 		o.Logger.Error("spool: database unusable; moved aside, starting an empty spool",
 			"err", err, "kept_as", bad)
-		s, err = openDB(o, path, uint64(o.Now().UnixMicro())) //nolint:gosec // positive
+		s, err = openDB(o, path, clockSeq(o.Now()))
 	}
 	return s, err
+}
+
+// clockSeq is the first seq of a new spool: the current time in
+// microseconds. A spool counts up by one per record, far slower than the
+// clock, so a new spool (the old one deleted, lost or quarantined) starts
+// above any seq an earlier one under the same agent_id reached. Starting at
+// 1 instead, its records would be dropped by the server as duplicates until
+// the seq passed the old high-water mark. An existing spool keeps its
+// counter; only a clock far behind (no RTC, no NTP yet) defeats this.
+func clockSeq(now time.Time) uint64 {
+	return uint64(max(now.UnixMicro(), 1)) //nolint:gosec // positive
 }
 
 // errCorrupt marks a spool file that cannot be used: bbolt found it
@@ -136,7 +147,8 @@ func Open(o Options) (*Spool, error) {
 var errCorrupt = errors.New("corrupt")
 
 // openDB opens the spool file, checks its consistency and initialises it;
-// firstSeq is the seq of an empty spool's first record (0: 1).
+// firstSeq is the seq of a new spool's first record (0: 1). A spool that
+// has assigned seqs before keeps counting from where it was.
 func openDB(o Options, path string, firstSeq uint64) (s *Spool, err error) {
 	// Faults while reading a damaged memory-mapped file become errors.
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
@@ -180,8 +192,21 @@ func openDB(o Options, path string, firstSeq uint64) (s *Spool, err error) {
 	return s, nil
 }
 
-// checkDB runs bbolt's consistency check (page structure and freelist).
+// checkDB reads every key and value, then runs bbolt's consistency check
+// (page structure and freelist).
+//
+// The walk comes first and runs in the caller's goroutine, where openDB has
+// turned faults into panics. tx.Check runs in a goroutine of its own, where a
+// fault on the memory-mapped file (a leaf element pointing past the mapping,
+// say) is fatal; bbolt pages carry no checksums, so a single damaged element
+// would otherwise crash the agent on every start. The walk reads every
+// branch, leaf and overflow page reachable from the buckets; the freelist,
+// the only other page the check reads, was loaded by bolt.Open in this
+// goroutine too.
 func checkDB(db *bolt.DB) error {
+	if err := db.View(walkAll); err != nil {
+		return err
+	}
 	var first error
 	err := db.View(func(tx *bolt.Tx) error {
 		for err := range tx.Check() { // drain: the checker runs until done
@@ -192,6 +217,34 @@ func checkDB(db *bolt.DB) error {
 		return nil
 	})
 	return errors.Join(first, err)
+}
+
+// walkAll visits every key and value of every bucket (nested ones included),
+// checking that keys are in order.
+func walkAll(tx *bolt.Tx) error { return tx.ForEach(walkBucket) }
+
+// valueSink keeps the compiler from eliding the reads of the values.
+var valueSink atomic.Uint32
+
+func walkBucket(name []byte, b *bolt.Bucket) error {
+	var prev []byte
+	c := b.Cursor()
+	for k, v := c.First(); k != nil; k, v = c.Next() {
+		if prev != nil && bytes.Compare(prev, k) >= 0 {
+			return fmt.Errorf("bucket %q: keys out of order", name)
+		}
+		prev = k
+		if v == nil { // a nested bucket
+			if nb := b.Bucket(k); nb != nil {
+				if err := walkBucket(k, nb); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		valueSink.Add(crc32.ChecksumIEEE(v)) // read the value itself, not just its header
+	}
+	return nil
 }
 
 // txState collects side effects of a write transaction that must only be

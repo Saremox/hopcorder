@@ -28,6 +28,8 @@ type Fake struct {
 	scenarios map[netip.Addr][]Scenario
 	cycles    map[netip.Addr]int
 	requests  []TraceRequest
+	held      []Flow
+	holdErr   error
 
 	late  atomic.Uint64
 	sent  atomic.Uint64
@@ -95,6 +97,32 @@ func (f *Fake) Requests() []TraceRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.requests)
+}
+
+// SetHoldErr makes later HoldFlows calls fail with err (nil: succeed).
+func (f *Fake) SetHoldErr(err error) {
+	f.mu.Lock()
+	f.holdErr = err
+	f.mu.Unlock()
+}
+
+// HoldFlows implements FlowHolder: it records flows, or fails as set by
+// SetHoldErr.
+func (f *Fake) HoldFlows(flows []Flow) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holdErr != nil {
+		return f.holdErr
+	}
+	f.held = slices.Clone(flows)
+	return nil
+}
+
+// Held returns the flows of the last successful HoldFlows.
+func (f *Fake) Held() []Flow {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.held)
 }
 
 // Stats implements StatsProvider.

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -226,6 +227,7 @@ func TestOutageAndRecovery(t *testing.T) {
 	writeTestFile(t, tokenFile, "t0ken\n")
 	metricsAddr := freeAddr(t)
 	cfg := daemonConfig(t, dir+"/spool", srv.URL, metricsAddr, tokenFile)
+	base := newSpool(t, dir+"/spool")
 
 	stop := startDaemon(t, cfg, fakeNetwork())
 	waitFor(t, 10*time.Second, func() bool {
@@ -262,17 +264,18 @@ func TestOutageAndRecovery(t *testing.T) {
 	defer sp.Close()
 	st := sp.Stats()
 	unique, dupes, maxSeq := ingest.snapshot()
-	t.Logf("spool last seq %d, delivered %d unique records (%d duplicates) in %d posts", st.LastSeq, unique, dupes, ingest.posts)
-	if st.LastSeq < 30 {
-		t.Fatalf("only %d records produced", st.LastSeq)
+	produced := st.LastSeq - base
+	t.Logf("spool produced %d records, delivered %d unique (%d duplicates) in %d posts", produced, unique, dupes, ingest.posts)
+	if produced < 30 {
+		t.Fatalf("only %d records produced", produced)
 	}
 	if p := sp.Pending("http"); p != 0 {
 		t.Errorf("%d records still pending after recovery", p)
 	}
-	if maxSeq != st.LastSeq || uint64(unique) != st.LastSeq {
-		t.Errorf("delivered %d unique records up to seq %d; spool assigned %d", unique, maxSeq, st.LastSeq)
+	if maxSeq != st.LastSeq || uint64(unique) != produced {
+		t.Errorf("delivered %d unique records up to seq %d; spool assigned %d up to %d", unique, maxSeq, produced, st.LastSeq)
 	}
-	for seq := uint64(1); seq <= st.LastSeq; seq++ {
+	for seq := base + 1; seq <= st.LastSeq; seq++ {
 		if ingest.received[seq] == 0 {
 			t.Errorf("seq %d never delivered", seq)
 		}
@@ -317,6 +320,7 @@ func TestShutdownShipsPartialBatch(t *testing.T) {
 	cfg := daemonConfig(t, dir+"/spool", srv.URL, freeAddr(t), tokenFile)
 	cfg.Outputs.HTTP.FlushInterval = config.Duration(config.DefaultHTTPFlushInterval)
 	shutdownGrace = 3 * time.Second
+	base := newSpool(t, dir+"/spool")
 
 	stop := startDaemon(t, cfg, fakeNetwork())
 	time.Sleep(500 * time.Millisecond)
@@ -331,9 +335,24 @@ func TestShutdownShipsPartialBatch(t *testing.T) {
 	}
 	defer sp.Close()
 	unique, _, _ := ingest.snapshot()
-	if p := sp.Pending("http"); p != 0 || unique == 0 || uint64(unique) != sp.Stats().LastSeq {
-		t.Errorf("pending %d, delivered %d of %d", p, unique, sp.Stats().LastSeq)
+	if p := sp.Pending("http"); p != 0 || unique == 0 || uint64(unique) != sp.Stats().LastSeq-base {
+		t.Errorf("pending %d, delivered %d of %d", p, unique, sp.Stats().LastSeq-base)
 	}
+}
+
+// newSpool creates the spool an http-only daemon will use and returns the
+// seq before its first record: a new spool's seqs start at the clock.
+func newSpool(t *testing.T, dir string) uint64 {
+	t.Helper()
+	sp, err := spool.Open(spool.Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := sp.Stats().LastSeq
+	if err := sp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return base
 }
 
 func readRecords(t *testing.T, path string) []record.Record {
@@ -493,4 +512,33 @@ func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Conf
 		t.Fatal(err)
 	}
 	return c
+}
+
+// The daemon holds its targets' flows before anything else, and a flow held
+// by another process stops the start with a hint at the remedy.
+func TestDaemonHoldsFlows(t *testing.T) {
+	dir := t.TempDir()
+	cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
+	cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999})
+	if err := cfg.Finalize(config.FinalizeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f := fakeNetwork()
+	stop := startDaemon(t, cfg, f)
+	waitFor(t, 3*time.Second, func() bool { return len(f.Held()) == 2 }, "held flows")
+	stop()
+	want := []probe.Flow{{Protocol: probe.ICMP, ID: 33434}, {Protocol: probe.TCP, ID: 999}}
+	if got := f.Held(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("held %v, want %v", got, want)
+	}
+
+	f = fakeNetwork()
+	f.SetHoldErr(fmt.Errorf("icmp flow_id 33434: ICMP echo identifier 33434 is %w", probe.ErrFlowInUse))
+	err := runDaemon(t.Context(), cfg, f, slog.New(slog.DiscardHandler))
+	if !errors.Is(err, probe.ErrFlowInUse) || !strings.Contains(err.Error(), "--flow-id") {
+		t.Errorf("runDaemon = %v, want ErrFlowInUse with a hint", err)
+	}
+	if n := len(f.Requests()); n != 0 {
+		t.Errorf("%d cycles probed although the flows could not be held", n)
+	}
 }

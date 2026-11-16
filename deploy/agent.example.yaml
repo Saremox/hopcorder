@@ -7,6 +7,7 @@ timeout: 1s                     # per-probe timeout; must be < interval
 max_ttl: 30                     # TTLs 1..max_ttl are probed at once each cycle
 probe_past: 2                   # silent TTLs kept past the last responder if unreached
 protocol: icmp                  # default for targets: icmp, udp or tcp
+flow_id: 33434                  # ICMP identifier / UDP, TCP source port; one per hopcorder process on a host
 paris: true                     # flow-stable probing (keeps ECMP on one path)
 adaptive_max_ttl: true          # stop a few TTLs past the destination (records unchanged)
 dns_ttl: 5m                     # re-resolve hostnames this often

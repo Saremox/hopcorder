@@ -456,12 +456,14 @@ added in the commit that introduced it.
   filter passing only ACK+SYN or ACK+RST segments; on IPv6 that socket also
   sends the SYNs. The kernel answers the SYN-ACK with an RST, so no
   connection is ever established.
-- **Probe ids are counted per flow** (dst, protocol, flow id) from a random
-  start, so a busy agent never reuses an id within the 30s tombstone window.
-  Two hopcorder *processes* on one host (e.g. `--once` next to the daemon)
-  both see every ICMP reply; with the same target and `flow_id` a reply can,
-  rarely, be attributed to the other process's probe. Give such runs a
-  different `flow_id`.
+- **Probe ids are random** (since round two of the security review; they
+  were counted per flow from a random start): drawn per probe, never one
+  whose key is in flight, a tombstoned one only when the flow has no other
+  free id. Two hopcorder *processes* on one host (e.g. `--once` next to the
+  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second fails
+  at startup, as the first holds the echo identifier; with UDP or TCP both
+  start, and a reply can, rarely, be attributed to the other process's
+  probe.
 - **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
   review). Once a target was reached at distance d, cycles probe TTLs
   1..d+3. If that batch neither reaches the destination nor hits an
@@ -532,7 +534,8 @@ added in the commit that introduced it.
   fragment line — never a record glued to a fragment. Backoff doubles from `retry_min` to `retry_max`, each wait
   jittered to 50–100%.
 - **`--once`** does not open the spool (so it can run next to a running agent)
-  and prints records with `seq: 0`; the spool assigns seqs from 1.
+  and prints records with `seq: 0`; a new spool starts its seqs at the clock
+  (time in microseconds, since round two), an existing one keeps counting.
 - **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
   and the original command-line flags and positional targets are re-applied.
   Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
@@ -1198,12 +1201,11 @@ decisions:
 - **Stale batches: the gap that stays.** The 409 needs every seq of the
   batch to lie more than 100,000 below the stored mark. An agent whose mark
   is at most 100,000 (in its first day or so) and whose spool is wiped
-  still has its new records dropped as duplicates until its seq passes the
-  old mark. Agents quarantine a corrupt spool with a time-based first seq,
-  so only a deleted spool (which starts at seq 1) hits this; give such an
-  agent a new agent_id (README). Starting every new spool at the current
-  time in microseconds, as the quarantine does, would close the gap on the
-  agent's side; the server cannot tell a reset from a retry.
+  had its new records dropped as duplicates until its seq passed the old
+  mark, as long as a new spool started at seq 1. Closed on the agent's side
+  in the same round: every new spool now starts at the current time in
+  microseconds (see Agent below), which holds while the agent's clock is
+  right; the server cannot tell a reset from a retry.
 - **Recovering an agent_id suppressed by a huge seq.** One record with
   `seq` 2^64−1 under someone else's agent_id makes every later batch of
   that agent 409 for good (`agent_seq` never expires). Authenticating
@@ -1353,3 +1355,122 @@ decisions:
   - Enforce the main ruleset with `ci` as a required check.
   - Add a tag ruleset for `v*`.
   - Optionally turn on immutable releases.
+
+**Agent**
+- **Corrupt spool files are read in full before bbolt's check.** The
+  round-one quarantine turned faults on the mapped file into panics with
+  `debug.SetPanicOnFault`, which covers only the calling goroutine, and
+  `tx.Check` runs in a goroutine of its own. A leaf element pointing outside
+  the mapping (bbolt pages have no checksums) killed the agent with
+  "fatal error: fault" on every start; 3 of 400 random 16-byte corruptions
+  did. `openDB` now walks every bucket with a cursor in its own goroutine,
+  checking key order and reading every value, before `tx.Check`. Such
+  damage then faults where it is recovered, and the file is quarantined.
+  Values are read too because the check never reads them, and a drain that
+  reads one later is not protected.
+- **Probe ids are random.** Each probe id is drawn from ChaCha8, seeded from
+  `crypto/rand`. An id whose key is in flight is never chosen, and a
+  tombstoned one only when the flow has no other free id. This replaces
+  "probe ids are counted per flow from a random start" (§10). Why: an
+  unprivileged local process can see the ids of the probes that reach the
+  destination. A UDP socket with `IP_RECVERR` on the flow's port is handed
+  every ICMP error quoting them, and a ping socket on the echo identifier
+  gets the echo replies. With consecutive ids, that gave away the ids of
+  the silent hops before them. A netns PoC then planted a fake hop and a
+  fake loop, or ended the path early, with one datagram per cycle, for UDP
+  and for ICMP.
+- **ICMPv4 errors must quote the probe's IP ID.** The probe id is already
+  the IP ID of every IPv4 probe. Unprivileged sockets choose ports, the UDP
+  checksum and the echo sequence, but not the IP ID. A mismatch is dropped
+  and counted in `hopcorder_probe_mismatched_replies_total`. Trade-off: a
+  middlebox that rewrites IP IDs makes every hop beyond it silent on IPv4.
+  The counter shows this. TestInnerPath (real Linux routers in netns)
+  passes with the check.
+- **Echo replies must echo the probe's data.** Destinations echo the
+  request's data, but an echo from someone else carries their own data:
+  for example, a ping run with a chosen identifier, which our ping socket
+  cannot stop when it is a raw-socket ping binary. Counted as a
+  mismatched reply.
+- **The agent holds its ICMP echo identifiers**, with one unprivileged
+  ping socket per identifier. The socket is bound to the identifier, has
+  `SO_REUSEADDR` cleared and drops everything it receives. Ping sockets
+  start with `SO_REUSEADDR` set, and the kernel lets two of them share an
+  identifier unless one has it cleared. IPv4 and IPv6 ping sockets share
+  one table of identifiers (`ping_get_port` compares only the identifier),
+  so the one socket holds it for both families: an IPv4 socket, or an IPv6
+  one where IPv4 ping sockets cannot be opened. A socket per family, as
+  first written, collided with itself on hosts with IPv6 (CI caught it; the
+  development container has no IPv6), and the netns test checks that an
+  IPv6 ping socket cannot take an identifier held over IPv4.
+  - The daemon does this first, at every start and reload, and `--once`
+    does too (`probe.FlowHolder`, `Raw.HoldFlows`).
+  - An identifier held by another process fails the start with
+    `ErrFlowInUse` and a hint to use `--flow-id`. A failed reload reverts
+    as before. This replaces the "two hopcorder processes" caveat for
+    ICMP.
+  - Without ping sockets for the agent's group
+    (`net.ipv4.ping_group_range`) nothing is held. This is logged once:
+    at info if other groups may open ping sockets, at debug if nobody can
+    (the kernel default, "1 0").
+- **UDP and TCP source ports are not held** (a deviation from the plan).
+  - A bound UDP port swallows the datagrams sent to it, so the host
+    stopped answering them with port unreachable. Another hopcorder
+    tracing this host with UDP defaults (destination port 33434, the same
+    as our default flow_id) would never see it reached.
+  - A TCP port cannot be bound without `SO_REUSEADDR` for 60 s after any
+    connection on it entered TIME_WAIT. 33434 lies in Linux's ephemeral
+    range, so on busy hosts starts would fail at random. With
+    `SO_REUSEADDR` the hold can be shared, so it would protect nothing.
+  - Both checked on Linux 6.18.
+  - The gain would have been small. Forged ICMP errors for UDP and TCP
+    probes fail the IP ID check. A SYN-ACK or RST cannot be provoked
+    without choosing the SYN's sequence number. With random ids, the ids
+    an unprivileged process can still observe say nothing about the
+    others.
+  - So two processes on the same UDP or TCP flow still start, and the
+    caveat stays for them.
+- **`flow_id` has a global default and a `--flow-id` flag**, so a `--once`
+  run next to the daemon can take another flow without a config file.
+- **Every new spool starts its seqs at the clock** (time in microseconds),
+  not only a quarantined one. The server drops seqs at or below an
+  agent's stored high-water mark as duplicates, and it answers 409 only when
+  a whole batch lies more than 100,000 below it. So a deleted spool that
+  restarted at 1 under the same `agent_id` lost its records silently until
+  its seq passed the old mark. A spool counts up by one per record, far
+  slower than the clock, so a new one starts above anything an earlier
+  one reached, as long as the clock is right. An existing spool keeps its
+  counter. This replaces "the spool assigns seqs from 1" (§10).
+  - On a host without an RTC whose clock is still at 1970 when a new
+    spool is created, the first seq is tiny: the old behaviour, no worse.
+  - Seqs near 1.8·10^15 stay below 2^53, so JavaScript numbers hold them
+    exactly until the year 2255.
+- **No reply before the send.** A reply whose receive time (the kernel's
+  stamp, up to 100 ms before the read) lies before its probe's send time is
+  ignored, and the probe stays pending. It used to be recorded with a
+  negative RTT, clamped to 1 µs.
+- **Accepted, not changed:**
+  - Neither the spool directory nor the JSONL file is opened with
+    `O_NOFOLLOW` or an ownership check. That only matters if an operator
+    puts them in a directory that other users can write, and
+    `O_NOFOLLOW` would break deliberate symlinks.
+  - 64 idle keep-alive connections can block scrapes of the metrics
+    endpoint. That is inherent to a connection cap. Bind the endpoint to
+    localhost or restrict it with a NetworkPolicy.
+- **Tests:**
+  - `TestDamagedLeafIsQuarantined` opens damaged spools in a child
+    process, so a regression fails the test instead of killing the binary.
+  - `TestNewSpoolStartsAtTheClock` covers four cases: a new spool, a
+    reopened spool that keeps counting, a recreated spool that starts
+    above the old one, and a spool created when seqs started at 1, which
+    keeps its counter. Spool, drain and daemon tests now count seqs from
+    each spool's first seq.
+  - Engine tests cover the IP ID check, echo data, random ids, id
+    allocation around in-flight and tombstoned keys, and early replies.
+  - The rawsock subtest `TestRawNetns/hold-and-forge` checks that a child
+    running as uid 65534 cannot bind a held identifier, and that one it
+    holds first fails the agent's start.
+  - The same subtest checks that ICMP probes on a held identifier still
+    get their replies.
+  - It also runs the review's PoC, given the exact id of the silent TTL 2:
+    the PoC can no longer plant a hop there or end the path there. It
+    could with the check disabled.

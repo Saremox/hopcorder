@@ -141,6 +141,7 @@ func TestDrainFullBatchGoesImmediately(t *testing.T) {
 
 func TestDrainRetriesWithBackoffAndKeepsOrder(t *testing.T) {
 	s := openSpool(t, "m")
+	base := s.Stats().LastSeq // a new spool's first seq comes from the clock
 	out := &memOutput{name: "m"}
 	out.fail.Store(true)
 	var errs atomic.Int64
@@ -163,8 +164,11 @@ func TestDrainRetriesWithBackoffAndKeepsOrder(t *testing.T) {
 	out.fail.Store(false)
 	eventually(t, 2*time.Second, func() bool { return len(out.all()) == 10 }, "not delivered after recovery")
 	got := strings.Join(out.all(), ",")
-	want := `{"seq":1},{"seq":2},{"seq":3},{"seq":4},{"seq":5},{"seq":6},{"seq":7},{"seq":8},{"seq":9},{"seq":10}`
-	if got != want {
+	var want []string
+	for i := range uint64(10) {
+		want = append(want, fmt.Sprintf(`{"seq":%d}`, base+1+i))
+	}
+	if got != strings.Join(want, ",") {
 		t.Errorf("delivered %s", got)
 	}
 }
@@ -172,8 +176,9 @@ func TestDrainRetriesWithBackoffAndKeepsOrder(t *testing.T) {
 func TestDrainResumesFromCursorAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := spool.Open(spool.Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"m"}})
+	base := s.Stats().LastSeq
 	push(t, s, 3)
-	_ = s.Ack("m", 2)
+	_ = s.Ack("m", base+2)
 	_ = s.Close()
 
 	s, _ = spool.Open(spool.Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"m"}})
@@ -181,7 +186,7 @@ func TestDrainResumesFromCursorAfterRestart(t *testing.T) {
 	out := &memOutput{name: "m"}
 	startDrain(t, s, out, DrainOptions{})
 	eventually(t, time.Second, func() bool { return len(out.all()) == 1 }, "backlog not delivered")
-	if got := out.all()[0]; got != `{"seq":3}` {
+	if got := out.all()[0]; got != fmt.Sprintf(`{"seq":%d}`, base+3) {
 		t.Errorf("delivered %s", got)
 	}
 }
