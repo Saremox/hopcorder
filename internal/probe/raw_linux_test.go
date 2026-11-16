@@ -299,10 +299,13 @@ func TestRawNetns(t *testing.T) {
 	}
 	t.Run("path", func(t *testing.T) { inner(t, "TestInnerPath|TestRawNoRoute") })
 	t.Run("loop", func(t *testing.T) {
-		// Make r2 send target traffic back to r1: a two-router loop.
-		run(t, "ip", "netns", "exec", topo.ns[2], "ip", "route", "replace", "10.99.3.0/24", "via", "10.99.2.1")
+		// Make r2 send target traffic back to r1: a two-router loop. Host
+		// routes, because the longest prefix beats r2's connected route to
+		// the target subnet whatever the metrics (an IPv6 /64 added with
+		// "replace" gets metric 1024 and loses to the connected /64 at 256).
+		run(t, "ip", "netns", "exec", topo.ns[2], "ip", "route", "add", "10.99.3.2/32", "via", "10.99.2.1")
 		if ipv6Supported() {
-			run(t, "ip", "netns", "exec", topo.ns[2], "ip", "-6", "route", "replace", "fd99:3::/64", "via", "fd99:2::1")
+			run(t, "ip", "netns", "exec", topo.ns[2], "ip", "-6", "route", "add", "fd99:3::2/128", "via", "fd99:2::1")
 		}
 		inner(t, "TestInnerLoop")
 	})
