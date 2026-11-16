@@ -396,3 +396,52 @@ func TestNewValidates(t *testing.T) {
 		t.Error("Run without sink accepted")
 	}
 }
+
+// blockingResolver answers the first lookup and then hangs until ctx ends,
+// like a resolver behind a dead uplink.
+type blockingResolver struct {
+	calls atomic.Int64
+}
+
+func (r *blockingResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	if r.calls.Add(1) == 1 {
+		return []netip.Addr{addr("192.0.2.10")}, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestShutdownDoesNotWaitForHungResolver(t *testing.T) {
+	f := probe.NewFake()
+	f.Set(addr("192.0.2.10"), probe.Scenario{Reachable: true})
+	res := &blockingResolver{}
+	tg := target("svc.example", 200*time.Millisecond) // background lookups time out after 1s
+	obs := &countObserver{}
+	a, _ := New(Options{AgentID: "test", Targets: []Target{tg}, DNSTTL: time.Millisecond,
+		Prober: f, Sink: &memSink{}, Observer: obs, Resolver: res})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { _ = a.Run(ctx); close(done) }()
+	// The second cycle starts a background refresh that hangs.
+	eventually(t, 2*time.Second, func() bool { return res.calls.Load() >= 2 })
+	cancel()
+	start := time.Now()
+	<-done
+	if d := time.Since(start); d > 300*time.Millisecond {
+		t.Errorf("Run took %v to return with a hung resolver", d)
+	}
+	if obs.resolve.Load() != 0 {
+		t.Errorf("shutdown counted as %d resolver failures", obs.resolve.Load())
+	}
+}
+
+func eventually(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
