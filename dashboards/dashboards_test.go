@@ -2,6 +2,7 @@ package dashboards
 
 import (
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -99,9 +100,12 @@ func TestDashboardsWellFormed(t *testing.T) {
 					t.Errorf("%s: %s uses undefined variable $%s", name, q.Where, v)
 				}
 			}
-			// Unquoted variables in SQL would let a value break the query.
-			if strings.Contains(q.SQL, "'${") || strings.Contains(q.SQL, "'$") {
-				t.Errorf("%s: %s quotes a variable itself; use ${name:sqlstring}", name, q.Where)
+			// Every value must enter SQL percent-encoded and decoded by
+			// ClickHouse: Grafana's sqlstring does not escape backslashes,
+			// which ClickHouse honours inside string literals.
+			if refs, safe := len(Variables(q.SQL)), len(safeVarRef.FindAllString(q.SQL, -1)); refs != safe {
+				t.Errorf("%s: %s: %d of %d variables are not decodeURLComponent('${name:percentencode}')",
+					name, q.Where, refs-safe, refs)
 			}
 		}
 	}
@@ -109,6 +113,8 @@ func TestDashboardsWellFormed(t *testing.T) {
 
 // The dashboards' default data source is the provisioned one, and the
 // compose stack mounts the dashboards where the provider looks.
+var safeVarRef = regexp.MustCompile(`decodeURLComponent\('\$\{\w+:percentencode\}'\)`)
+
 func TestProvisioningMatches(t *testing.T) {
 	var ds struct {
 		Datasources []struct {
@@ -171,6 +177,14 @@ func TestInterpolateAndExpand(t *testing.T) {
 		"pc.ts >= toDateTime(1000) AND pc.ts <= toDateTime(2000) AND a <= toDateTime(2000) AND b >= toDateTime(1000)"
 	if got != want {
 		t.Errorf("Expand:\n got %s\nwant %s", got, want)
+	}
+	// Grafana's percentencode: nothing that could end a SQL string survives.
+	if got := PercentEncode(`!\' OR 1=1 -- é~_.`); got != "%21%5C%27%20OR%201%3D1%20--%20%C3%A9~_." {
+		t.Errorf("PercentEncode = %s", got)
+	}
+	if got := Interpolate("a = decodeURLComponent('${agent:percentencode}')", map[string]string{"agent": "x'y"}); got !=
+		"a = decodeURLComponent('x%27y')" {
+		t.Errorf("Interpolate percentencode = %s", got)
 	}
 	if v := Variables("x = ${agent:sqlstring} AND $__timeFilter(ts) AND $target"); !slices.Equal(v, []string{"agent", "target"}) {
 		t.Errorf("Variables = %v", v)

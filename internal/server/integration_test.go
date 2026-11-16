@@ -458,6 +458,33 @@ func TestQueryParamsRoundTrip(t *testing.T) {
 	}
 }
 
+// The review's injection: Grafana's sqlstring left a backslash in place, so
+// a value like this ended the string literal. Every dashboard query runs it
+// as plain data: no error, and nothing but the (empty) data it filters for.
+func TestDashboardQueriesInjection(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
+	evil := `!\' OR 1=1 UNION ALL SELECT name FROM system.users -- `
+	vars := map[string]string{"datasource": "hopcorder-clickhouse", "agent": evil, "target": evil,
+		"protocol": evil, "target_b": evil}
+	for _, name := range dashboards.Names() {
+		d, err := dashboards.Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range d.Queries() {
+			if len(dashboards.Variables(q.SQL)) == 0 {
+				continue
+			}
+			sql := dashboards.Expand(q.SQL, vars, t0.Add(-time.Hour), t0.Add(time.Hour), time.Minute)
+			rows, err := clickhouse.QueryInto[map[string]any](t.Context(), c, sql, nil)
+			if err != nil || len(rows) != 0 {
+				t.Errorf("%s: %d rows, %v\n%s", q.Where, len(rows), err, sql)
+			}
+		}
+	}
+}
+
 func TestApplyRetention(t *testing.T) {
 	c := testClickHouse(t)
 	ttlTables := func() int {

@@ -64,9 +64,9 @@
         "query": {
           "refId": "Var-target",
           "queryType": "sql",
-          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} ORDER BY target"
+          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') ORDER BY target"
         },
-        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} ORDER BY target",
+        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') ORDER BY target",
         "refresh": 2,
         "sort": 1,
         "multi": false,
@@ -86,9 +86,9 @@
         "query": {
           "refId": "Var-protocol",
           "queryType": "sql",
-          "rawSql": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} ORDER BY protocol"
+          "rawSql": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') ORDER BY protocol"
         },
-        "definition": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} ORDER BY protocol",
+        "definition": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') ORDER BY protocol",
         "refresh": 2,
         "sort": 1,
         "multi": false,
@@ -108,9 +108,9 @@
         "query": {
           "refId": "Var-target_b",
           "queryType": "sql",
-          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target != ${target:sqlstring} ORDER BY target"
+          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target != decodeURLComponent('${target:percentencode}') ORDER BY target"
         },
-        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target != ${target:sqlstring} ORDER BY target",
+        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target != decodeURLComponent('${target:percentencode}') ORDER BY target",
         "refresh": 2,
         "sort": 1,
         "multi": false,
@@ -152,7 +152,7 @@
           "format": 1,
           "queryType": "table",
           "refId": "Anno",
-          "rawSql": "SELECT ts AS time, concat(target, ' ', protocol, ': ', reason, ' ', arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), ttls, from_ips, to_ips), ', ')) AS text FROM path_changes FINAL WHERE agent_id = ${agent:sqlstring} AND $__timeFilter(ts) ORDER BY time"
+          "rawSql": "SELECT ts AS time, concat(target, ' ', protocol, ': ', reason, ' ', arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), ttls, from_ips, to_ips), ', ')) AS text FROM path_changes FINAL WHERE agent_id = decodeURLComponent('${agent:percentencode}') AND $__timeFilter(ts) ORDER BY time"
         }
       }
     ]
@@ -195,7 +195,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream,\n       round(100 * (1 - avg(reached)), 1) AS unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring}\nGROUP BY time, stream\nORDER BY time",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream,\n       round(100 * (1 - avg(reached)), 1) AS unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}')\nGROUP BY time, stream\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -241,7 +241,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT start_ts AS start, end_ts AS end,\n       dateDiff('second', start_ts, ifNull(end_ts, now64(3))) AS duration_s,\n       target, protocol, cycles, last_hop_ttl, last_hop_ip\nFROM outages FINAL\nWHERE agent_id = ${agent:sqlstring} AND start_ts <= $__toTime AND (end_ts IS NULL OR end_ts >= $__fromTime)\nORDER BY start_ts DESC\nLIMIT 500",
+          "rawSql": "SELECT start_ts AS start, end_ts AS end,\n       dateDiff('second', start_ts, ifNull(end_ts, now64(3))) AS duration_s,\n       target, protocol, cycles, last_hop_ttl, last_hop_ip\nFROM outages FINAL\nWHERE agent_id = decodeURLComponent('${agent:percentencode}') AND start_ts <= $__toTime AND (end_ts IS NULL OR end_ts >= $__fromTime)\nORDER BY start_ts DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -292,7 +292,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(100 * (1 - avgIf(reached, target = ${target:sqlstring})), 1) AS a_unreachable_pct,\n       round(100 * (1 - avgIf(reached, target = ${target_b:sqlstring})), 1) AS b_unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target IN (${target:sqlstring}, ${target_b:sqlstring})\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(100 * (1 - avgIf(reached, target = decodeURLComponent('${target:percentencode}'))), 1) AS a_unreachable_pct,\n       round(100 * (1 - avgIf(reached, target = decodeURLComponent('${target_b:percentencode}'))), 1) AS b_unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target IN (decodeURLComponent('${target:percentencode}'), decodeURLComponent('${target_b:percentencode}'))\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -368,7 +368,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(t) AS time,\n       if(last_ttl = 0, 'no hop answered',\n          concat(toString(last_ttl), '. ', last_hop, if(last_as != '', concat(' (', last_as, ')'), ''))) AS hop,\n       count() AS failed_cycles\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND NOT reached\n  GROUP BY seq\n)\nGROUP BY time, hop\nORDER BY time",
+          "rawSql": "SELECT $__timeInterval(t) AS time,\n       if(last_ttl = 0, 'no hop answered',\n          concat(toString(last_ttl), '. ', last_hop, if(last_as != '', concat(' (', last_as, ')'), ''))) AS hop,\n       count() AS failed_cycles\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}') AND NOT reached\n  GROUP BY seq\n)\nGROUP BY time, hop\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -411,7 +411,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT last_ttl AS ttl, last_hop AS hop, last_as AS as_name, count() AS failed_cycles,\n       min(t) AS first_seen, max(t) AS last_seen\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND NOT reached\n  GROUP BY seq\n)\nGROUP BY last_ttl, last_hop, last_as\nORDER BY failed_cycles DESC",
+          "rawSql": "SELECT last_ttl AS ttl, last_hop AS hop, last_as AS as_name, count() AS failed_cycles,\n       min(t) AS first_seen, max(t) AS last_seen\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}') AND NOT reached\n  GROUP BY seq\n)\nGROUP BY last_ttl, last_hop, last_as\nORDER BY failed_cycles DESC",
           "refId": "A"
         }
       ],
@@ -445,7 +445,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT ttl,\n       anyIf(if(hop_name != '', hop_name, hop_ip), hop_ip != '') AS hop,\n       anyIf(hop_as_name, hop_ip != '') AS as_name,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS own_loss_pct,\n       round(100 * (1 - avg(reached)), 1) AS e2e_loss_pct,\n       multiIf(own_loss_pct < 5, 'clean',\n               e2e_loss_pct > own_loss_pct * 0.5, 'REAL LOSS',\n               'rate-limited (ignore)') AS verdict\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY ttl\nORDER BY ttl",
+          "rawSql": "SELECT ttl,\n       anyIf(if(hop_name != '', hop_name, hop_ip), hop_ip != '') AS hop,\n       anyIf(hop_as_name, hop_ip != '') AS as_name,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS own_loss_pct,\n       round(100 * (1 - avg(reached)), 1) AS e2e_loss_pct,\n       multiIf(own_loss_pct < 5, 'clean',\n               e2e_loss_pct > own_loss_pct * 0.5, 'REAL LOSS',\n               'rate-limited (ignore)') AS verdict\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}')\nGROUP BY ttl\nORDER BY ttl",
           "refId": "A"
         }
       ],
@@ -516,7 +516,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(quantile(0.5)(rtt_us) / 1000, 2) AS p50_ms,\n       round(quantile(0.95)(rtt_us) / 1000, 2) AS p95_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND status = 'reply'\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(quantile(0.5)(rtt_us) / 1000, 2) AS p50_ms,\n       round(quantile(0.95)(rtt_us) / 1000, 2) AS p95_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}') AND status = 'reply'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -552,7 +552,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS loss_pct\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY time, ttl\nORDER BY time, ttl",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS loss_pct\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}')\nGROUP BY time, ttl\nORDER BY time, ttl",
           "refId": "A"
         }
       ],
@@ -612,7 +612,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(quantile(0.5)(nullIf(rtt_us, 0)) / 1000, 2) AS rtt_p50_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY time, ttl\nORDER BY time, ttl",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(quantile(0.5)(nullIf(rtt_us, 0)) / 1000, 2) AS rtt_p50_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND target = decodeURLComponent('${target:percentencode}') AND protocol = decodeURLComponent('${protocol:percentencode}')\nGROUP BY time, ttl\nORDER BY time, ttl",
           "refId": "A"
         }
       ],
@@ -685,7 +685,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "WITH paths AS\n(\n    SELECT seq, arrayStringConcat(arrayMap(ip -> if(ip = '', '*', ip), hops.ip), ' > ') AS path\n    FROM cycles\n    WHERE agent_id = ${agent:sqlstring} AND seq IN\n    (\n        SELECT arrayJoin([seq, prev_seq]) FROM path_changes\n        WHERE agent_id = ${agent:sqlstring} AND $__timeFilter(ts)\n    )\n)\nSELECT pc.ts AS time, pc.target, pc.protocol, pc.reason,\n       arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), pc.ttls, pc.from_ips, pc.to_ips), ', ') AS changed_hops,\n       pc.prev_path_len, pc.path_len, b.path AS before, a.path AS after\nFROM path_changes AS pc FINAL\nLEFT JOIN paths AS a ON a.seq = pc.seq\nLEFT JOIN paths AS b ON b.seq = pc.prev_seq\nWHERE pc.agent_id = ${agent:sqlstring} AND $__timeFilter(pc.ts)\nORDER BY time DESC\nLIMIT 500",
+          "rawSql": "WITH paths AS\n(\n    SELECT seq, arrayStringConcat(arrayMap(ip -> if(ip = '', '*', ip), hops.ip), ' > ') AS path\n    FROM cycles\n    WHERE agent_id = decodeURLComponent('${agent:percentencode}') AND seq IN\n    (\n        SELECT arrayJoin([seq, prev_seq]) FROM path_changes\n        WHERE agent_id = decodeURLComponent('${agent:percentencode}') AND $__timeFilter(ts)\n    )\n)\nSELECT pc.ts AS time, pc.target, pc.protocol, pc.reason,\n       arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), pc.ttls, pc.from_ips, pc.to_ips), ', ') AS changed_hops,\n       pc.prev_path_len, pc.path_len, b.path AS before, a.path AS after\nFROM path_changes AS pc FINAL\nLEFT JOIN paths AS a ON a.seq = pc.seq\nLEFT JOIN paths AS b ON b.seq = pc.prev_seq\nWHERE pc.agent_id = decodeURLComponent('${agent:percentencode}') AND $__timeFilter(pc.ts)\nORDER BY time DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -719,7 +719,7 @@
           "editorType": "sql",
           "format": 1,
           "queryType": "table",
-          "rawSql": "SELECT ts AS time, target, protocol, hop_ip, hop_name, hop_as_name, loop_ttls, reached\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND is_loop\n  AND ttl = toUInt8OrZero(splitByChar(',', loop_ttls)[1])\nORDER BY time DESC\nLIMIT 500",
+          "rawSql": "SELECT ts AS time, target, protocol, hop_ip, hop_name, hop_as_name, loop_ttls, reached\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}') AND is_loop\n  AND ttl = toUInt8OrZero(splitByChar(',', loop_ttls)[1])\nORDER BY time DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -753,7 +753,7 @@
           "editorType": "sql",
           "format": 0,
           "queryType": "timeseries",
-          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream, max(path_len) AS path_len\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring}\nGROUP BY time, stream\nORDER BY time",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream, max(path_len) AS path_len\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = decodeURLComponent('${agent:percentencode}')\nGROUP BY time, stream\nORDER BY time",
           "refId": "A"
         }
       ],
