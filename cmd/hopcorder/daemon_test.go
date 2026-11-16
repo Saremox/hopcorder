@@ -294,3 +294,34 @@ func writeTestFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// With the default 10s flush_interval, records produced shortly before
+// SIGTERM must still be shipped during the shutdown grace period.
+func TestShutdownShipsPartialBatch(t *testing.T) {
+	ingest := newMockIngest()
+	srv := httptest.NewServer(ingest)
+	defer srv.Close()
+	dir := t.TempDir()
+	tokenFile := dir + "/token"
+	writeTestFile(t, tokenFile, "t0ken")
+	cfg := daemonConfig(t, dir+"/spool", srv.URL, freeAddr(t), tokenFile)
+	cfg.Outputs.HTTP.FlushInterval = config.Duration(config.DefaultHTTPFlushInterval)
+	shutdownGrace = 3 * time.Second
+
+	stop := startDaemon(t, cfg, fakeNetwork())
+	time.Sleep(500 * time.Millisecond)
+	start := time.Now()
+	stop()
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("shutdown took %v; it should end as soon as the spool is drained", d)
+	}
+	sp, err := spool.Open(spool.Options{Dir: dir + "/spool", MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+	unique, _, _ := ingest.snapshot()
+	if p := sp.Pending("http"); p != 0 || unique == 0 || uint64(unique) != sp.Stats().LastSeq {
+		t.Errorf("pending %d, delivered %d of %d", p, unique, sp.Stats().LastSeq)
+	}
+}

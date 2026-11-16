@@ -324,8 +324,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	// schedulers, letting the last records reach them when that is quick.
 	drainCtx, stopDrains := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopDrains()
+	flushNow := make(chan struct{})
 	var drains sync.WaitGroup
 	for i, o := range outs {
+		drainOpts[i].FlushNow = flushNow
 		drains.Go(func() { output.Drain(drainCtx, sp, o, drainOpts[i]) })
 	}
 
@@ -333,6 +335,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		"outputs", names, "spool", cfg.Spool.Dir, "spool_records", sp.Stats().Records)
 	err = a.Run(ctx)
 	logger.Info("shutting down")
+	close(flushNow) // ship partial batches now rather than after flush_interval
 	waitIdle(sp, names, shutdownGrace)
 	stopDrains()
 	drains.Wait()
