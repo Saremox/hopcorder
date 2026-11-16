@@ -138,10 +138,14 @@ next to a running agent.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
   probing the same target with the same `flow_id` can occasionally pick up
   each other's replies. Use a different `flow_id` for side-by-side runs.
-- **Beyond the destination**, every TTL up to `max_ttl` is still probed and
-  answered by the destination (trimmed from the record). Keep `max_ttl` near
-  your longest path if destination rate limiting matters (UDP port-unreachable
-  replies are rate limited by most hosts).
+- **Beyond the destination**: with `adaptive_max_ttl` (default), once a
+  target has been reached, cycles probe only 3 TTLs past its distance. If such
+  a cycle neither reaches the destination nor hits an unreachable (the path
+  grew, or the destination went silent), the same cycle probes the remaining
+  TTLs up to `max_ttl`, so records are identical to full-depth probing.
+  Unreached targets are always probed to `max_ttl`. This also keeps the
+  destination from being asked for ~20 replies per cycle, which matters for
+  UDP, whose port-unreachable replies most hosts rate-limit.
 
 ## Configuration
 
@@ -159,6 +163,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
 | `protocol` | `icmp` | `--protocol` | Default protocol: `icmp` or `udp` (`tcp` is planned) |
 | `paris` | `true` | `--paris` | Flow-stable probing |
+| `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
 | `log.level` | `info` | `--log-level` | `debug`, `info`, `warn`, `error` |
 | `log.format` | `text` | `--log-format` | `text` or `json` (to stderr) |
@@ -169,8 +174,8 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 **Targets** (`targets:` list): `host` (name or address, required), and
 overrides `protocol`, `port` (UDP destination, default 33434), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
-arguments), `flow_id` (default 33434), `paris`, `interval`, `timeout`,
-`max_ttl`, `probe_past`.
+arguments), `flow_id` (default 33434), `paris`, `adaptive_max_ttl`,
+`interval`, `timeout`, `max_ttl`, `probe_past`.
 
 **Outputs** (at least one):
 

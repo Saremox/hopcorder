@@ -30,7 +30,14 @@ type Target struct {
 	Timeout   time.Duration
 	MaxTTL    int
 	ProbePast int
+	// AdaptiveTTL probes only a few TTLs past the destination's last known
+	// distance instead of up to MaxTTL; see runner.cycle.
+	AdaptiveTTL bool
 }
+
+// adaptiveMargin is how many TTLs beyond the destination's last distance an
+// adaptive cycle probes.
+const adaptiveMargin = 3
 
 // Sink receives every finished record. Publish must make the record durable
 // (the spool assigns rec.Seq) before returning.
@@ -155,6 +162,10 @@ type runner struct {
 	t   *Target
 	log *slog.Logger
 
+	// limit is the highest TTL the next adaptive cycle probes; 0 = MaxTTL.
+	// Only the runner's own loop touches it.
+	limit int
+
 	mu         sync.Mutex
 	ip         netip.Addr
 	resolvedAt time.Time
@@ -216,24 +227,66 @@ func (r *runner) cycle(ctx context.Context, start time.Time) (*record.Record, er
 		r.a.opts.Observer.ResolveFailed(r.t)
 		return nil, err
 	}
+	// An adaptive cycle stops a few TTLs past where the destination last
+	// answered. If it then neither reaches the destination nor hits an
+	// unreachable, the path may have grown, so the same cycle probes the
+	// remaining TTLs: the record is always what a full-depth cycle would
+	// have recorded, only TTLs beyond the destination are saved.
+	limit := r.t.MaxTTL
+	if r.t.AdaptiveTTL && r.limit > 0 {
+		limit = min(r.limit, r.t.MaxTTL)
+	}
+	res, err := r.trace(ctx, ip, 1, limit)
+	if err != nil {
+		return nil, err
+	}
+	if limit < r.t.MaxTTL && !pathEnded(res) {
+		more, err := r.trace(ctx, ip, limit+1, r.t.MaxTTL)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, more...)
+	}
+	rec := buildRecord(r.a.opts.AgentID, r.t, ip, start, res)
+	r.limit = 0
+	if rec.Reached {
+		r.limit = rec.PathLen + adaptiveMargin
+	}
+	return rec, nil
+}
+
+// trace probes TTLs minTTL..maxTTL. No route (e.g. the uplink is down) is
+// an observation, not a gap: it yields silent hops rather than an error.
+func (r *runner) trace(ctx context.Context, ip netip.Addr, minTTL, maxTTL int) ([]probe.HopResult, error) {
 	res, err := r.a.opts.Prober.Trace(ctx, probe.TraceRequest{
 		Target:   ip,
 		Protocol: r.t.Protocol,
 		Port:     r.t.Port,
 		FlowID:   r.t.FlowID,
 		Paris:    r.t.Paris,
-		MaxTTL:   r.t.MaxTTL,
+		MinTTL:   minTTL,
+		MaxTTL:   maxTTL,
 		Timeout:  r.t.Timeout,
 	})
 	if err != nil {
 		if ctx.Err() != nil || !errors.Is(err, probe.ErrNoRoute) {
 			return nil, fmt.Errorf("trace %s: %w", ip, err)
 		}
-		// No route (e.g. the uplink is down) is an observation, not a gap.
 		r.log.Debug("no route to target; recording a silent cycle", "ip", ip, "err", err)
-		res = probe.NoReplies(r.t.MaxTTL)
+		return probe.NoRepliesRange(minTTL, maxTTL), nil
 	}
-	return buildRecord(r.a.opts.AgentID, r.t, ip, start, res), nil
+	return res, nil
+}
+
+// pathEnded reports whether some TTL got a destination reply or an
+// unreachable, beyond which nothing is recorded.
+func pathEnded(res []probe.HopResult) bool {
+	for _, h := range res {
+		if h.Status == record.StatusReply || h.Status == record.StatusUnreachable {
+			return true
+		}
+	}
+	return false
 }
 
 // address returns the target address, resolving it on first use and

@@ -147,8 +147,9 @@ func (f *Fake) Trace(ctx context.Context, req TraceRequest) ([]HopResult, error)
 	if sc.Err != nil {
 		return nil, sc.Err
 	}
-	f.sent.Add(uint64(req.MaxTTL))
-	return f.simulate(sc, req, cycle), nil
+	first := req.FirstTTL()
+	f.sent.Add(uint64(req.MaxTTL - first + 1)) //nolint:gosec // validated range
+	return f.simulate(sc, req, cycle)[first-1:], nil
 }
 
 func (f *Fake) active(target netip.Addr, now time.Time) (Scenario, bool) {

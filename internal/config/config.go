@@ -52,11 +52,14 @@ type Config struct {
 	ProbePast *int     `yaml:"probe_past"`
 	Protocol  string   `yaml:"protocol"`
 	Paris     *bool    `yaml:"paris"`
-	DNSTTL    Duration `yaml:"dns_ttl"`
-	Log       Log      `yaml:"log"`
-	Spool     Spool    `yaml:"spool"`
-	Targets   []Target `yaml:"targets"`
-	Outputs   Outputs  `yaml:"outputs"`
+	// AdaptiveMaxTTL probes only a few TTLs past the destination's last
+	// distance; cycles that fall short are extended in the same cycle.
+	AdaptiveMaxTTL *bool    `yaml:"adaptive_max_ttl"`
+	DNSTTL         Duration `yaml:"dns_ttl"`
+	Log            Log      `yaml:"log"`
+	Spool          Spool    `yaml:"spool"`
+	Targets        []Target `yaml:"targets"`
+	Outputs        Outputs  `yaml:"outputs"`
 }
 
 // Log configures logging.
@@ -74,16 +77,18 @@ type Spool struct {
 
 // Target is one probed destination. Zero fields inherit the global value.
 type Target struct {
-	Host      string   `yaml:"host"`
-	Protocol  string   `yaml:"protocol"`
-	Port      int      `yaml:"port"`
-	AF        int      `yaml:"af"` // 4 or 6; 0 prefers IPv4
-	FlowID    int      `yaml:"flow_id"`
-	Paris     *bool    `yaml:"paris"`
-	Interval  Duration `yaml:"interval"`
-	Timeout   Duration `yaml:"timeout"`
-	MaxTTL    int      `yaml:"max_ttl"`
-	ProbePast *int     `yaml:"probe_past"`
+	Host     string `yaml:"host"`
+	Protocol string `yaml:"protocol"`
+	Port     int    `yaml:"port"`
+	AF       int    `yaml:"af"` // 4 or 6; 0 prefers IPv4
+	FlowID   int    `yaml:"flow_id"`
+	Paris    *bool  `yaml:"paris"`
+	// AdaptiveMaxTTL overrides the global setting.
+	AdaptiveMaxTTL *bool    `yaml:"adaptive_max_ttl"`
+	Interval       Duration `yaml:"interval"`
+	Timeout        Duration `yaml:"timeout"`
+	MaxTTL         int      `yaml:"max_ttl"`
+	ProbePast      *int     `yaml:"probe_past"`
 }
 
 // Outputs selects where records go. A nil output is disabled.
@@ -203,6 +208,9 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 	if c.Paris == nil {
 		c.Paris = ptr(true)
 	}
+	if c.AdaptiveMaxTTL == nil {
+		c.AdaptiveMaxTTL = ptr(true)
+	}
 	setDur(&c.DNSTTL, DefaultDNSTTL)
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -298,6 +306,9 @@ func (c *Config) defaultTarget(t *Target) {
 	}
 	if t.Paris == nil {
 		t.Paris = c.Paris
+	}
+	if t.AdaptiveMaxTTL == nil {
+		t.AdaptiveMaxTTL = c.AdaptiveMaxTTL
 	}
 	setDur(&t.Interval, c.Interval.D())
 	setDur(&t.Timeout, c.Timeout.D())

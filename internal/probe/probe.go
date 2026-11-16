@@ -50,7 +50,10 @@ type TraceRequest struct {
 	// across the TTLs of a cycle. With Paris false, probes vary the ICMP
 	// checksum or UDP destination port per TTL like classic traceroute.
 	Paris bool
-	// MaxTTL is the highest TTL probed; TTLs 1..MaxTTL are sent at once.
+	// MinTTL and MaxTTL bound the TTLs probed; MinTTL..MaxTTL are sent at
+	// once. MinTTL 0 means 1. A cycle normally probes from 1; a higher
+	// MinTTL lets a caller extend a cycle that stopped short.
+	MinTTL int
 	MaxTTL int
 	// Timeout is the per-probe timeout. Replies arriving later are dropped
 	// and counted as late.
@@ -77,6 +80,9 @@ func (r TraceRequest) Validate() error {
 	if r.MaxTTL < 1 || r.MaxTTL > MaxTTL {
 		return fmt.Errorf("probe: max ttl %d out of range 1..%d", r.MaxTTL, MaxTTL)
 	}
+	if r.MinTTL < 0 || r.MinTTL > r.MaxTTL {
+		return fmt.Errorf("probe: min ttl %d out of range 0..%d", r.MinTTL, r.MaxTTL)
+	}
 	if r.Timeout <= 0 {
 		return errors.New("probe: timeout must be positive")
 	}
@@ -97,8 +103,8 @@ type HopResult struct {
 
 // Prober runs traceroute cycles.
 type Prober interface {
-	// Trace probes TTLs 1..req.MaxTTL in parallel and returns one result per
-	// TTL, ordered by TTL. It returns an error only if the cycle could not
+	// Trace probes TTLs req.MinTTL..req.MaxTTL in parallel and returns one
+	// result per TTL, ordered by TTL. It returns an error only if the cycle could not
 	// be run at all; see ErrNoRoute.
 	Trace(ctx context.Context, req TraceRequest) ([]HopResult, error)
 }
@@ -125,11 +131,18 @@ var ErrNoRoute = errors.New("no route to target")
 var ErrPermission = errors.New("raw sockets need CAP_NET_RAW: run `sudo setcap cap_net_raw+ep $(which hopcorder)` " +
 	"or, under systemd, set AmbientCapabilities=CAP_NET_RAW (running as root is not required)")
 
+// FirstTTL returns the lowest TTL the request probes.
+func (r TraceRequest) FirstTTL() int { return max(r.MinTTL, 1) }
+
 // NoReplies returns results for TTLs 1..maxTTL in which nothing answered.
-func NoReplies(maxTTL int) []HopResult {
-	out := make([]HopResult, maxTTL)
-	for i := range out {
-		out[i] = HopResult{TTL: i + 1, Status: record.StatusNoReply}
+func NoReplies(maxTTL int) []HopResult { return NoRepliesRange(1, maxTTL) }
+
+// NoRepliesRange returns results for TTLs minTTL..maxTTL in which nothing
+// answered.
+func NoRepliesRange(minTTL, maxTTL int) []HopResult {
+	out := make([]HopResult, 0, max(0, maxTTL-minTTL+1))
+	for ttl := minTTL; ttl <= maxTTL; ttl++ {
+		out = append(out, HopResult{TTL: ttl, Status: record.StatusNoReply})
 	}
 	return out
 }

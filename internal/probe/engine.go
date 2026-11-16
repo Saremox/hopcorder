@@ -84,6 +84,7 @@ type pendingProbe struct {
 
 type traceState struct {
 	req       TraceRequest
+	first     int        // lowest TTL probed; results[0] is for this TTL
 	target    netip.Addr // req.Target, unmapped and without zone
 	results   []HopResult
 	remaining int
@@ -145,16 +146,18 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 		return nil, fmt.Errorf("source %s and target %s differ in address family", src, target)
 	}
 
+	first, n := req.FirstTTL(), req.MaxTTL-req.FirstTTL()+1
 	tr := &traceState{
 		req:       req,
+		first:     first,
 		target:    target,
-		results:   NoReplies(req.MaxTTL),
-		remaining: req.MaxTTL,
+		results:   NoRepliesRange(first, req.MaxTTL),
+		remaining: n,
 		done:      make(chan struct{}),
 	}
-	pkts := make([]outPacket, req.MaxTTL)
-	keys := make([]probeKey, req.MaxTTL)
-	probes := make([]*pendingProbe, req.MaxTTL)
+	pkts := make([]outPacket, n)
+	keys := make([]probeKey, n)
+	probes := make([]*pendingProbe, n)
 
 	fk := flowKey{dst: target, proto: protoUDP, flow: req.FlowID}
 	if req.Protocol == ICMP {
@@ -162,7 +165,7 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 	}
 	e.mu.Lock()
 	for i := range pkts {
-		ttl := i + 1
+		ttl := first + i
 		id := e.allocIDLocked(fk)
 		p := outPacket{src: src, dst: target, zone: req.Target.Zone(), ttl: uint8(ttl), ipID: id} //nolint:gosec // ttl <= MaxTTL (255), checked by Validate
 		var k probeKey
@@ -177,7 +180,7 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 		case UDP:
 			dport := req.Port
 			if !req.Paris {
-				dport += uint16(i) //nolint:gosec // classic traceroute port walk; wraps like it does
+				dport += uint16(ttl - 1) //nolint:gosec // classic traceroute port walk; wraps like it does
 			}
 			p.proto = protoUDP
 			p.l4 = buildUDP(src, target, req.FlowID, dport, id)
@@ -315,7 +318,7 @@ func (e *engine) handle(from netip.Addr, msg []byte, at time.Time) {
 		e.resolveLocked(tr)
 		return
 	}
-	res := &tr.results[p.ttl-1]
+	res := &tr.results[p.ttl-tr.first]
 	res.From, res.RTT = from, rtt
 	switch r.kind {
 	case kindEchoReply:
