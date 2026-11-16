@@ -80,9 +80,11 @@ type Spool struct {
 	enc  *zstd.Encoder
 	dec  *zstd.Decoder
 
-	mu      sync.Mutex
-	notify  map[string]chan struct{}
-	cursors map[string]uint64
+	mu         sync.Mutex
+	notify     map[string]chan struct{}
+	cursors    map[string]uint64
+	txGen      uint64 // incremented inside write transactions (serialized by bbolt)
+	appliedGen uint64 // generation whose counters the mirrors below hold; guarded by mu
 
 	bytes   atomic.Int64
 	records atomic.Int64
@@ -139,11 +141,14 @@ type txState struct {
 }
 
 // update runs fn in a write transaction and, after a successful commit,
-// refreshes the in-memory mirrors of the stored counters.
+// refreshes the in-memory mirrors of the stored counters. Commits of
+// concurrent appends can return in any order, so mirrors are only replaced
+// by a newer transaction's values.
 func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
 	var (
-		st       txState
-		bytes, n uint64
+		st             txState
+		bytes, n, last uint64
+		gen            uint64
 	)
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		if err := fn(tx, &st); err != nil {
@@ -151,13 +156,22 @@ func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
 		}
 		meta := tx.Bucket(bucketMeta)
 		bytes, n = getU64(meta, keyBytes), getU64(meta, keyCount)
+		last = getU64(meta, keyNextSeq) - 1
+		s.txGen++ // only one write transaction runs at a time
+		gen = s.txGen
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	s.bytes.Store(int64(bytes)) //nolint:gosec // bounded by MaxBytes
-	s.records.Store(int64(n))   //nolint:gosec // record count
+	s.mu.Lock()
+	if gen > s.appliedGen {
+		s.appliedGen = gen
+		s.bytes.Store(int64(bytes)) //nolint:gosec // bounded by MaxBytes
+		s.records.Store(int64(n))   //nolint:gosec // record count
+		s.lastSeq.Store(last)
+	}
+	s.mu.Unlock()
 	if st.dropped > 0 {
 		s.dropped.Add(st.dropped)
 		s.opts.Logger.Warn("spool: bound reached, dropped oldest undelivered records", "dropped", st.dropped)
@@ -207,7 +221,6 @@ func (s *Spool) init() error {
 			}
 			s.cursors[c] = binary.BigEndian.Uint64(v)
 		}
-		s.lastSeq.Store(next - 1)
 		if err := s.collectLocked(tx); err != nil {
 			return err
 		}
@@ -255,7 +268,6 @@ func (s *Spool) Append(ts time.Time, encode func(seq uint64) ([]byte, error)) (u
 	if err != nil {
 		return 0, fmt.Errorf("spool append: %w", err)
 	}
-	s.lastSeq.Store(seq)
 	s.mu.Lock()
 	for _, ch := range s.notify {
 		select {
