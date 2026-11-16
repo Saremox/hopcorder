@@ -110,6 +110,10 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 
 	var en server.Enrichment
 	if *cfg.Enrich.ASN.Enabled {
+		if strings.HasPrefix(*cfg.Enrich.ASN.URL, "http://") {
+			logger.Warn("enrich.asn.url is plain http: anyone on the path can replace the ASN database",
+				"url", *cfg.Enrich.ASN.URL)
+		}
 		en.ASNs = &enrich.ASNSource{URL: *cfg.Enrich.ASN.URL, File: cfg.Enrich.ASN.File,
 			Refresh: cfg.Enrich.ASN.Refresh.D(), Logger: logger}
 		bg.Go(func() { en.ASNs.Run(bgCtx) })
@@ -138,6 +142,8 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 	}
 	srv := server.New(server.Options{Store: ch, Pinger: ch, Enricher: en, Logger: logger, Registry: reg,
 		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
+		MaxConcurrentIngest: cfg.Ingest.MaxConcurrent, MaxConcurrentQueries: cfg.Query.MaxConcurrent,
+		MaxStreams: cfg.Ingest.MaxStreams, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
 		UI: uiHandler})
 
 	var lc net.ListenConfig
@@ -145,7 +151,10 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
 	}
-	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	// Every phase of a connection is bounded, so stalled clients cannot pin
+	// connections (and the decode buffers of their requests) indefinitely.
+	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 2 * time.Minute,
+		WriteTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
 	logger.Info("server listening", "addr", ln.Addr().String(), "clickhouse", cfg.ClickHouse.URL,

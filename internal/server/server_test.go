@@ -398,7 +398,15 @@ func TestIngestFromAgentOutput(t *testing.T) {
 
 func post(t *testing.T, url, encoding string, body []byte) (int, IngestResult) {
 	t.Helper()
+	return postAs(t, url, "application/x-ndjson", encoding, body)
+}
+
+func postAs(t *testing.T, url, contentType, encoding string, body []byte) (int, IngestResult) {
+	t.Helper()
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, url+"/api/v1/ingest", bytes.NewReader(body))
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	if encoding != "" {
 		req.Header.Set("Content-Encoding", encoding)
 	}
@@ -466,6 +474,31 @@ func TestIngestHTTP(t *testing.T) {
 	st.fail["cycles"] = 1
 	if code, _ := post(t, ts.URL, "", ndjson(mk("lab", 6, pathA...))); code != http.StatusServiceUnavailable {
 		t.Errorf("storage failure: %d", code)
+	}
+
+	// Content types a web page can send without a CORS preflight are refused.
+	for _, ct := range []string{"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x"} {
+		if code, _ := postAs(t, ts.URL, ct, "", ndjson(mk("lab", 7, pathA...))); code != http.StatusUnsupportedMediaType {
+			t.Errorf("Content-Type %q: %d", ct, code)
+		}
+	}
+	if code, res := postAs(t, ts.URL, "application/x-ndjson; charset=utf-8", "", ndjson(mk("lab", 7, pathA...))); code != 200 || res.Accepted != 1 {
+		t.Errorf("ndjson with parameters: %d %+v", code, res)
+	}
+
+	// A zstd frame declaring a huge window is refused before it is allocated.
+	big := []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x88, 0x01, 0x00, 0x00} // magic, window 128 MiB, empty raw block
+	if code, _ := post(t, ts.URL, "zstd", big); code != http.StatusRequestEntityTooLarge && code != http.StatusBadRequest {
+		t.Errorf("huge zstd window: %d", code)
+	}
+
+	// More agents in one request than an agent would send.
+	var many []*record.Record
+	for i := range maxAgentsPerRequest + 1 {
+		many = append(many, mk(fmt.Sprintf("a%d", i), 1, pathA...))
+	}
+	if code, _ := post(t, ts.URL, "", ndjson(many...)); code != http.StatusBadRequest {
+		t.Errorf("%d agents in one request: %d", len(many), code)
 	}
 	resp, _ := http.Get(ts.URL + "/api/v1/ingest")
 	_ = resp.Body.Close()
@@ -558,5 +591,61 @@ func TestQueryAPI(t *testing.T) {
 				t.Errorf("parameter interpolated into SQL: %s", q)
 			}
 		}
+	}
+}
+
+// A batch far below the agent's stored seqs is refused (409), not silently
+// dropped as duplicates: the agent keeps it and its operator notices.
+func TestStaleBatchRefused(t *testing.T) {
+	st := newFakeStore()
+	_, ts := newTestServer(t, st)
+	if code, res := post(t, ts.URL, "", ndjson(mk("lab", staleWindow+50, pathA...))); code != 200 || res.Accepted != 1 {
+		t.Fatalf("first: %d %+v", code, res)
+	}
+	if code, res := post(t, ts.URL, "", ndjson(mk("lab", staleWindow+50, pathA...))); code != 200 || res.Duplicates != 1 {
+		t.Errorf("retry: %d %+v", code, res)
+	}
+	if code, _ := post(t, ts.URL, "", ndjson(mk("lab", 1, pathA...), mk("lab", 2, pathA...))); code != http.StatusConflict {
+		t.Errorf("stale batch: %d", code)
+	}
+}
+
+// Stream state is bounded: idle streams and agents are dropped, and the
+// least recently used beyond the limit.
+func TestIngesterStateBounded(t *testing.T) {
+	st := newFakeStore()
+	in := NewIngester(st, fakeEnrich{}, quietLogger(), nil)
+	now := t0
+	in.now = func() time.Time { return now }
+	in.maxStreams = 10
+	ingest := func(agent string, seq uint64, target string) {
+		t.Helper()
+		r := mk(agent, seq, pathA...)
+		r.Target = target
+		if _, err := in.Ingest(t.Context(), []*record.Record{r}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 30 {
+		ingest("lab", uint64(i+1), fmt.Sprintf("t%d.example", i))
+		now = now.Add(2 * time.Second)
+	}
+	if n := in.nstreams.Load(); n > 10 {
+		t.Errorf("%d streams tracked, max 10", n)
+	}
+	// Everything idle for longer than the TTL goes, agents included.
+	now = now.Add(in.idleTTL + 2*sweepInterval)
+	ingest("other", 1, "x.example")
+	in.mu.Lock()
+	_, kept := in.agents["lab"]
+	in.mu.Unlock()
+	if kept || in.nstreams.Load() != 1 {
+		t.Errorf("after idling: lab kept=%v, %d streams", kept, in.nstreams.Load())
+	}
+	// An evicted agent resumes from storage: its high-water mark is reloaded.
+	ingest("lab", 30, "t29.example")
+	r, err := in.Ingest(t.Context(), []*record.Record{mk("lab", 29, pathA...)})
+	if err != nil || r.Duplicates != 1 {
+		t.Errorf("after eviction, an old seq is a duplicate: %+v %v", r, err)
 	}
 }
