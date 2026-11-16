@@ -1,8 +1,20 @@
 name: ci
 
+# Pull requests, and main after each merge (or by hand). Not on every branch
+# push: a pull request's branch would run everything twice, once for the push
+# and once for the pull request. Tags have no run of their own: a release tag
+# must be a commit of main (images.yml checks), which this ran on.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A new commit on a pull request cancels the run for the one before; on main
+# every commit's run completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -10,6 +22,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -17,17 +30,15 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: vet
-        run: |
-          go vet ./...
-          go vet -tags rawsock,clickhouse,grafana ./...
       - name: test
         run: go test -race ./...
       - name: build
         run: go build ./cmd/hopcorder
 
   lint:
+    # golangci-lint includes go vet, with every build tag.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,6 +55,7 @@ jobs:
     # GitHub-hosted runners grant passwordless sudo, so the raw-socket tests can
     # run with CAP_NET_RAW (and CAP_SYS_ADMIN for the netns topology test).
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +72,7 @@ jobs:
     # Server tests against a real ClickHouse: migrations, every query, and
     # the agent -> server -> ClickHouse path.
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.8
@@ -87,6 +100,7 @@ jobs:
     # Grafana ClickHouse plugin: records through the server's ingest API, then
     # every dashboard query through Grafana and the provisioned data source.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,6 +124,7 @@ jobs:
     # internal/ui/dist matches the source, and the browser tests against a
     # real server and ClickHouse.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:25.8
@@ -173,6 +188,7 @@ jobs:
     # modes) into a kind cluster, with images built from this commit, and
     # check that every agent's records arrive.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
