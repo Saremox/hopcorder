@@ -17,6 +17,7 @@ clickhouse:                     # the HTTP interface
   # password: ""
   # password_file: /etc/hopcorder/clickhouse-password
   timeout: 30s
+  retention_days: 90            # like the prototype; 0 keeps data forever
 
 ingest:
   max_body_bytes: 64MiB         # compressed request body

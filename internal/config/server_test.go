@@ -18,7 +18,8 @@ func TestServerDefaults(t *testing.T) {
 	}
 	if c.Listen != DefaultServerListen || c.ClickHouse.URL != DefaultClickHouseURL || c.ClickHouse.Database != "hopcorder" ||
 		!*c.Metrics || !*c.Enrich.RDNS.Enabled || *c.Enrich.ASN.URL != DefaultASNURL ||
-		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes {
+		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes ||
+		*c.ClickHouse.RetentionDays != 90 {
 		t.Errorf("defaults %+v", c)
 	}
 }
@@ -37,7 +38,7 @@ func TestServerValidation(t *testing.T) {
 	c, err := ParseServer([]byte(`
 listen: nope
 log: {level: loud}
-clickhouse: {url: "ftp://x", database: "a;b", password: x, password_file: /nonexistent}
+clickhouse: {url: "ftp://x", database: "a;b", password: x, password_file: /nonexistent, retention_days: -1}
 ingest: {max_body_bytes: 1KiB}
 enrich:
   rdns: {workers: -1}
@@ -51,6 +52,7 @@ enrich:
 		t.Fatal("invalid config accepted")
 	}
 	for _, want := range []string{"listen", "log.level", "clickhouse.url", "clickhouse.database", "mutually exclusive",
+		"retention_days",
 		"password_file", "ingest:", "enrich.rdns", "enrich.asn: set url or file", "enrich.asn.refresh"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error lacks %q:\n%v", want, err)

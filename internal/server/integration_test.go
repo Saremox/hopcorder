@@ -7,13 +7,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/saremox/hopcorder/dashboards"
 	"github.com/saremox/hopcorder/internal/clickhouse"
 	"github.com/saremox/hopcorder/internal/output"
 	"github.com/saremox/hopcorder/internal/record"
@@ -71,7 +76,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	if n := count(t, c, "SELECT count() AS n FROM schema_migrations"); n != len(migs) {
 		t.Errorf("%d migrations recorded, want %d", n, len(migs))
 	}
-	for _, tbl := range []string{"cycles", "hops", "loop_events", "agent_seq", "path_changes", "outages"} {
+	for _, tbl := range []string{"cycles", "hops", "loop_events", "agent_seq", "path_changes", "outages", "path_probes"} {
 		if n := count(t, c, "SELECT count() AS n FROM system.tables WHERE database = currentDatabase() AND name = '"+tbl+"'"); n != 1 {
 			t.Errorf("table %s missing", tbl)
 		}
@@ -163,5 +168,178 @@ func TestIngestEndToEndClickHouse(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("readyz: %d", resp.StatusCode)
+	}
+}
+
+// prototypeQueries returns the analysis queries of docs/prototype/schema.sql
+// with only names substituted: the database, the targets and Grafana's time
+// filter macro.
+func prototypeQueries(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile("../../docs/prototype/schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, stmt := range splitStatements(string(b)) {
+		if !strings.HasPrefix(stmt, "SELECT") {
+			continue
+		}
+		q := strings.NewReplacer(
+			"netpath.path_probes", "path_probes",
+			"'dc1.example'", "'dc1.example'",
+			"'target-a'", "'dc1.example'",
+			"'target-b'", "'dc2.example'",
+			"$__timeFilter(ts)", "ts >= now() - INTERVAL 3650 DAY",
+		).Replace(stmt)
+		if strings.Contains(q, "neighbor(") {
+			// The prototype's Q3 fails on ClickHouse 25.8 even against its
+			// own netpath.path_probes table: "min(ts) AS ts" shadows the
+			// column in the same subquery's WHERE (ILLEGAL_AGGREGATION).
+			// Renaming the alias is the whole fix.
+			q = regexp.MustCompile(`min\(ts\)\s+AS ts`).ReplaceAllString(q, "min(ts) AS first_ts")
+			q = regexp.MustCompile(`SELECT\s+ts,\s+path,`).ReplaceAllString(q, "SELECT first_ts AS ts, path,")
+			// neighbor() is deprecated in current ClickHouse but still works.
+			q += " SETTINGS allow_deprecated_error_prone_window_functions = 1"
+		}
+		out = append(out, q)
+	}
+	return out
+}
+
+// seedTwoTargets ingests cycles of agent "lab" to dc1.example and
+// dc2.example: a stable path, a loop (dc1), an outage on both and a route
+// change on both.
+func seedTwoTargets(t *testing.T, c *clickhouse.Client) {
+	t.Helper()
+	in := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	var recs []*record.Record
+	add := func(target string, spec ...string) {
+		r := mk("lab", uint64(len(recs)+1), spec...)
+		r.Target = target
+		recs = append(recs, r)
+	}
+	for range 3 {
+		add("dc1.example", pathA...)
+		add("dc2.example", pathA...)
+	}
+	add("dc1.example", "10.0.0.1", "198.18.120.1", "198.18.120.2", "198.18.120.1", "198.18.120.2", "*") // loop
+	add("dc1.example", brokenA...)
+	add("dc2.example", brokenA...)
+	add("dc1.example", pathB...)
+	add("dc2.example", pathB...)
+	if _, err := in.Ingest(t.Context(), recs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The prototype's seven analysis queries run unchanged (but for names)
+// against hopcorder data through the path_probes compatibility view.
+func TestPrototypeQueriesRun(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
+
+	queries := prototypeQueries(t)
+	if len(queries) != 7 {
+		t.Fatalf("found %d prototype queries, want 7", len(queries))
+	}
+	for i, q := range queries {
+		rows, err := clickhouse.QueryInto[map[string]any](t.Context(), c, q, nil)
+		if err != nil {
+			t.Errorf("Q%d failed: %v\n%s", i+1, err, q)
+			continue
+		}
+		if len(rows) == 0 {
+			t.Errorf("Q%d returned no rows", i+1)
+			continue
+		}
+		t.Logf("Q%d: %d rows, first %v", i+1, len(rows), rows[0])
+	}
+
+	// Loop columns on the per-hop rows, as the prototype has them.
+	if n := count(t, c, "SELECT count() AS n FROM path_probes WHERE is_loop = 1 AND loop_ttls IN ('2,4', '3,5')"); n != 4 {
+		t.Errorf("%d looping hop rows, want 4", n)
+	}
+}
+
+// Every query of the Grafana dashboards (panels, variables, annotations)
+// runs against the real schema, expanded as Grafana and the ClickHouse
+// plugin would, and finds the seeded data.
+func TestDashboardQueriesRun(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
+	vars := map[string]string{"datasource": "hopcorder-clickhouse", "agent": "lab", "target": "dc1.example",
+		"protocol": "icmp", "target_b": "dc2.example"}
+	for _, name := range dashboards.Names() {
+		d, err := dashboards.Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range d.Queries() {
+			sql := dashboards.Expand(q.SQL, vars, t0.Add(-time.Hour), t0.Add(time.Hour), time.Minute)
+			rows, err := clickhouse.QueryInto[map[string]any](t.Context(), c, sql, nil)
+			if err != nil {
+				t.Errorf("%s %s: %v\n%s", name, q.Where, err, sql)
+				continue
+			}
+			if len(rows) == 0 {
+				t.Errorf("%s %s: no rows\n%s", name, q.Where, sql)
+				continue
+			}
+			t.Logf("%s: %d rows, first %v", q.Where, len(rows), rows[0])
+			check := func(ok bool) {
+				if !ok {
+					t.Errorf("%s: unexpected rows %v", q.Where, rows)
+				}
+			}
+			switch q.Where {
+			case "panel Where failures stop":
+				// On dc1, brokenA stops after 198.18.120.1 at TTL 2, the loop
+				// after 198.18.120.2 at TTL 5.
+				stops := map[string]any{}
+				for _, r := range rows {
+					stops[fmt.Sprint(r["ttl"], " ", r["hop"], " ", r["as_name"])] = r["failed_cycles"]
+				}
+				check(len(stops) == 2 && stops["2 198.18.120.1 EXAMPLE-TRANSIT"] == float64(1) && stops["5 198.18.120.2 EXAMPLE-TRANSIT"] == float64(1))
+			case "panel Route changes":
+				// Into the loop, out of it, then pathA to pathB.
+				check(len(rows) == 3 && rows[0]["before"] != "" && rows[0]["after"] != "" && rows[0]["changed_hops"] != "")
+			case "panel Loops":
+				check(len(rows) == 2 && rows[0]["loop_ttls"] != "")
+			case "panel Outages":
+				// dc1: the loop and brokenA in a row, 2 cycles; dc2: brokenA.
+				check(len(rows) == 2 && rows[1]["target"] == "dc1.example" && rows[1]["cycles"] == float64(2))
+			case "variable target_b":
+				check(len(rows) == 1 && rows[0]["target"] == "dc2.example")
+			}
+		}
+	}
+}
+
+func TestApplyRetention(t *testing.T) {
+	c := testClickHouse(t)
+	ttlTables := func() int {
+		return count(t, c, `SELECT count() AS n FROM system.tables WHERE database = currentDatabase()
+			AND position(create_table_query, ' TTL ') > 0`)
+	}
+	for range 2 { // idempotent
+		if err := ApplyRetention(t.Context(), c, 90); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := ttlTables(); n != len(retentionTables) {
+		t.Errorf("%d tables with a TTL, want %d", n, len(retentionTables))
+	}
+	if n := count(t, c, `SELECT count() AS n FROM system.tables WHERE database = currentDatabase() AND name = 'hops'
+		AND position(create_table_query, 'toIntervalDay(90)') > 0`); n != 1 {
+		t.Error("hops has no 90-day TTL")
+	}
+	for range 2 {
+		if err := ApplyRetention(t.Context(), c, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := ttlTables(); n != 0 {
+		t.Errorf("%d tables still have a TTL after retention 0", n)
 	}
 }

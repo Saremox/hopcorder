@@ -32,9 +32,10 @@ ClickHouse DDL and analysis queries in `docs/prototype/schema.sql`. Treat it as 
 behavioural reference, not code to port line by line. It shells out to
 `mtr-packet`; the Go version probes natively.
 
-> **Note (M1):** the prototype files were not present in the repository when M1
-> was implemented; M1 was built from this document alone. Add them under
-> `docs/prototype/` before starting M2/M3, which depend on `schema.sql`.
+> **Note:** the prototype files were not present when M1 and M2 were
+> implemented; both were built from this document alone. `schema.sql` was
+> added after M2 and the server schema reconciled with it (§10, "Prototype
+> reconciliation"). `pathwatch.py` is still not in the repository.
 
 ## 2. Architecture (locked)
 
@@ -247,8 +248,8 @@ internal/spool/         durable queue
 internal/output/        jsonl, http, metrics
 internal/config/        load, defaults, validation
 internal/server/        (milestone 2)
-deploy/                 systemd unit, Helm chart, docker-compose (later)
-dashboards/             Grafana JSON (milestone 3)
+deploy/                 systemd units, example configs, docker-compose, Grafana provisioning (Helm chart later)
+dashboards/             Grafana JSON, plus a Go package that reads its queries for tests
 docs/                   this file, prototype/
 ```
 
@@ -308,7 +309,7 @@ applied on startup.
 - [x] Loop events (materialized view); path changes and reachability-loss
       windows (derived by the server, see §10)
 - [x] Read API, `/healthz`, `/readyz`, migrations on startup
-- [ ] Reconcile the schema with `docs/prototype/schema.sql` once it is added
+- [x] Reconcile the schema with `docs/prototype/schema.sql` (migration 0002, §10)
 
 ### M3 — Grafana
 
@@ -317,6 +318,14 @@ per-hop latency/loss heatmap, last-responding-hop during failures, path-change
 log, loop log, two-target correlation, real-loss vs rate-limited classifier.
 Queries are in `docs/prototype/schema.sql`. Plus `deploy/docker-compose.yml`
 (ClickHouse + server + Grafana) for a five-minute try-out.
+
+- [x] `dashboards/hopcorder.json`: all seven panels, plus outage windows,
+      end-to-end RTT, path length and route-change annotations (§10)
+- [x] Data source and dashboard provisioning in `deploy/grafana/provisioning`
+- [x] `Dockerfile` and `deploy/docker-compose.yml` (ClickHouse, server, an
+      agent, Grafana with the plugin)
+- [x] Every dashboard query tested against ClickHouse (`clickhouse` tag) and
+      through Grafana and the real plugin (`grafana` tag, CI job `grafana`)
 
 ### M4 — Embedded UI
 
@@ -529,14 +538,13 @@ added in the commit that introduced it.
 
 ### M2 — server
 
-- **Schema without the prototype.** `docs/prototype/schema.sql` was still not
-  in the repository when M2 was built, so the ClickHouse schema
+- **Schema without the prototype.** `docs/prototype/schema.sql` was not in the
+  repository when M2 was built, so the ClickHouse schema
   (`internal/server/migrations/0001_init.sql`) was designed from this
   document: the per-hop `hops` table carries the fields of §3.1 plus
   `agent_id`, `seq`, `af`, `protocol`, `flow_id`, `hop_asn`, `hop_as_name`,
-  `hop_name` (rDNS) and `mpls`. When the prototype arrives, its analysis
-  queries should be checked against these names (a follow-up migration can
-  add views with the prototype's column names if they differ).
+  `hop_name` (rDNS) and `mpls`. Reconciled with the prototype afterwards, see
+  the next section.
 - **One insert per batch, flattening in ClickHouse.** The server inserts only
   into `cycles` (one row per cycle, hops and loops as `Nested` columns, plus
   per-hop enrichment). `hops`, `loop_events` and `agent_seq` are materialized
@@ -590,6 +598,41 @@ added in the commit that introduced it.
   daemon → server → ClickHouse path. CI runs these with ClickHouse as a
   service container.
 
+### Prototype reconciliation (after M2)
+
+`docs/prototype/schema.sql` arrived after M2 and is kept verbatim. Migration
+`0002_prototype_compat.sql` reconciles with it:
+
+- **`path_probes` view** with the prototype's column names over `hops`
+  (`src` = `agent_id`, `cycle` = `seq`; hopcorder's extra columns appended),
+  so the prototype's seven analysis queries run against hopcorder data with
+  only the database name changed. `TestPrototypeQueriesRun` (clickhouse tag)
+  runs all seven, read straight from the file.
+- **`is_loop` / `loop_ttls` on `hops`**: the prototype keeps loops on the
+  per-hop rows; `hops_mv` now fills both from the cycle's loops. Rows stored
+  before the migration keep the defaults (`loop_events` has every loop).
+- **Retention**: the prototype expires data after 90 days.
+  `clickhouse.retention_days` (default 90, 0 = forever) sets a TTL on every
+  data table on each start (`agent_seq` never expires; it guards dedup).
+- **The prototype's Q3 is broken on current ClickHouse**, even against its
+  own `netpath.path_probes`: `min(ts) AS ts` is visible in the same
+  subquery's `WHERE ts >= …`, giving `ILLEGAL_AGGREGATION` (with the old and
+  the new analyzer, 25.8). Renaming the alias (`min(ts) AS first_ts`, and
+  `SELECT first_ts AS ts, …` one level up) fixes it; `neighbor()` also needs
+  `allow_deprecated_error_prone_window_functions = 1`. Q3 also detects
+  changes by `path_hash`, so it counts rate-limit flicker; the dashboards use
+  `path_changes` instead (decided rule, below).
+- **Differences that stay**:
+  - Status values: hopcorder has `unreachable` (with a code) where the
+    prototype had mtr-packet's `no-route` / `network-down`. hopcorder records
+    a local no-route as a cycle of `no-reply` hops (§10, M1).
+  - Partitioning: monthly instead of the prototype's daily, with
+    `ORDER BY (agent_id, target, protocol, ts, ttl)` instead of
+    `(target, ttl, ts)`. Neither can be changed without rebuilding the tables,
+    and both serve the queries.
+  - The prototype's queries filter on `target` only. With several agents or
+    protocols per target, add `src` and `protocol` filters.
+
 ### Decided after review (2026-11-16)
 
 - **Path change = wildcard comparison** (resolves the contradiction in §3.2:
@@ -610,3 +653,69 @@ added in the commit that introduced it.
 - **The 24h run** from the M1 done criteria is skipped for now; the
   3-minute accelerated soak (4,645 cycles, flat goroutines/heap/RSS) stands
   in. Revisit if growth shows up in production.
+
+
+### M3 — Grafana
+
+- **Plugin**: the official `grafana-clickhouse-datasource`, over ClickHouse's
+  HTTP interface (port 8123, like the server; no native port needed). The
+  compose stack pins Grafana 12.2.1 and plugin 4.23.5. Queries are raw SQL
+  (`editorType: sql`), formats 0 (time series) and 1 (table) as the plugin
+  defines them.
+- **One dashboard**, `hopcorder-overview`, in three rows following the
+  prototype's questions. Variables: `datasource`, `agent`, `target`,
+  `protocol`, and `target_b` (the second target to compare, defaulting to
+  one other than `target`). Values go into SQL as `${name:sqlstring}`
+  (quoted and escaped by Grafana), never inside hand-written quotes.
+- **Prototype queries → panels**:
+  - Q1 reachability: from `cycles` (one row per cycle, so no `ttl = 1`
+    trick), one series per target and protocol. Next to it the server's
+    outage windows (`outages FINAL`).
+  - Q7 correlation: from `cycles`, `${target}` against `${target_b}`.
+  - Q2 last responding hop: from `hops` for the selected stream, as a
+    stacked time series and a table, with the hop's AS name; a cycle in
+    which nothing answered shows as "no hop answered".
+  - Q5 real loss vs rate limiting: from `hops`, the prototype's thresholds
+    (own loss < 5 % is clean; real loss if end-to-end loss > half the own
+    loss).
+  - Q6 per-hop heatmap: two heatmaps (no-reply rate, median RTT) with one
+    row per TTL, labelled `TTL nn` rather than by address, because the
+    address at a TTL changes with the route. Plus end-to-end RTT (p50, p95).
+  - Q3 route changes: `path_changes FINAL` (the wildcard rule, see "Decided
+    after review") instead of `path_hash` transitions, with the changed hops
+    and the full path before and after, rebuilt from `cycles` by seq. The
+    same events are a dashboard annotation.
+  - Q4 loops: `hops` with `is_loop`, first TTL only, as in the prototype.
+  - Added: path length per stream.
+- **The JSON is the source of truth.** It is provisioned read-only
+  (`allowUiUpdates: false`); to change it, edit a copy in Grafana, export it
+  and replace the file. The data source provisioning reads
+  `HOPCORDER_CLICKHOUSE_{HOST,PORT,DATABASE,USER,PASSWORD}` from Grafana's
+  environment.
+- **Image**: one static image (`FROM scratch`, CA certificates only) for
+  both commands. The server runs as uid 65532. The agent needs
+  `CAP_NET_RAW`, which Docker grants only to root unless the binary carries a
+  file capability, so in compose it runs as uid 0 with every other
+  capability dropped, and with the host's network so paths are not traced
+  through Docker's NAT. Its spool directory belongs to root for that reason.
+- **Compose**: every published port on localhost only; ClickHouse's
+  passwordless default user. No `ulimits` for ClickHouse: raising the file
+  limit fails on hosts that do not allow it (rootless Docker, this
+  development container), and ClickHouse runs without it.
+- **Tests**: `go test ./dashboards/` checks the JSON (data sources, grid,
+  every variable defined, no hand-quoted variables) and that provisioning
+  and compose agree. `TestDashboardQueriesRun` (`clickhouse` tag) runs every
+  panel, variable and annotation query with the plugin's macro expansions
+  reproduced from its source (`$__timeFilter(c)` becomes
+  `c >= toDateTime(from) AND c <= toDateTime(to)`, `$__timeInterval(c)`
+  becomes `toStartOfInterval(toDateTime(c), INTERVAL n second)`). The CI job
+  `grafana` builds and starts the compose stack, sends records through the
+  server's ingest API, and runs every query through Grafana's
+  `/api/ds/query` with the real plugin (`grafana` tag).
+- **Verified in CI only**: the development container cannot install the
+  plugin (grafana.com is unreachable), so Grafana's side is checked by the
+  `grafana` job alone. Its first run installed plugin 4.23.5, passed the data
+  source health check, and all 17 queries returned rows. The rest of the
+  stack also ran in the development container: provisioning loaded, and the
+  agent traced and shipped through the server to ClickHouse. How the panels
+  look has not been reviewed by a person yet.

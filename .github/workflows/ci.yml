@@ -18,7 +18,7 @@ jobs:
       - name: vet
         run: |
           go vet ./...
-          go vet -tags rawsock,clickhouse ./...
+          go vet -tags rawsock,clickhouse,grafana ./...
       - name: test
         run: go test -race ./...
       - name: build
@@ -34,7 +34,7 @@ jobs:
       - uses: golangci/golangci-lint-action@v8
         with:
           version: v2.15.0
-          args: --build-tags=rawsock,clickhouse
+          args: --build-tags=rawsock,clickhouse,grafana
 
   rawsock:
     # GitHub-hosted runners grant passwordless sudo, so the raw-socket tests can
@@ -73,3 +73,24 @@ jobs:
         env:
           HOPCORDER_CLICKHOUSE_URL: http://127.0.0.1:8123
         run: go test -tags clickhouse -race -count=1 ./internal/server/... ./cmd/hopcorder/...
+
+  grafana:
+    # The docker-compose try-out stack built from this commit, with the real
+    # Grafana ClickHouse plugin: records through the server's ingest API, then
+    # every dashboard query through Grafana and the provisioned data source.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: start the stack
+        run: docker compose -f deploy/docker-compose.yml up -d --build --wait --wait-timeout 300
+      - name: dashboards through Grafana
+        env:
+          HOPCORDER_SERVER_URL: http://127.0.0.1:8080
+          HOPCORDER_GRAFANA_URL: http://127.0.0.1:3000
+        run: go test -tags grafana -count=1 -v ./dashboards/
+      - name: stack logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml logs --no-color

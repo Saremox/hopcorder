@@ -1,0 +1,23 @@
+# hopcorder agent in the docker-compose try-out (deploy/docker-compose.yml).
+# Put the targets you care about here; `docker compose restart agent` picks
+# up changes. See deploy/agent.example.yaml for every option.
+# agent_id: lab-01              # default: the host's name (the agent uses the host network)
+interval: 5s
+
+spool:
+  dir: /var/lib/hopcorder
+
+targets:
+  - host: 1.1.1.1
+  - host: 9.9.9.9
+    protocol: udp
+  - host: 8.8.8.8
+    protocol: tcp
+    port: 443
+
+outputs:
+  http:
+    url: http://127.0.0.1:8080  # the server, published on the host's localhost
+    flush_interval: 5s
+  metrics:
+    listen: 127.0.0.1:9469
