@@ -155,3 +155,33 @@ jobs:
         if: always()
         working-directory: .
         run: cat server-e2e.log || true
+
+  helm:
+    # The Helm charts: lint, then install the server and the agent (in both
+    # modes) into a kind cluster, with images built from this commit, and
+    # check that every agent's records arrive.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+      - name: lint
+        run: |
+          helm lint --strict deploy/helm/hopcorder-server
+          helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml
+          helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml
+      - name: build images
+        run: |
+          docker build --target server -t hopcorder-server:ci .
+          docker build --target agent -t hopcorder-agent:ci .
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: hc
+      - run: kind load docker-image hopcorder-server:ci hopcorder-agent:ci --name hc
+      - run: deploy/helm/ci/smoke.sh
+      - name: cluster state
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl describe pods
+          kubectl logs -l app.kubernetes.io/instance=hopcorder-server --tail=100
+          kubectl logs -l app.kubernetes.io/name=hopcorder-agent --tail=50 --prefix

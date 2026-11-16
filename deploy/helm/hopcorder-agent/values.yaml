@@ -1,0 +1,89 @@
+# hopcorder agent. Needs CAP_NET_RAW for raw sockets, so it runs as root with
+# every other capability dropped: the namespace must allow that (Pod Security
+# "baseline", not "restricted").
+
+image:
+  repository: ghcr.io/saremox/hopcorder-agent
+  tag: ""                     # default: the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# statefulset: `replicas` agents with stable names; each pod's name is its
+#   agent_id and it keeps its spool on its own volume.
+# daemonset: one agent per node; the node's name is the agent_id and the
+#   spool lives on the node (hostPath).
+mode: statefulset
+replicas: 1
+
+# Trace from the node's network instead of the pod network (no CNI hops in
+# the path, and the node's own source address).
+hostNetwork: false
+
+# Where records go: the hopcorder server (outputs.http.url).
+server:
+  url: http://hopcorder-server:8080
+  # A bearer token from an existing Secret, if your ingress wants one.
+  bearerTokenSecret:
+    name: ""
+    key: token
+
+# The agent's configuration file (see deploy/agent.example.yaml for every
+# key; unknown keys are rejected). The chart sets agent_id, spool.dir,
+# outputs.http (from server) and outputs.metrics (from metrics); other
+# outputs.http keys given here are kept.
+config:
+  interval: 5s
+  log:
+    level: info
+    format: json
+  spool:
+    max_age: 168h
+    max_bytes: 1GiB
+  targets: []                 # required, e.g. [{host: example.net}, {host: 192.0.2.10, protocol: tcp, port: 443}]
+
+metrics:
+  enabled: true
+  port: 9469
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}
+
+# mode: statefulset - the spool volume of each agent.
+persistence:
+  size: 1Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+
+# mode: daemonset - the spool directory on each node.
+hostPath: /var/lib/hopcorder-agent
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 32Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsUser: 0
+  runAsNonRoot: false
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+    add: [NET_RAW]
+
+extraArgs: []
