@@ -266,3 +266,31 @@ func TestShippedExampleIsValid(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TLS settings on a plain-http URL would be silently unused; batches must
+// fit the server's default request limit.
+func TestHTTPOutputSafety(t *testing.T) {
+	base := "targets: [{host: example.net}]\nspool: {dir: /tmp/x}\noutputs:\n  http:\n"
+	for _, c := range []struct {
+		yaml, want string
+	}{
+		{"    url: http://ingest.example\n    tls: {server_name: x}\n", "needs an https url"},
+		{"    url: https://ingest.example\n    batch_max_bytes: 64MiB\n", "batch_max_bytes"},
+	} {
+		cfg, err := Parse([]byte(base + c.yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cfg.Finalize(FinalizeOptions{}); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v", c.yaml, err)
+		}
+	}
+	h := &HTTP{URL: "http://ingest.example", BearerToken: "t"}
+	if !h.CleartextCredentials() {
+		t.Error("bearer token over http not flagged")
+	}
+	h.URL = "https://ingest.example"
+	if h.CleartextCredentials() {
+		t.Error("https flagged")
+	}
+}

@@ -339,7 +339,7 @@ func (r *Raw) recvLoop(c *net.IPConn, ipv4Header bool, handle func(netip.Addr, [
 			continue
 		}
 		addr, ok := netip.AddrFromSlice(from.IP)
-		if !ok {
+		if !ok || !sourceMatchesSocket(addr, ipv4Header) {
 			continue
 		}
 		if stamped {

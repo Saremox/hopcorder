@@ -19,6 +19,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -75,10 +76,11 @@ type Stats struct {
 
 // Spool is a durable, bounded, multi-consumer queue of records.
 type Spool struct {
-	db   *bolt.DB
-	opts Options
-	enc  *zstd.Encoder
-	dec  *zstd.Decoder
+	db       *bolt.DB
+	opts     Options
+	enc      *zstd.Encoder
+	dec      *zstd.Decoder
+	firstSeq uint64 // seq of an empty spool's first record
 
 	mu         sync.Mutex
 	notify     map[string]chan struct{}
@@ -110,19 +112,63 @@ func Open(o Options) (*Spool, error) {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
 	path := filepath.Join(o.Dir, fileName)
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		if errors.Is(err, berrors.ErrTimeout) {
-			return nil, fmt.Errorf("spool %s: %w", path, ErrLocked)
+	s, err := openDB(o, path, 0)
+	if errors.Is(err, errCorrupt) {
+		// A corrupt file must not stop the agent for good (bbolt can even
+		// fault on one): keep it for inspection and start over. The new
+		// spool's seqs start at the current time in microseconds, above any
+		// the old one can have used, so the server neither drops the new
+		// records as duplicates nor refuses them as stale.
+		bad := fmt.Sprintf("%s.corrupt-%d", path, o.Now().Unix())
+		if rerr := os.Rename(path, bad); rerr != nil {
+			return nil, fmt.Errorf("%w (and cannot move it aside: %w)", err, rerr)
 		}
+		o.Logger.Error("spool: database unusable; moved aside, starting an empty spool",
+			"err", err, "kept_as", bad)
+		s, err = openDB(o, path, uint64(o.Now().UnixMicro())) //nolint:gosec // positive
+	}
+	return s, err
+}
+
+// errCorrupt marks a spool file that cannot be used: bbolt found it
+// invalid, its consistency check failed, or reading it faulted. Other errors
+// (locked, permissions, a full disk) leave the file alone.
+var errCorrupt = errors.New("corrupt")
+
+// openDB opens the spool file, checks its consistency and initialises it;
+// firstSeq is the seq of an empty spool's first record (0: 1).
+func openDB(o Options, path string, firstSeq uint64) (s *Spool, err error) {
+	// Faults while reading a damaged memory-mapped file become errors.
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	var db *bolt.DB
+	defer func() {
+		if r := recover(); r != nil {
+			if db != nil {
+				_ = db.Close()
+			}
+			s, err = nil, fmt.Errorf("spool %s: %w: %v", path, errCorrupt, r)
+		}
+	}()
+	db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	switch {
+	case errors.Is(err, berrors.ErrTimeout):
+		return nil, fmt.Errorf("spool %s: %w", path, ErrLocked)
+	case errors.Is(err, berrors.ErrInvalid), errors.Is(err, berrors.ErrVersionMismatch), errors.Is(err, berrors.ErrChecksum):
+		return nil, fmt.Errorf("spool %s: %w: %w", path, errCorrupt, err)
+	case err != nil:
 		return nil, fmt.Errorf("spool %s: %w", path, err)
+	}
+	if err := checkDB(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("spool %s: %w: %w", path, errCorrupt, err)
 	}
 	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
 	dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-	s := &Spool{
+	s = &Spool{
 		db: db, opts: o, enc: enc, dec: dec,
-		notify:  map[string]chan struct{}{},
-		cursors: map[string]uint64{},
+		notify:   map[string]chan struct{}{},
+		cursors:  map[string]uint64{},
+		firstSeq: max(firstSeq, 1),
 	}
 	for _, c := range o.Consumers {
 		s.notify[c] = make(chan struct{}, 1)
@@ -132,6 +178,20 @@ func Open(o Options) (*Spool, error) {
 		return nil, fmt.Errorf("spool %s: %w", path, err)
 	}
 	return s, nil
+}
+
+// checkDB runs bbolt's consistency check (page structure and freelist).
+func checkDB(db *bolt.DB) error {
+	var first error
+	err := db.View(func(tx *bolt.Tx) error {
+		for err := range tx.Check() { // drain: the checker runs until done
+			if first == nil {
+				first = err
+			}
+		}
+		return nil
+	})
+	return errors.Join(first, err)
 }
 
 // txState collects side effects of a write transaction that must only be
@@ -189,7 +249,7 @@ func (s *Spool) init() error {
 		meta, curs := tx.Bucket(bucketMeta), tx.Bucket(bucketCursors)
 		next := getU64(meta, keyNextSeq)
 		if next == 0 {
-			next = 1
+			next = s.firstSeq
 			if err := putU64(meta, keyNextSeq, next); err != nil {
 				return err
 			}
@@ -302,6 +362,9 @@ func (s *Spool) Read(consumer string, maxRecords, maxBytes int) ([]Entry, error)
 		c := tx.Bucket(bucketRecords).Cursor()
 		size := 0
 		for k, v := c.Seek(seqKey(from)); k != nil && len(out) < maxRecords; k, v = c.Next() {
+			if len(k) != 8 {
+				continue // not a record key; cannot be acknowledged either
+			}
 			seq := binary.BigEndian.Uint64(k)
 			if len(v) < 8 {
 				corrupt = append(corrupt, seq)

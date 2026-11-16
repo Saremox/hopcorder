@@ -921,3 +921,29 @@ fixes. The decisions:
   post SQL to `127.0.0.1:8123`. The server uses its own ClickHouse user; the
   passwords are fixed, as the stack is a try-out.
 
+**Agent**
+- **The HTTP output never follows redirects** (`CheckRedirect` returns the
+  3xx, which is retried and logged). Go's default would resend the batch, on
+  the same host its credentials even after a downgrade to plain http, and
+  custom headers to any host.
+- **Plain-http ingest URLs**: `tls` settings are refused (they were loaded and
+  silently unused); credentials or headers over http are warned about at
+  startup but allowed (in-cluster plain http behind a mesh is common).
+  `batch_max_bytes` is capped at 16 MiB, below the server's default limit.
+- **Metrics endpoint**: read, write and idle timeouts, a 16 KiB header limit
+  and at most 64 connections, so idle clients cannot pin goroutines and file
+  descriptors the agent needs for probing.
+- **MPLS**: only the first label-stack object of an ICMP extension, cut at 16
+  labels (one packet carried 334 before, about 200 times a normal record).
+- **IPv4-mapped sources on IPv6 sockets are dropped**: some kernels deliver
+  them, and the engine picks the parser by the source address, so such a
+  packet was parsed as an IPv4 reply and could inject hops into IPv4 probes.
+- **Corrupt spool files are quarantined**: bbolt's consistency check runs at
+  start, with faults on the memory-mapped file turned into errors. A file
+  that is invalid, fails the check or faults is renamed to
+  `spool.db.corrupt-<unix time>` and an empty spool starts. Its first seq is
+  the current time in microseconds, above any counter the old file can have
+  reached, so the server neither drops the new records as duplicates nor
+  refuses them as stale. Other open errors (locked, permissions, a full disk)
+  leave the file alone.
+

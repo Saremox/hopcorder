@@ -107,6 +107,18 @@ type JSONL struct {
 }
 
 // HTTP pushes zstd-compressed NDJSON batches to <URL>/api/v1/ingest.
+// MaxHTTPBatchBytes bounds batch_max_bytes, below the server's default
+// limit for one request.
+const MaxHTTPBatchBytes = ByteSize(16 << 20)
+
+// CleartextCredentials reports whether credentials would travel over plain
+// http (the agent warns about it at startup).
+func (h *HTTP) CleartextCredentials() bool {
+	u, err := url.Parse(h.URL)
+	return err == nil && u.Scheme == "http" &&
+		(h.BearerToken != "" || h.BearerTokenFile != "" || h.BasicAuth != nil || len(h.Headers) > 0)
+}
+
 type HTTP struct {
 	URL             string            `yaml:"url"`
 	Headers         map[string]string `yaml:"headers"`
@@ -410,6 +422,9 @@ func (h *HTTP) finalize(stat func(string) (os.FileInfo, error)) []error {
 		fail("url %q: missing host", h.URL)
 	case u.User != nil:
 		fail("url: put credentials in basic_auth, not the URL")
+	case u.Scheme == "http" && (h.TLS.CAFile != "" || h.TLS.CertFile != "" || h.TLS.KeyFile != "" || h.TLS.ServerName != ""):
+		// They would be loaded and silently not used.
+		fail("tls: needs an https url")
 	}
 	if h.BearerToken != "" && h.BearerTokenFile != "" {
 		fail("bearer_token and bearer_token_file are mutually exclusive")
@@ -452,8 +467,8 @@ func (h *HTTP) finalize(stat func(string) (os.FileInfo, error)) []error {
 	if h.BatchRecords < 1 {
 		fail("batch_max_records: must be positive")
 	}
-	if h.BatchBytes < 1024 {
-		fail("batch_max_bytes: must be at least 1KiB")
+	if h.BatchBytes < 1024 || h.BatchBytes > MaxHTTPBatchBytes {
+		fail("batch_max_bytes: must be 1KiB to 16MiB (the server takes 32MiB per request by default)")
 	}
 	if h.FlushInterval.D() <= 0 {
 		fail("flush_interval: must be positive")
