@@ -25,9 +25,9 @@ services:
     restart: unless-stopped
 
   server:
-    build: { context: .., dockerfile: Dockerfile }
-    image: hopcorder:local
-    command: ["server", "--config", "/etc/hopcorder/server.yaml"]
+    build: { context: .., target: server }
+    image: hopcorder-server:local
+    command: ["--config", "/etc/hopcorder/server.yaml"]
     ports: ["127.0.0.1:8080:8080"]
     volumes:
       - ./compose/server.yaml:/etc/hopcorder/server.yaml:ro
@@ -37,12 +37,11 @@ services:
     restart: unless-stopped
 
   agent:
-    image: hopcorder:local
-    command: ["agent", "--config", "/etc/hopcorder/agent.yaml"]
+    build: { context: .., target: agent }
+    image: hopcorder-agent:local
     # Trace from the host's own network rather than through Docker's NAT.
     network_mode: host
-    # Raw sockets: root with CAP_NET_RAW and nothing else.
-    user: "0:0"
+    # Raw sockets: the image runs as root; keep CAP_NET_RAW and nothing else.
     cap_drop: [ALL]
     cap_add: [NET_RAW]
     volumes:

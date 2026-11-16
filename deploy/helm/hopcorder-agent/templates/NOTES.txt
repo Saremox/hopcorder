@@ -1,0 +1,7 @@
+hopcorder agent {{ .Chart.AppVersion }} ({{ .Values.mode }}) traces {{ len .Values.config.targets }} target(s)
+and ships to {{ .Values.server.url }}.
+
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=20
+
+The agent runs as root with only CAP_NET_RAW: the namespace's Pod Security
+level must be "baseline" or "privileged".

@@ -248,7 +248,7 @@ internal/spool/         durable queue
 internal/output/        jsonl, http, metrics
 internal/config/        load, defaults, validation
 internal/server/        (milestone 2)
-deploy/                 systemd units, example configs, docker-compose, Grafana provisioning (Helm chart later)
+deploy/                 systemd units, example configs, docker-compose, Grafana provisioning, Helm charts
 dashboards/             Grafana JSON, plus a Go package that reads its queries for tests
 ui/                     the web UI's source (Vue 3 + TypeScript + Vite); built into internal/ui/dist
 docs/                   this file, prototype/
@@ -343,6 +343,20 @@ changes and loops). ECharts or Cytoscape.js.
       gzip and caching; `ui: false` turns it off
 - [x] Unit tests (Go and Vitest), a ClickHouse test of the aggregation, and
       browser tests (Playwright) against a real server in CI (`ui` job)
+
+### Packaging (after M4)
+
+Asked for alongside M4: container images and Helm charts for the agent and
+the server.
+
+- [x] `Dockerfile` targets `agent` and `server` (static, on scratch,
+      amd64 and arm64), published to `ghcr.io/saremox/hopcorder-{agent,server}`
+      by `.github/workflows/images.yml`
+- [x] Helm charts `deploy/helm/hopcorder-server` and
+      `deploy/helm/hopcorder-agent` (StatefulSet or DaemonSet), pushed to
+      `oci://ghcr.io/saremox/charts` on release tags
+- [x] CI job `helm`: strict lint, then both charts (the agent in both modes)
+      installed into kind with images from the commit, records checked
 
 ## 8. Testing
 
@@ -703,12 +717,11 @@ added in the commit that introduced it.
   and replace the file. The data source provisioning reads
   `HOPCORDER_CLICKHOUSE_{HOST,PORT,DATABASE,USER,PASSWORD}` from Grafana's
   environment.
-- **Image**: one static image (`FROM scratch`, CA certificates only) for
-  both commands. The server runs as uid 65532. The agent needs
-  `CAP_NET_RAW`, which Docker grants only to root unless the binary carries a
-  file capability, so in compose it runs as uid 0 with every other
-  capability dropped, and with the host's network so paths are not traced
-  through Docker's NAT. Its spool directory belongs to root for that reason.
+- **Images**: built from the Dockerfile's `agent` and `server` targets
+  (originally one image for both commands; split for the published images,
+  see "Packaging: images and Helm charts"). In compose the agent runs as
+  root with every capability but `NET_RAW` dropped, and with the host's
+  network so paths are not traced through Docker's NAT.
 - **Compose**: every published port on localhost only; ClickHouse's
   passwordless default user. No `ulimits` for ClickHouse: raising the file
   limit fails on hosts that do not allow it (rootless Docker, this
@@ -777,3 +790,54 @@ added in the commit that introduced it.
   medians now default to 0 there, and the ClickHouse test covers it.
 - **Not done**: on phone screens the graph's labels crowd (zoom works);
   there is no per-address history view yet.
+
+### Packaging: images and Helm charts
+
+- **Two images from one Dockerfile** (`--target agent`, `--target server`,
+  the default), so each has the right user, entrypoint and data directory.
+  Static Go binaries on `scratch` with CA certificates only, about 18 MB.
+  The build stage runs on the build platform and cross-compiles
+  (`GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH`), so arm64 images need no
+  emulation.
+- **The agent image runs as root.** Raw sockets need `CAP_NET_RAW`;
+  container runtimes give capabilities only to root, and Kubernetes has no
+  ambient capabilities, while a file capability on the binary would be
+  ignored under `allowPrivilegeEscalation: false`. So the agent runs as uid 0
+  with every capability but `NET_RAW` dropped, a read-only root file system
+  and no privilege escalation. That needs Pod Security `baseline`; the server
+  runs as uid 65532 and fits `restricted`.
+- **Publishing** (`images.yml`): pull requests build both images without
+  pushing; `main` pushes `:main` and `:sha-<commit>`; `v*` tags push
+  `:<version>`, `:<major>.<minor>` and `:latest`, and package the charts with
+  that version and appVersion into `oci://ghcr.io/saremox/charts`. Charts
+  default to their appVersion as the image tag, so before the first release
+  `image.tag=main` is needed. No release has been tagged.
+- **Server chart**: always one replica with the `Recreate` strategy. The
+  server keeps each stream's path tracker and open outage in memory
+  (restored from ClickHouse on start), so two servers receiving one agent's
+  batches would each derive events from half its cycles, and two ingesting
+  at once could race the per-agent dedup. Scaling out would need
+  stream-sticky routing first. The chart owns `listen`, the ASN cache path
+  (an emptyDir, or a PVC with `persistence.enabled`) and, with
+  `clickhouse.passwordSecret`, `password_file`; everything else in
+  `values.config` is the server's config file as-is. No ClickHouse is
+  bundled.
+- **Agent chart**: `mode: statefulset` (default) gives every agent a stable
+  name, used as `--agent-id`, and its own spool volume, so sequence numbers
+  stay unique and streams stay continuous across restarts and rescheduling.
+  A Deployment would get a new name with an empty spool on every
+  reschedule. `mode: daemonset` uses the node's name as `--agent-id` and a
+  hostPath spool, so an agent keeps its identity and spool on its node.
+  `hostNetwork` traces from the node's network namespace. The chart owns
+  `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`;
+  the rest of `values.config` is the agent's config file.
+- **Tested in CI** (`helm` job, kind): ClickHouse, the server chart, two
+  StatefulSet agents and a hostNetwork DaemonSet agent tracing the server's
+  Service over TCP; the job passes when every agent's cycles arrive and a
+  TCP stream reached its destination. The development container cannot run
+  kind (its cgroup v1 needs `failCgroupV1: false`, and then nested runc may
+  not set `oom_score_adj`), so there the rendered manifests were validated
+  with kubeconform (strict) and both images ran in Docker with the
+  chart-rendered config files and the charts' security settings (read-only
+  root file system, every capability dropped but the agent's `NET_RAW`, no
+  privilege escalation): the agent's TCP and UDP cycles reached the server.
