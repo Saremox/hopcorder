@@ -158,15 +158,19 @@ func PathHash(hops []Hop) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// DetectLoops returns every IP that responded at more than one TTL, ordered
-// by the first TTL it was seen at. A rate-limited looping router answers only
-// some of its probes, so loops found this way are a floor, not a count. The
-// result is never nil.
+// DetectLoops returns every IP that answered with time exceeded at more than
+// one TTL, ordered by the first TTL it was seen at. Only time-exceeded
+// answers count: they prove the router handled the packet in transit, so
+// seeing one at two TTLs means the packet came back to it. A router that
+// expires TTL k and then rejects TTL k+1 with an unreachable is a filtering
+// edge, not a loop. A rate-limited looping router answers only some of its
+// probes, so loops found this way are a floor, not a count. The result is
+// never nil.
 func DetectLoops(hops []Hop) []Loop {
 	seen := make(map[netip.Addr][]int)
 	var order []netip.Addr
 	for _, h := range hops {
-		if !h.Status.Responded() || !h.IP.IsValid() {
+		if h.Status != StatusTTLExpired || !h.IP.IsValid() {
 			continue
 		}
 		if _, ok := seen[h.IP]; !ok {

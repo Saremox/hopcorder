@@ -198,6 +198,17 @@ func TestDetectLoops(t *testing.T) {
 			hops: hops("*", "*", "*"),
 			want: []Loop{},
 		},
+		{
+			// A filtering edge router: expires TTL 2, rejects TTL 3.
+			name: "expired then unreachable from the same router is not a loop",
+			hops: hops("x:10.0.0.1", "x:21.4.241.33", "u3:21.4.241.33"),
+			want: []Loop{},
+		},
+		{
+			name: "destination reply does not join a loop",
+			hops: hops("x:10.0.0.1", "x:192.0.2.9", "r:192.0.2.9"),
+			want: []Loop{},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

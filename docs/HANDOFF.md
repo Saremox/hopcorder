@@ -355,6 +355,13 @@ added in the commit that introduced it.
 - **`path_len`** is the number of hops in the trimmed `hops` array, which is
   always contiguous from TTL 1. For reached paths that is the destination's
   distance; for unreached ones it includes the `probe_past` silent hops.
+- **Loops count only `ttl-expired` answers** (narrows §3.2, which says "any IP
+  that responded at more than one TTL"). Found on the first real trace: a
+  filtering router that expires TTL k and rejects TTL k+1 with an unreachable
+  shows up at two TTLs, and the literal rule logs it as a loop. Only time
+  exceeded proves the router forwarded the packet and saw it again. A
+  destination that also appears one hop earlier (e.g. a firewall answering
+  with the target's address) is likewise excluded.
 - **`loops`** and **`hops`** are always present (`[]` when empty), never `null`.
 - **`rtt_us`** is at least 1 for responding hops, so `omitempty` only ever drops
   it on `no-reply`. **`code`** is present exactly on `unreachable` hops (as a
