@@ -1,0 +1,53 @@
+# systemd unit for the hopcorder ingest server.
+#
+#   install -m 0755 hopcorder /usr/local/bin/hopcorder
+#   install -D -m 0644 deploy/server.example.yaml /etc/hopcorder/server.yaml
+#   install -m 0644 deploy/hopcorder-server.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now hopcorder-server
+#
+# The server needs no capabilities. It listens on 127.0.0.1:8080 by default:
+# put a reverse proxy in front for authentication (it does none itself).
+# StateDirectory (/var/lib/hopcorder-server) holds the cached ASN database.
+
+[Unit]
+Description=hopcorder network path recorder (ingest server)
+Documentation=https://github.com/Saremox/hopcorder
+Wants=network-online.target
+After=network-online.target clickhouse-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hopcorder server --config /etc/hopcorder/server.yaml
+Restart=always
+RestartSec=5s
+TimeoutStopSec=15s
+
+DynamicUser=yes
+StateDirectory=hopcorder-server
+ConfigurationDirectory=hopcorder
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
