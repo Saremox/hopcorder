@@ -1,0 +1,773 @@
+{
+  "uid": "hopcorder-overview",
+  "title": "hopcorder — network paths",
+  "description": "When, where and why paths break: built from the prototype's analysis queries (docs/prototype/schema.sql) on the hopcorder schema.",
+  "tags": [
+    "hopcorder",
+    "network"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "grafana-clickhouse-datasource",
+        "current": {
+          "text": "hopcorder ClickHouse",
+          "value": "hopcorder-clickhouse"
+        },
+        "hide": 0,
+        "refresh": 1,
+        "options": []
+      },
+      {
+        "name": "agent",
+        "label": "Agent",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "Var-agent",
+          "queryType": "sql",
+          "rawSql": "SELECT DISTINCT agent_id FROM cycles WHERE $__timeFilter(ts) ORDER BY agent_id"
+        },
+        "definition": "SELECT DISTINCT agent_id FROM cycles WHERE $__timeFilter(ts) ORDER BY agent_id",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "target",
+        "label": "Target",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "Var-target",
+          "queryType": "sql",
+          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} ORDER BY target"
+        },
+        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} ORDER BY target",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "protocol",
+        "label": "Protocol",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "Var-protocol",
+          "queryType": "sql",
+          "rawSql": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} ORDER BY protocol"
+        },
+        "definition": "SELECT DISTINCT protocol FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} ORDER BY protocol",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "current": {},
+        "options": []
+      },
+      {
+        "name": "target_b",
+        "label": "Compare with",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "refId": "Var-target_b",
+          "queryType": "sql",
+          "rawSql": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target != ${target:sqlstring} ORDER BY target"
+        },
+        "definition": "SELECT DISTINCT target FROM cycles WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target != ${target:sqlstring} ORDER BY target",
+        "refresh": 2,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "name": "Route changes",
+        "enable": true,
+        "iconColor": "orange",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "target": {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "refId": "Anno",
+          "rawSql": "SELECT ts AS time, concat(target, ' ', protocol, ': ', reason, ' ', arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), ttls, from_ips, to_ips), ', ')) AS text FROM path_changes FINAL WHERE agent_id = ${agent:sqlstring} AND $__timeFilter(ts) ORDER BY time"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "When does it break?",
+      "id": 1,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Unreachable cycles per target",
+      "description": "Share of cycles in which the destination did not answer (prototype Q1), for every target of the agent.",
+      "id": 2,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream,\n       round(100 * (1 - avg(reached)), 1) AS unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring}\nGROUP BY time, stream\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "displayName": "${__field.labels.stream}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 60,
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Outages",
+      "description": "Reachability-loss windows: from the first cycle that missed the destination to the first that reached it again. Open windows have no end. Last hop = last responding hop of the first failing cycle.",
+      "id": 3,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT start_ts AS start, end_ts AS end,\n       dateDiff('second', start_ts, ifNull(end_ts, now64(3))) AS duration_s,\n       target, protocol, cycles, last_hop_ttl, last_hop_ip\nFROM outages FINAL\nWHERE agent_id = ${agent:sqlstring} AND start_ts <= $__toTime AND (end_ts IS NULL OR end_ts >= $__fromTime)\nORDER BY start_ts DESC\nLIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_s"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Two-target correlation",
+      "description": "Unreachable share of ${target} and ${target_b} (prototype Q7). Failing in the same minutes points at a shared transit; failing independently, at two problems.",
+      "id": 4,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(100 * (1 - avgIf(reached, target = ${target:sqlstring})), 1) AS a_unreachable_pct,\n       round(100 * (1 - avgIf(reached, target = ${target_b:sqlstring})), 1) AS b_unreachable_pct\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target IN (${target:sqlstring}, ${target_b:sqlstring})\nGROUP BY time\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "a_unreachable_pct"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "${target}"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "b_unreachable_pct"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "${target_b}"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Where does it break? (${target}, ${protocol})",
+      "id": 5,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Failed cycles by last responding hop",
+      "description": "For every cycle that did not reach the destination, the last hop that answered at all (prototype Q2): does the path die inside a transit AS or past it?",
+      "id": 6,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 17
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(t) AS time,\n       if(last_ttl = 0, 'no hop answered',\n          concat(toString(last_ttl), '. ', last_hop, if(last_as != '', concat(' (', last_as, ')'), ''))) AS hop,\n       count() AS failed_cycles\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND NOT reached\n  GROUP BY seq\n)\nGROUP BY time, hop\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "displayName": "${__field.labels.hop}",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Where failures stop",
+      "description": "Failed cycles grouped by their last responding hop.",
+      "id": 7,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT last_ttl AS ttl, last_hop AS hop, last_as AS as_name, count() AS failed_cycles,\n       min(t) AS first_seen, max(t) AS last_seen\nFROM (\n  SELECT any(ts) AS t, seq,\n         maxIf(ttl, status != 'no-reply') AS last_ttl,\n         argMaxIf(if(hop_name != '', hop_name, hop_ip), ttl, status != 'no-reply') AS last_hop,\n         argMaxIf(hop_as_name, ttl, status != 'no-reply') AS last_as\n  FROM hops\n  WHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND NOT reached\n  GROUP BY seq\n)\nGROUP BY last_ttl, last_hop, last_as\nORDER BY failed_cycles DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Real loss vs ICMP rate limiting",
+      "description": "A hop's own no-reply rate is forwarding loss only if the end-to-end rate is comparable (prototype Q5). High own loss with low end-to-end loss means the router only deprioritises time-exceeded replies.",
+      "id": 8,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT ttl,\n       anyIf(if(hop_name != '', hop_name, hop_ip), hop_ip != '') AS hop,\n       anyIf(hop_as_name, hop_ip != '') AS as_name,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS own_loss_pct,\n       round(100 * (1 - avg(reached)), 1) AS e2e_loss_pct,\n       multiIf(own_loss_pct < 5, 'clean',\n               e2e_loss_pct > own_loss_pct * 0.5, 'REAL LOSS',\n               'rate-limited (ignore)') AS verdict\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY ttl\nORDER BY ttl",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "verdict"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "clean": {
+                        "color": "green",
+                        "index": 0
+                      },
+                      "REAL LOSS": {
+                        "color": "red",
+                        "index": 1
+                      },
+                      "rate-limited (ignore)": {
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end RTT",
+      "description": "Round-trip time of the destination's reply.",
+      "id": 9,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time,\n       round(quantile(0.5)(rtt_us) / 1000, 2) AS p50_ms,\n       round(quantile(0.95)(rtt_us) / 1000, 2) AS p95_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring} AND status = 'reply'\nGROUP BY time\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "heatmap",
+      "title": "No-reply rate per hop",
+      "description": "Share of probes each TTL left unanswered (prototype Q6). A band across every TTL from some hop on is real loss; a single hot TTL is usually rate limiting.",
+      "id": 10,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(100 * countIf(status = 'no-reply') / count(), 1) AS loss_pct\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY time, ttl\nORDER BY time, ttl",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "displayName": "${__field.labels.hop}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": false
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Oranges",
+          "steps": 64,
+          "exponent": 0.5
+        },
+        "legend": {
+          "show": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": false
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        }
+      }
+    },
+    {
+      "type": "heatmap",
+      "title": "RTT per hop (p50)",
+      "description": "Median round-trip time per TTL (prototype Q6).",
+      "id": 11,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat('TTL ', leftPad(toString(ttl), 2, '0')) AS hop,\n       round(quantile(0.5)(nullIf(rtt_us, 0)) / 1000, 2) AS rtt_p50_ms\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND target = ${target:sqlstring} AND protocol = ${protocol:sqlstring}\nGROUP BY time, ttl\nORDER BY time, ttl",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "displayName": "${__field.labels.hop}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "yAxis": {
+          "axisPlacement": "left",
+          "reverse": false
+        },
+        "color": {
+          "mode": "scheme",
+          "scheme": "Blues",
+          "steps": 64,
+          "exponent": 0.5
+        },
+        "legend": {
+          "show": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "yHistogram": false
+        },
+        "rowsFrame": {
+          "layout": "auto"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Did the route change?",
+      "id": 12,
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panels": []
+    },
+    {
+      "type": "table",
+      "title": "Route changes",
+      "description": "Route changes decided like the agent's metric: silent hops match anything, so a rate-limited router going quiet is not a change (HANDOFF.md §10). Shows the hops that changed and the full path before and after.",
+      "id": 13,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "WITH paths AS\n(\n    SELECT seq, arrayStringConcat(arrayMap(ip -> if(ip = '', '*', ip), hops.ip), ' > ') AS path\n    FROM cycles\n    WHERE agent_id = ${agent:sqlstring} AND seq IN\n    (\n        SELECT arrayJoin([seq, prev_seq]) FROM path_changes\n        WHERE agent_id = ${agent:sqlstring} AND $__timeFilter(ts)\n    )\n)\nSELECT pc.ts AS time, pc.target, pc.protocol, pc.reason,\n       arrayStringConcat(arrayMap((t, f, n) -> concat(toString(t), ': ', f, ' → ', n), pc.ttls, pc.from_ips, pc.to_ips), ', ') AS changed_hops,\n       pc.prev_path_len, pc.path_len, b.path AS before, a.path AS after\nFROM path_changes AS pc FINAL\nLEFT JOIN paths AS a ON a.seq = pc.seq\nLEFT JOIN paths AS b ON b.seq = pc.prev_seq\nWHERE pc.agent_id = ${agent:sqlstring} AND $__timeFilter(pc.ts)\nORDER BY time DESC\nLIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Loops",
+      "description": "Addresses that answered at more than one TTL in one cycle (prototype Q4), one row per loop. Loops of heavily rate-limited routers are only seen in some cycles, so counts are a floor.",
+      "id": 14,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 1,
+          "queryType": "table",
+          "rawSql": "SELECT ts AS time, target, protocol, hop_ip, hop_name, hop_as_name, loop_ttls, reached\nFROM hops\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring} AND is_loop\n  AND ttl = toUInt8OrZero(splitByChar(',', loop_ttls)[1])\nORDER BY time DESC\nLIMIT 500",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Path length per target",
+      "description": "Hops in the recorded path (the destination's distance when reached).",
+      "id": 15,
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 53
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "editorType": "sql",
+          "format": 0,
+          "queryType": "timeseries",
+          "rawSql": "SELECT $__timeInterval(ts) AS time, concat(target, ' ', protocol) AS stream, max(path_len) AS path_len\nFROM cycles\nWHERE $__timeFilter(ts) AND agent_id = ${agent:sqlstring}\nGROUP BY time, stream\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "displayName": "${__field.labels.stream}",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter"
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    }
+  ]
+}

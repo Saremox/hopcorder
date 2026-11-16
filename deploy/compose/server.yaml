@@ -1,0 +1,9 @@
+# hopcorder server in the docker-compose try-out (deploy/docker-compose.yml).
+# See deploy/server.example.yaml for every option.
+listen: 0.0.0.0:8080            # published on 127.0.0.1:8080 only
+clickhouse:
+  url: http://clickhouse:8123
+  retention_days: 30
+enrich:
+  asn:
+    file: /var/lib/hopcorder-server/ip2asn-combined.tsv.gz

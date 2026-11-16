@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/saremox/hopcorder/dashboards"
 	"github.com/saremox/hopcorder/internal/clickhouse"
 	"github.com/saremox/hopcorder/internal/output"
 	"github.com/saremox/hopcorder/internal/record"
@@ -204,10 +207,11 @@ func prototypeQueries(t *testing.T) []string {
 	return out
 }
 
-// The prototype's seven analysis queries run unchanged (but for names)
-// against hopcorder data through the path_probes compatibility view.
-func TestPrototypeQueriesRun(t *testing.T) {
-	c := testClickHouse(t)
+// seedTwoTargets ingests cycles of agent "lab" to dc1.example and
+// dc2.example: a stable path, a loop (dc1), an outage on both and a route
+// change on both.
+func seedTwoTargets(t *testing.T, c *clickhouse.Client) {
+	t.Helper()
 	in := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
 	var recs []*record.Record
 	add := func(target string, spec ...string) {
@@ -227,6 +231,13 @@ func TestPrototypeQueriesRun(t *testing.T) {
 	if _, err := in.Ingest(t.Context(), recs); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// The prototype's seven analysis queries run unchanged (but for names)
+// against hopcorder data through the path_probes compatibility view.
+func TestPrototypeQueriesRun(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
 
 	queries := prototypeQueries(t)
 	if len(queries) != 7 {
@@ -248,6 +259,60 @@ func TestPrototypeQueriesRun(t *testing.T) {
 	// Loop columns on the per-hop rows, as the prototype has them.
 	if n := count(t, c, "SELECT count() AS n FROM path_probes WHERE is_loop = 1 AND loop_ttls IN ('2,4', '3,5')"); n != 4 {
 		t.Errorf("%d looping hop rows, want 4", n)
+	}
+}
+
+// Every query of the Grafana dashboards (panels, variables, annotations)
+// runs against the real schema, expanded as Grafana and the ClickHouse
+// plugin would, and finds the seeded data.
+func TestDashboardQueriesRun(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
+	vars := map[string]string{"datasource": "hopcorder-clickhouse", "agent": "lab", "target": "dc1.example",
+		"protocol": "icmp", "target_b": "dc2.example"}
+	for _, name := range dashboards.Names() {
+		d, err := dashboards.Load(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range d.Queries() {
+			sql := dashboards.Expand(q.SQL, vars, t0.Add(-time.Hour), t0.Add(time.Hour), time.Minute)
+			rows, err := clickhouse.QueryInto[map[string]any](t.Context(), c, sql, nil)
+			if err != nil {
+				t.Errorf("%s %s: %v\n%s", name, q.Where, err, sql)
+				continue
+			}
+			if len(rows) == 0 {
+				t.Errorf("%s %s: no rows\n%s", name, q.Where, sql)
+				continue
+			}
+			t.Logf("%s: %d rows, first %v", q.Where, len(rows), rows[0])
+			check := func(ok bool) {
+				if !ok {
+					t.Errorf("%s: unexpected rows %v", q.Where, rows)
+				}
+			}
+			switch q.Where {
+			case "panel Where failures stop":
+				// On dc1, brokenA stops after 62.115.120.1 at TTL 2, the loop
+				// after 62.115.120.2 at TTL 5.
+				stops := map[string]any{}
+				for _, r := range rows {
+					stops[fmt.Sprint(r["ttl"], " ", r["hop"], " ", r["as_name"])] = r["failed_cycles"]
+				}
+				check(len(stops) == 2 && stops["2 62.115.120.1 TWELVE99"] == float64(1) && stops["5 62.115.120.2 TWELVE99"] == float64(1))
+			case "panel Route changes":
+				// Into the loop, out of it, then pathA to pathB.
+				check(len(rows) == 3 && rows[0]["before"] != "" && rows[0]["after"] != "" && rows[0]["changed_hops"] != "")
+			case "panel Loops":
+				check(len(rows) == 2 && rows[0]["loop_ttls"] != "")
+			case "panel Outages":
+				// dc1: the loop and brokenA in a row, 2 cycles; dc2: brokenA.
+				check(len(rows) == 2 && rows[1]["target"] == "dc1.example" && rows[1]["cycles"] == float64(2))
+			case "variable target_b":
+				check(len(rows) == 1 && rows[0]["target"] == "dc2.example")
+			}
+		}
 	}
 }
 
