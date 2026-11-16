@@ -19,6 +19,9 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hopcorder agent --config /etc/hopcorder/agent.yaml
+# Re-read the config (an invalid one is rejected and the running one kept)
+# and reopen the JSONL file, e.g. after log rotation.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5s
 # SIGTERM: stop probing, give outputs a few seconds, exit. Spooled records

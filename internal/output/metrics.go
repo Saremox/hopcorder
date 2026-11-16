@@ -159,29 +159,32 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{Registry: m.reg})
 }
 
-// Serve listens on addr and serves the metrics at path until ctx ends.
-func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger) error {
+// Serve listens on addr and serves the metrics at path. The returned stop
+// function shuts the server down and returns once the listener is closed,
+// so the address can be bound again right away (as a config reload does).
+func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger) (stop func(), err error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("metrics listen %s: %w", addr, err)
+		return nil, fmt.Errorf("metrics listen %s: %w", addr, err)
 	}
 	mux := http.NewServeMux()
 	mux.Handle(path, m.Handler())
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-	}()
 	log.Info("serving metrics", "addr", ln.Addr().String(), "path", path)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server failed", "err", err)
 		}
 	}()
-	return nil
+	return func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+		<-done
+	}, nil
 }
 
 // OutputError counts a failed delivery; pass it as DrainOptions.OnError.

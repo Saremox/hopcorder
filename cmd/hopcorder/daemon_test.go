@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -324,4 +325,153 @@ func TestShutdownShipsPartialBatch(t *testing.T) {
 	if p := sp.Pending("http"); p != 0 || unique == 0 || uint64(unique) != sp.Stats().LastSeq {
 		t.Errorf("pending %d, delivered %d of %d", p, unique, sp.Stats().LastSeq)
 	}
+}
+
+func readRecords(t *testing.T, path string) []record.Record {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []record.Record
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if l == "" {
+			continue
+		}
+		var r record.Record
+		if err := json.Unmarshal([]byte(l), &r); err != nil {
+			t.Fatalf("bad line %q: %v", l, err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func waitFor(t *testing.T, d time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestReloadOnSIGHUP(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := dir + "/agent.yaml"
+	writeCfg := func(target, out string) {
+		writeTestFile(t, cfgPath, fmt.Sprintf(`
+agent_id: reload
+interval: 100ms
+timeout: 50ms
+spool: {dir: %q}
+targets: [{host: %s}]
+outputs: {jsonl: {path: %q}}
+`, dir+"/spool", target, out))
+	}
+	load := func() (*config.Config, error) {
+		c, err := config.Load(cfgPath)
+		if err != nil {
+			return nil, err
+		}
+		return c, c.Finalize(config.FinalizeOptions{})
+	}
+	writeCfg("192.0.2.1", dir+"/a.jsonl")
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() { done <- superviseDaemon(ctx, cfg, fakeNetwork(), reload, load, quiet) }()
+
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/a.jsonl")) >= 3 }, "records before reload")
+
+	// An invalid configuration is rejected and the agent keeps running.
+	writeTestFile(t, cfgPath, "bogus: true\n")
+	reload <- syscall.SIGHUP
+	n := len(readRecords(t, dir+"/a.jsonl"))
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/a.jsonl")) > n+2 }, "records after rejected reload")
+
+	// A valid one switches target and output file; seq continues.
+	writeCfg("192.0.2.2", dir+"/b.jsonl")
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool { return len(readRecords(t, dir+"/b.jsonl")) >= 3 }, "records after reload")
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+
+	a, b := readRecords(t, dir+"/a.jsonl"), readRecords(t, dir+"/b.jsonl")
+	var maxA uint64
+	for _, r := range a {
+		if r.Target != "192.0.2.1" {
+			t.Errorf("a.jsonl has target %s", r.Target)
+		}
+		maxA = max(maxA, r.Seq)
+	}
+	for _, r := range b {
+		if r.Target != "192.0.2.2" {
+			t.Errorf("b.jsonl has target %s", r.Target)
+		}
+		if r.Seq <= maxA {
+			t.Errorf("seq %d after reload does not continue past %d", r.Seq, maxA)
+		}
+	}
+}
+
+func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
+	dir := t.TempDir()
+	good := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	bad := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", busy.Addr().String()) // metrics port taken
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() {
+		done <- superviseDaemon(ctx, good, fakeNetwork(), reload, func() (*config.Config, error) { return bad, nil }, quiet)
+	}()
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/out.jsonl")) >= 2 }, "records")
+	reload <- syscall.SIGHUP
+	time.Sleep(1500 * time.Millisecond)
+	n := len(readRecords(t, dir+"/out.jsonl"))
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/out.jsonl")) > n+2 }, "records after revert")
+	select {
+	case err := <-done:
+		t.Fatalf("supervisor exited: %v", err)
+	default:
+	}
+}
+
+func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Config {
+	t.Helper()
+	yml := fmt.Sprintf("agent_id: r\ninterval: 100ms\ntimeout: 50ms\nspool: {dir: %q}\ntargets: [{host: 192.0.2.1}]\noutputs:\n  jsonl: {path: %q}\n", spoolDir, out)
+	if metrics != "" {
+		yml += fmt.Sprintf("  metrics: {listen: %q}\n", metrics)
+	}
+	c, err := config.Parse([]byte(yml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Finalize(config.FinalizeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
