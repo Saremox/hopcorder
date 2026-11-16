@@ -62,6 +62,18 @@ type Hop struct {
 	// because code 0 (net unreachable / no route) is meaningful. Codes are
 	// raw ICMPv4 or ICMPv6 codes; interpret them according to Record.AF.
 	Code *int `json:"code,omitempty"`
+	// MPLS is the label stack the router reported in its ICMP error
+	// (RFC 4884/4950 extensions), outermost label first; absent when the
+	// router sent none.
+	MPLS []MPLSLabel `json:"mpls,omitempty"`
+}
+
+// MPLSLabel is one entry of an MPLS label stack as quoted by a router.
+type MPLSLabel struct {
+	Label uint32 `json:"label"` // 20-bit label value
+	TC    uint8  `json:"tc"`    // traffic class (formerly EXP)
+	S     bool   `json:"s"`     // bottom of stack
+	TTL   uint8  `json:"ttl"`   // the label's TTL when the packet arrived
 }
 
 // Loop is an IP address that answered at more than one TTL in one cycle.
@@ -249,6 +261,14 @@ func (h Hop) validate() error {
 	}
 	if (h.Status == StatusUnreachable) != (h.Code != nil) {
 		return errors.New("code must be set exactly for unreachable hops")
+	}
+	if len(h.MPLS) > 0 && h.Status != StatusTTLExpired && h.Status != StatusUnreachable {
+		return fmt.Errorf("status %s carries an MPLS label stack", h.Status)
+	}
+	for _, l := range h.MPLS {
+		if l.Label > 0xfffff || l.TC > 7 {
+			return fmt.Errorf("invalid MPLS label %+v", l)
+		}
 	}
 	return nil
 }

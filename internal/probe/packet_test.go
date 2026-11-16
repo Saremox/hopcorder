@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/saremox/hopcorder/internal/record"
 )
 
 func unhex(t testing.TB, s string) []byte {
@@ -252,13 +255,15 @@ func TestBuiltProbesMatchQuotedKeys(t *testing.T) {
 
 func FuzzParseICMP(f *testing.F) {
 	for _, s := range []string{timeExceeded4Echo, portUnreach4UDP, timeExceeded4Options, echoReply4,
-		timeExceeded6Echo, portUnreach6UDP, echoReply6} {
+		timeExceeded6Echo, portUnreach6UDP, echoReply6, mplsV4Explicit, mplsV4Compat, mplsV6Explicit} {
 		f.Add(unhex(f, s))
 	}
 	f.Fuzz(func(_ *testing.T, b []byte) {
 		_, _ = parseICMPv4(dst4, b)
 		_, _ = parseICMPv6(dst6, b)
 		_, _ = parseTCP(dst4, b)
+		_ = parseMPLS(b, false)
+		_ = parseMPLS(b, true)
 	})
 }
 
@@ -309,5 +314,55 @@ func TestQuotedTCPKey(t *testing.T) {
 	}
 	if s := verifySum(src4, dst4, protoTCP, syn); s != 0xffff {
 		t.Errorf("syn checksum does not verify (sum %#x)", s)
+	}
+}
+
+// Golden RFC 4884/4950 messages built by an independent Python script: an
+// ICMP error quoting a 128-byte-padded original datagram followed by an
+// extension structure with an MPLS label stack object.
+const (
+	mplsV4Explicit  = "0b00000000200000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020007e13000c010105dc500100010b01"
+	mplsV4Compat    = "0b00000000000000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020007e13000c010105dc500100010b01"
+	mplsV4CompatBad = "0b00000000000000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020008113000c010105dc500100010b01"
+	mplsV6Explicit  = "03000000100000006000000000143a0120010db800000000000000000000000120010db8000000000000000000000002800082f6829a000700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000def600080101ffffffff"
+)
+
+func TestParseMPLS(t *testing.T) {
+	two := []record.MPLSLabel{{Label: 24005, TC: 0, S: false, TTL: 1}, {Label: 16, TC: 5, S: true, TTL: 1}}
+	tests := []struct {
+		name string
+		msg  string
+		v6   bool
+		want []record.MPLSLabel
+	}{
+		{"v4 with length field", mplsV4Explicit, false, two},
+		{"v4 length 0, extension at 128", mplsV4Compat, false, two},
+		{"v4 length 0, bad checksum", mplsV4CompatBad, false, nil},
+		{"v6 with length field", mplsV6Explicit, true, []record.MPLSLabel{{Label: 1048575, TC: 7, S: true, TTL: 255}}},
+		{"no extension", timeExceeded4Echo, false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseMPLS(unhex(t, tt.msg), tt.v6); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+	// Truncations and a wrong version never panic and never invent labels.
+	full := unhex(t, mplsV4Explicit)
+	for n := range len(full) {
+		if got := parseMPLS(full[:n], false); len(got) > 2 {
+			t.Fatalf("prefix %d: %+v", n, got)
+		}
+	}
+	bad := unhex(t, mplsV4Explicit)
+	bad[8+128] = 0x10 // version 1
+	if got := parseMPLS(bad, false); got != nil {
+		t.Errorf("version 1 extension parsed: %+v", got)
+	}
+	// The quoted datagram still parses as usual.
+	if r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), unhex(t, mplsV4Explicit)); err != nil ||
+		r.key != (probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}) {
+		t.Errorf("quoted probe: %+v %v", r, err)
 	}
 }

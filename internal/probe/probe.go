@@ -105,6 +105,8 @@ type HopResult struct {
 	RTT time.Duration
 	// Code is the ICMP code for StatusUnreachable.
 	Code int
+	// MPLS is the label stack the router reported (RFC 4950), if any.
+	MPLS []record.MPLSLabel
 }
 
 // Prober runs traceroute cycles.

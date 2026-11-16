@@ -433,8 +433,20 @@ added in the commit that introduced it.
   ~55µs to ~24µs (p90 104 → 35µs), i.e. about 30µs of every RTT was Go
   scheduling delay. Send times are still user-space, taken just before the
   send call.
-- **Known limitations**: MPLS label extensions (RFC 4950) are not parsed.
-  All TTLs up to `max_ttl` are probed in cycles of unreached targets.
+- **MPLS label stacks** (added after review; **additive change to the locked
+  wire record §3.1**, approved with the "agent polish" scope): hops may carry
+  `"mpls": [{"label": 24005, "tc": 0, "s": true, "ttl": 1}, …]`, outermost
+  label first, parsed from RFC 4884 extensions (RFC 4950 MPLS object) of time
+  exceeded and unreachable messages. Absent when the router sent none, so
+  existing consumers are unaffected and `schema` stays 1. Both layouts are
+  read: the RFC 4884 length field, and the common "length 0, extension after
+  a 128-byte original datagram" form, which is accepted only with a valid
+  extension checksum. M2 should store the stack per hop (e.g.
+  `hop_mpls Array(Tuple(label UInt32, tc UInt8, s UInt8, ttl UInt8))`); it
+  shows which hops of a transit backbone sit inside an MPLS tunnel.
+- **Known limitations**: all TTLs up to `max_ttl` are probed in cycles of
+  unreached targets. Routers that hide MPLS hops (no TTL propagation) stay
+  invisible; labels only appear for hops that answer.
 - **Testing**: the demux engine sits behind a small socket interface and is
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology

@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+
+	"github.com/saremox/hopcorder/internal/record"
 )
 
 // IP protocol numbers.
@@ -344,4 +346,65 @@ func quotedL4Key(dst netip.Addr, proto uint8, l4 []byte) (probeKey, error) {
 	default:
 		return probeKey{}, errIgnored
 	}
+}
+
+// RFC 4884 extension structure, RFC 4950 MPLS label stack object.
+const (
+	extVersion         = 2
+	extMinOriginal     = 128 // original datagram is padded to at least this
+	extClassMPLS       = 1
+	extCTypeLabelStack = 1
+)
+
+// parseMPLS returns the MPLS label stack from the RFC 4884 extension of an
+// ICMP time-exceeded or destination-unreachable message, or nil.
+//
+// Compliant routers state the original datagram's length (in 32-bit words
+// for ICMPv4, 64-bit words for ICMPv6) and the extension follows it. Many
+// routers instead leave the length at 0 and append the extension after a
+// 128-byte original datagram (RFC 4884 §5); that layout is accepted only
+// with a valid extension checksum, so payload bytes that merely look like an
+// extension are not misread.
+func parseMPLS(msg []byte, v6 bool) []record.MPLSLabel {
+	if len(msg) < 8 {
+		return nil
+	}
+	words, unit := int(msg[5]), 4
+	if v6 {
+		words, unit = int(msg[4]), 8
+	}
+	off, compat := 8+words*unit, words == 0
+	if compat {
+		off = 8 + extMinOriginal
+	}
+	if len(msg) < off+4 {
+		return nil
+	}
+	ext := msg[off:]
+	if ext[0]>>4 != extVersion {
+		return nil
+	}
+	if sum := binary.BigEndian.Uint16(ext[2:]); (compat || sum != 0) && fold(onesSum(0, ext)) != 0xffff {
+		return nil
+	}
+	var labels []record.MPLSLabel
+	for obj := ext[4:]; len(obj) >= 4; {
+		n := int(binary.BigEndian.Uint16(obj))
+		if n < 4 || n > len(obj) {
+			break
+		}
+		if obj[2] == extClassMPLS && obj[3] == extCTypeLabelStack {
+			for e := obj[4:n]; len(e) >= 4; e = e[4:] {
+				v := binary.BigEndian.Uint32(e)
+				labels = append(labels, record.MPLSLabel{
+					Label: v >> 12,
+					TC:    uint8(v>>9) & 7,
+					S:     v&0x100 != 0,
+					TTL:   uint8(v),
+				})
+			}
+		}
+		obj = obj[n:]
+	}
+	return labels
 }

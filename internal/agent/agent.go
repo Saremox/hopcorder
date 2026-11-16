@@ -387,6 +387,9 @@ func buildRecord(agentID string, t *Target, ip netip.Addr, start time.Time, res 
 		if h.Status == record.StatusUnreachable {
 			hop.Code = record.IntPtr(h.Code)
 		}
+		if h.Status == record.StatusTTLExpired || h.Status == record.StatusUnreachable {
+			hop.MPLS = h.MPLS
+		}
 		hops[i] = hop
 	}
 	af := 4
