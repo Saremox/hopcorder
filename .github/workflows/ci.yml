@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: |
+          go vet ./...
+          go vet -tags rawsock ./...
+      - name: test
+        run: go test -race ./...
+      - name: build
+        run: go build ./cmd/hopcorder
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+
+  rawsock:
+    # GitHub-hosted runners grant passwordless sudo, so the raw-socket tests can
+    # run with CAP_NET_RAW (and CAP_SYS_ADMIN for the netns topology test).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build test binary
+        run: go test -c -tags rawsock -race -o probe.test ./internal/probe
+      - name: run with capabilities
+        run: sudo ./probe.test -test.v -test.count=1
