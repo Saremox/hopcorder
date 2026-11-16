@@ -188,9 +188,18 @@ func Variables(sql string) []string {
 }
 
 // Interpolate replaces template variables like Grafana does before a query
-// reaches the data source: ${name:sqlstring} becomes a quoted SQL string
-// literal, every other form the raw value. Unknown variables and the
-// plugin's $__ macros are left alone.
+// reaches the data source. The formats are Grafana's:
+//
+//   - ${name:percentencode}: encodeURIComponent, then !'()* as well, so the
+//     result only contains [A-Za-z0-9-_.~%]. The dashboards put every value
+//     into SQL this way, as decodeURLComponent('${name:percentencode}'):
+//     nothing a value contains can end the string literal.
+//   - ${name:sqlstring}: ' doubled. Not safe for ClickHouse, which also
+//     treats \' as an escaped quote; the dashboards do not use it (the
+//     tests check that).
+//   - any other form: the raw value.
+//
+// Unknown variables and the plugin's $__ macros are left alone.
 func Interpolate(sql string, vars map[string]string) string {
 	return varRef.ReplaceAllStringFunc(sql, func(ref string) string {
 		m := varRef.FindStringSubmatch(ref)
@@ -199,11 +208,30 @@ func Interpolate(sql string, vars map[string]string) string {
 		if !ok || strings.HasPrefix(name, "__") {
 			return ref
 		}
-		if format == "sqlstring" {
+		switch format {
+		case "percentencode":
+			return PercentEncode(v)
+		case "sqlstring":
 			return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 		}
 		return v
 	})
+}
+
+// PercentEncode is Grafana's percentencode variable format: every byte
+// outside [A-Za-z0-9-_.~] as %XX.
+func PercentEncode(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_', c == '.', c == '~':
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+	return b.String()
 }
 
 var macroRef = regexp.MustCompile(`\$__(timeFilter|timeInterval)\(([^)]*)\)|\$__(fromTime|toTime)\b`)
