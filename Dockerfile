@@ -2,7 +2,8 @@
 # Two images from one build: `--target agent` and `--target server` (the
 # default). Static binaries on scratch, cross-compiled for the target platform
 # (docker buildx build --platform linux/amd64,linux/arm64 ...).
-FROM --platform=$BUILDPLATFORM golang:1.27 AS build
+# Pinned by digest (Dependabot updates it); the tag says which Go it is.
+FROM --platform=$BUILDPLATFORM golang:1.27@sha256:fe517acaa580cc7915457080f850c37e618b3c1e750f98b58fc6429b605147a1 AS build
 WORKDIR /src
 COPY . .
 ARG TARGETOS TARGETARCH

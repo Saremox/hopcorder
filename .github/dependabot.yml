@@ -1,0 +1,23 @@
+# Keeps pinned dependencies current: GitHub Actions (pinned to commits), the
+# Go base image (pinned by digest), Go modules and the UI's npm packages.
+# Minor and patch updates are grouped into one PR per ecosystem and week.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      actions: {update-types: [minor, patch]}
+  - package-ecosystem: docker
+    directory: /
+    schedule: {interval: weekly}
+  - package-ecosystem: gomod
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      go: {update-types: [minor, patch]}
+  - package-ecosystem: npm
+    directory: /ui
+    schedule: {interval: weekly}
+    groups:
+      ui: {update-types: [minor, patch]}

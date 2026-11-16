@@ -69,6 +69,24 @@ ingress:
           pathType: Prefix
   tls: []
 
+# Who may connect to the server. Clients inside the cluster reach the
+# Service directly, around whatever authentication the ingress does; with a
+# CNI that enforces NetworkPolicy, this limits them to the peers listed in
+# `from` (NetworkPolicy "from" entries).
+networkPolicy:
+  enabled: false
+  from:
+    # hopcorder agents in any namespace (pod network; agents with
+    # hostNetwork come from node addresses: add an ipBlock for those).
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: hopcorder-agent
+    # Add your ingress controller and Prometheus, e.g.
+    # - namespaceSelector:
+    #     matchLabels:
+    #       kubernetes.io/metadata.name: ingress-nginx
+
 # Prometheus Operator ServiceMonitor for /metrics (config.metrics: true).
 serviceMonitor:
   enabled: false
