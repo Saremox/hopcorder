@@ -245,3 +245,13 @@ func TestLoad(t *testing.T) {
 		t.Errorf("err = %v, want it to name the file", err)
 	}
 }
+
+func TestShippedExampleIsValid(t *testing.T) {
+	c, err := Load("../../deploy/agent.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Finalize(FinalizeOptions{Stat: statOK}); err != nil {
+		t.Fatal(err)
+	}
+}
