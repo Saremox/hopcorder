@@ -93,7 +93,8 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 	case strings.Contains(q, "FROM cycles WHERE agent_id = {agent:String}"): // restore
 		var cs []map[string]any
 		for _, c := range f.rows["cycles"] {
-			if f.stream(c, p) && num(c["seq"]) < before {
+			// ts is stored as clickhouse.Time, which sorts like the time.
+			if f.stream(c, p) && num(c["seq"]) < before && c["ts"].(string) >= p["since"] {
 				cs = append(cs, c)
 			}
 		}
@@ -359,8 +360,16 @@ func TestEventInsertFailureDoesNotFailIngest(t *testing.T) {
 
 func newTestServer(t *testing.T, st *fakeStore) (*Server, *httptest.Server) {
 	t.Helper()
+	return newTestServerAt(t, st, t0.Add(time.Hour))
+}
+
+// newTestServerAt is newTestServer with its clock at now (records' ts must
+// lie within a month before it).
+func newTestServerAt(t *testing.T, st Store, now time.Time) (*Server, *httptest.Server) {
+	t.Helper()
 	s := New(Options{Store: st, Enricher: fakeEnrich{}, Logger: quietLogger(), Registry: prometheus.NewRegistry(),
 		MaxBodyBytes: 1 << 20, MaxDecodedBytes: 4 << 20})
+	s.ingester.now = func() time.Time { return now }
 	s.SetReady()
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
@@ -599,7 +608,7 @@ func TestQueryAPI(t *testing.T) {
 // dropped as duplicates: the agent keeps it and its operator notices.
 func TestStaleBatchRefused(t *testing.T) {
 	st := newFakeStore()
-	_, ts := newTestServer(t, st)
+	_, ts := newTestServerAt(t, st, t0.Add((staleWindow+50)*5*time.Second)) // the first record's ts
 	if code, res := post(t, ts.URL, "", ndjson(mk("lab", staleWindow+50, pathA...))); code != 200 || res.Accepted != 1 {
 		t.Fatalf("first: %d %+v", code, res)
 	}

@@ -346,9 +346,47 @@ func TestValidateRejects(t *testing.T) {
 		{"too many mpls labels", func(r *Record) {
 			r.Hops[0].MPLS = make([]MPLSLabel, MaxMPLSLabels+1)
 		}},
+		// IPv6 zones (second security review): netip accepts any text after
+		// "%", so one address could carry a megabyte of anything.
+		{"zone on a hop", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("2001:db8::9")
+			r.Hops[0].IP, r.Hops[1].IP = ip("fe80::1%eth0"), ip("2001:db8::9")
+		}},
+		{"zone on a loop", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("2001:db8::9")
+			r.Hops[0].IP, r.Hops[1].IP = ip("fe80::1"), ip("2001:db8::9")
+			r.Loops = []Loop{{IP: ip("fe80::1%eth0"), TTLs: []int{1, 2}}}
+		}},
+		{"long target zone", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("fe80::9%"+strings.Repeat("z", MaxZoneLen+1))
+			r.Hops[0].IP, r.Hops[1].IP = ip("fe80::1"), ip("fe80::9")
+		}},
+		{"target zone with markup", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("fe80::9%<b>")
+			r.Hops[0].IP, r.Hops[1].IP = ip("fe80::1"), ip("fe80::9")
+		}},
+		{"IPv6 hop in an IPv4 record", func(r *Record) { r.Hops[0].IP = ip("2001:db8::1") }},
+		{"IPv4 hop in an IPv6 record", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("2001:db8::9")
+			r.Hops[1].IP = ip("2001:db8::9")
+		}},
+		{"IPv4-mapped hop in an IPv6 record", func(r *Record) {
+			r.AF, r.TargetIP = 6, ip("2001:db8::9")
+			r.Hops[0].IP, r.Hops[1].IP = ip("::ffff:10.0.0.1"), ip("2001:db8::9")
+		}},
+		{"IPv6 loop in an IPv4 record", func(r *Record) {
+			r.Loops = []Loop{{IP: ip("2001:db8::1"), TTLs: []int{1, 2}}}
+		}},
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("baseline invalid: %v", err)
+	}
+	// A link-local target keeps its (short) zone.
+	r6 := good()
+	r6.AF, r6.TargetIP = 6, ip("fe80::9%eth0.100")
+	r6.Hops[0].IP, r6.Hops[1].IP = ip("fe80::1"), ip("fe80::9")
+	if err := r6.Validate(); err != nil {
+		t.Errorf("link-local target with a zone: %v", err)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -473,6 +511,23 @@ func TestPathTrackerChangeDetail(t *testing.T) {
 	}
 }
 
+// Validation errors end up in responses and logs: they never quote what
+// the record carried.
+func TestValidateErrorsQuoteNoValues(t *testing.T) {
+	junk := strings.Repeat("<junk>", 100)
+	r := &Record{Schema: 1, AgentID: junk, TS: time.Unix(1, 0), Target: junk, TargetIP: ip("fe80::1%" + junk),
+		AF: 4, Protocol: junk, PathHash: junk, Loops: []Loop{},
+		Hops: []Hop{{TTL: 1, Status: Status(junk)}, {TTL: 2, Status: StatusTTLExpired, IP: ip("fe80::2%" + junk), RTTMicros: 1}}}
+	r.PathLen = 2
+	err := r.Validate()
+	if err == nil {
+		t.Fatal("accepted")
+	}
+	if strings.Contains(err.Error(), "junk") || len(err.Error()) > 1000 {
+		t.Errorf("error quotes the record: %v", err)
+	}
+}
+
 func TestValidNames(t *testing.T) {
 	for _, s := range []string{"lab-01", "node.example.net", "agent_7", "fe80::1"} {
 		if !ValidAgentID(s) {
@@ -487,6 +542,12 @@ func TestValidNames(t *testing.T) {
 	for _, s := range []string{"", "a b", `a\b`, "a'b", "a/b", "ä"} {
 		if ValidAgentID(s) || ValidTarget(s) {
 			t.Errorf("%q accepted", s)
+		}
+	}
+	// An address literal's zone is an interface name or index.
+	for _, s := range []string{"fe80::1%" + strings.Repeat("e", MaxZoneLen+1), "fe80::1%a:b", "fe80::1%a%b"} {
+		if ValidTarget(s) {
+			t.Errorf("target %q accepted", s)
 		}
 	}
 }

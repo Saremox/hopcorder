@@ -29,8 +29,10 @@ const (
 	DefaultQueryConcurrency  = 8
 	DefaultMaxResponseBytes  = ByteSize(32 << 20)
 	DefaultMaxQueryMemory    = ByteSize(1 << 30)
-	DefaultMaxStreams        = 100000
+	DefaultMaxStreams        = 20000
+	DefaultMaxAgents         = 10000
 	DefaultStreamIdleTimeout = time.Hour
+	DefaultMaxRecordAge      = 720 * time.Hour
 	defaultClickHouseTimeout = 30 * time.Second
 	DefaultRetentionDays     = 90
 )
@@ -78,11 +80,16 @@ type IngestConfig struct {
 	// MaxConcurrent ingest requests are processed at once; more wait up to
 	// 10s, then get 503 and the agent retries.
 	MaxConcurrent int `yaml:"max_concurrent"`
-	// MaxStreams streams (agent, target, protocol, flow) are tracked in
-	// memory; idle ones are dropped after StreamIdleTimeout. A dropped
-	// stream is restored from ClickHouse when it comes back.
+	// MaxStreams streams (agent, target, protocol, flow) and MaxAgents
+	// agents are tracked in memory; idle ones are dropped after
+	// StreamIdleTimeout, the least recently used beyond the limits. A
+	// dropped stream is restored from ClickHouse when it comes back.
 	MaxStreams        int      `yaml:"max_streams"`
+	MaxAgents         int      `yaml:"max_agents"`
 	StreamIdleTimeout Duration `yaml:"stream_idle_timeout"`
+	// MaxRecordAge refuses records older than this (and more than a day
+	// in the future): it must exceed the agents' spool max_age.
+	MaxRecordAge Duration `yaml:"max_record_age"`
 }
 
 // QueryConfig bounds the read API.
@@ -180,7 +187,9 @@ func (c *ServerConfig) Finalize() error {
 	}
 	setInt(&c.Ingest.MaxConcurrent, DefaultIngestConcurrency)
 	setInt(&c.Ingest.MaxStreams, DefaultMaxStreams)
+	setInt(&c.Ingest.MaxAgents, DefaultMaxAgents)
 	setDur(&c.Ingest.StreamIdleTimeout, DefaultStreamIdleTimeout)
+	setDur(&c.Ingest.MaxRecordAge, DefaultMaxRecordAge)
 	setInt(&c.Query.MaxConcurrent, DefaultQueryConcurrency)
 	if c.Query.MaxResponseBytes == 0 {
 		c.Query.MaxResponseBytes = DefaultMaxResponseBytes
@@ -254,9 +263,12 @@ func (c *ServerConfig) Finalize() error {
 	if c.Ingest.MaxBodyBytes < 1<<20 || c.Ingest.MaxDecodedBytes < c.Ingest.MaxBodyBytes {
 		fail("ingest: need max_body_bytes >= 1MiB and max_decoded_bytes >= max_body_bytes")
 	}
-	if c.Ingest.MaxConcurrent < 1 || c.Ingest.MaxStreams < 1 || c.Ingest.StreamIdleTimeout.D() < time.Minute ||
-		c.Query.MaxConcurrent < 1 {
-		fail("ingest/query: max_concurrent and max_streams must be positive, stream_idle_timeout at least 1m")
+	if c.Ingest.MaxConcurrent < 1 || c.Ingest.MaxStreams < 1 || c.Ingest.MaxAgents < 1 ||
+		c.Ingest.StreamIdleTimeout.D() < time.Minute || c.Query.MaxConcurrent < 1 {
+		fail("ingest/query: max_concurrent, max_streams and max_agents must be positive, stream_idle_timeout at least 1m")
+	}
+	if c.Ingest.MaxRecordAge.D() < time.Hour {
+		fail("ingest.max_record_age: must be at least 1h (and longer than the agents' spool max_age)")
 	}
 	if c.Query.MaxResponseBytes < 1<<20 || c.Query.MaxMemoryBytes < 16<<20 {
 		fail("query: max_response_bytes must be at least 1MiB, max_memory_bytes at least 16MiB")

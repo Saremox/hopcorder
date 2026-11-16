@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -32,6 +34,8 @@ const (
 	DefaultMaxConcurrentQueries = 8
 	maxLineBytes                = 1 << 20 // one record
 	maxReportedErrors           = 5
+	// maxErrorLen bounds an error reported to the agent and logged.
+	maxErrorLen = 200
 	// maxZstdWindow caps the window a zstd frame may declare, which the
 	// decoder allocates before reading data (an agent's frames are no
 	// larger than its batch, 1 MiB by default).
@@ -43,6 +47,17 @@ const (
 	// queueWait is how long a request waits for a free slot before the
 	// server answers 503 (agents retry later).
 	queueWait = 10 * time.Second
+	// Request bodies are read before a request takes an ingest slot, so a
+	// slow client holds no slot: at most maxReading at once, each within
+	// bodyReadTimeout (agents give a request 30s), and together buffering
+	// at most the larger of 32 MiB and twice max_body_bytes.
+	maxReading      = 64
+	bodyReadTimeout = 20 * time.Second
+	minReadBuffer   = 32 << 20
+	readChunk       = 64 << 10
+	// maxFutureSkew is how far ahead of the server's clock a record's ts
+	// may be.
+	maxFutureSkew = 24 * time.Hour
 )
 
 // Pinger checks that storage is reachable.
@@ -73,10 +88,14 @@ type Options struct {
 	// name in their Host header, against DNS rebinding; empty allows any.
 	// /healthz, /readyz and /metrics answer every host.
 	AllowedHosts []string
-	// MaxStreams and StreamIdleTTL bound the per-stream state kept in memory
-	// (see Ingester).
+	// MaxStreams, MaxAgents and StreamIdleTTL bound the per-stream and
+	// per-agent state kept in memory (see Ingester).
 	MaxStreams    int
+	MaxAgents     int
 	StreamIdleTTL time.Duration
+	// MaxRecordAge refuses records older than this (default 30 days);
+	// records more than a day ahead of the server's clock are refused too.
+	MaxRecordAge time.Duration
 	// UI serves the web UI under /ui/ (internal/ui); nil serves none.
 	UI http.Handler
 }
@@ -95,6 +114,11 @@ type Server struct {
 	ready     atomic.Bool
 	ingestSem chan struct{}
 	querySem  chan struct{}
+	// readSem bounds the requests whose bodies are being read; readBuf
+	// holds one token per readChunk bytes buffered for them.
+	readSem     chan struct{}
+	readBuf     chan struct{}
+	bodyTimeout time.Duration
 }
 
 // New returns a server. Call SetReady once migrations have been applied.
@@ -129,11 +153,20 @@ func New(o Options) *Server {
 	if o.MaxStreams > 0 {
 		in.maxStreams = o.MaxStreams
 	}
+	if o.MaxAgents > 0 {
+		in.maxAgents = o.MaxAgents
+	}
 	if o.StreamIdleTTL > 0 {
 		in.idleTTL = o.StreamIdleTTL
 	}
+	if o.MaxRecordAge > 0 {
+		in.maxRecordAge = o.MaxRecordAge
+	}
+	readBuf := max(minReadBuffer, 2*o.MaxBodyBytes)
 	return &Server{opts: o, log: o.Logger, metrics: m, ingester: in,
-		ingestSem: make(chan struct{}, o.MaxConcurrentIngest), querySem: make(chan struct{}, o.MaxConcurrentQueries)}
+		ingestSem: make(chan struct{}, o.MaxConcurrentIngest), querySem: make(chan struct{}, o.MaxConcurrentQueries),
+		readSem: make(chan struct{}, maxReading), readBuf: make(chan struct{}, (readBuf+readChunk-1)/readChunk),
+		bodyTimeout: bodyReadTimeout}
 }
 
 // acquire takes a slot of sem, waiting up to queueWait.
@@ -239,6 +272,10 @@ type errorBody struct {
 // cannot fix them) and reported back; the rest are stored. A storage
 // failure returns 503 so the agent retries the whole batch, which the
 // deduplication makes safe.
+//
+// The body is read first, under its own bounds (readBody); only then does
+// the request take one of the max_concurrent ingest slots, so the slots are
+// spent on decoding and storing, never on waiting for a client.
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	code := http.StatusOK
 	defer func() { s.metrics.request(code) }()
@@ -259,78 +296,32 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusUnsupportedMediaType, "Content-Type must be application/x-ndjson")
 		return
 	}
+	enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
+	switch enc {
+	case "zstd", "gzip", "", "identity":
+	default:
+		fail(http.StatusUnsupportedMediaType, truncate("unsupported Content-Encoding "+enc))
+		return
+	}
+	if r.ContentLength > s.opts.MaxBodyBytes {
+		fail(http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	raw, release, c, err := s.readBody(w, r)
+	if err != nil {
+		fail(c, err.Error())
+		return
+	}
+	defer release()
 	if !acquire(r.Context(), s.ingestSem) {
 		fail(http.StatusServiceUnavailable, "server busy; retry later")
 		return
 	}
 	defer func() { <-s.ingestSem }()
-	body := http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
-	var in io.Reader = body
-	switch enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc {
-	case "zstd":
-		dec, err := zstd.NewReader(body, zstd.WithDecoderConcurrency(1),
-			zstd.WithDecoderMaxMemory(uint64(s.opts.MaxDecodedBytes)),                     //nolint:gosec // positive
-			zstd.WithDecoderMaxWindow(uint64(min(s.opts.MaxDecodedBytes, maxZstdWindow)))) //nolint:gosec // positive
-		if err != nil {
-			fail(http.StatusBadRequest, "bad zstd stream: "+err.Error())
-			return
-		}
-		defer dec.Close()
-		in = dec
-	case "gzip":
-		gz, err := gzip.NewReader(body)
-		if err != nil {
-			fail(http.StatusBadRequest, "bad gzip stream: "+err.Error())
-			return
-		}
-		defer gz.Close()
-		in = gz
-	case "", "identity":
-	default:
-		fail(http.StatusUnsupportedMediaType, "unsupported Content-Encoding "+enc)
-		return
-	}
-	limited := &io.LimitedReader{R: in, N: s.opts.MaxDecodedBytes + 1}
 
-	var (
-		recs []*record.Record
-		res  IngestResult
-	)
-	sc := bufio.NewScanner(limited)
-	sc.Buffer(make([]byte, 64<<10), maxLineBytes)
-	line := 0
-	for sc.Scan() {
-		line++
-		b := sc.Bytes()
-		if len(strings.TrimSpace(string(b))) == 0 {
-			continue
-		}
-		rec, err := parseRecord(b)
-		if err != nil {
-			res.Rejected++
-			if len(res.Errors) < maxReportedErrors {
-				res.Errors = append(res.Errors, fmt.Sprintf("line %d: %v", line, err))
-			}
-			continue
-		}
-		recs = append(recs, rec)
-	}
-	if err := sc.Err(); err != nil {
-		var tooBig *http.MaxBytesError
-		switch {
-		case errors.As(err, &tooBig):
-			fail(http.StatusRequestEntityTooLarge, "request body too large")
-		case errors.Is(err, bufio.ErrTooLong):
-			fail(http.StatusRequestEntityTooLarge, "a line exceeds the record size limit")
-		case errors.Is(err, zstd.ErrDecoderSizeExceeded), errors.Is(err, zstd.ErrWindowSizeExceeded):
-			fail(http.StatusRequestEntityTooLarge, "decompressed body too large")
-		default:
-			fail(http.StatusBadRequest, "cannot read body: "+err.Error())
-		}
-		return
-	}
-	if limited.N <= 0 {
-		fail(http.StatusRequestEntityTooLarge, "decompressed body too large")
+	recs, res, c, msg := s.decode(enc, raw)
+	if c != 0 {
+		fail(c, msg)
 		return
 	}
 	agents, streams := map[string]bool{}, map[streamKey]bool{}
@@ -362,10 +353,145 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, res)
 }
 
-func parseRecord(b []byte) (*record.Record, error) {
+// readBody reads the compressed request body into memory, at most
+// max_body_bytes: with at most maxReading requests reading at once, each
+// within bodyReadTimeout, and all of them holding at most cap(readBuf)
+// chunks of readChunk bytes, so slow or stalled clients cost neither ingest
+// slots nor unbounded memory. release returns the chunks to readBuf; on an
+// error, code is the status to answer.
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request) (body io.Reader, release func(), code int, err error) {
+	if !acquire(r.Context(), s.readSem) {
+		return nil, nil, http.StatusServiceUnavailable, errors.New("server busy; retry later")
+	}
+	defer func() { <-s.readSem }()
+	deadline := time.Now().Add(s.bodyTimeout)
+	// Not supported by every ResponseWriter (tests); the server's own
+	// ReadTimeout still applies then.
+	_ = http.NewResponseController(w).SetReadDeadline(deadline)
+	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	defer cancel()
+	held := 0
+	release = func() {
+		for range held {
+			<-s.readBuf
+		}
+		held = 0
+	}
+	in := http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
+	var chunks []io.Reader
+	var total int64
+	for {
+		select {
+		case s.readBuf <- struct{}{}:
+			held++
+		case <-ctx.Done():
+			release()
+			if r.Context().Err() == nil {
+				return nil, nil, http.StatusServiceUnavailable, errors.New("server busy; retry later")
+			}
+			return nil, nil, http.StatusRequestTimeout, errors.New("request body not received in time")
+		}
+		size := int64(readChunk)
+		if r.ContentLength >= 0 {
+			size = min(size, max(r.ContentLength-total, 1))
+		}
+		c := make([]byte, size)
+		n, err := io.ReadFull(in, c)
+		chunks, total = append(chunks, bytes.NewReader(c[:n])), total+int64(n)
+		var tooBig *http.MaxBytesError
+		switch {
+		case err == nil:
+			continue
+		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+			return io.MultiReader(chunks...), release, 0, nil
+		case errors.As(err, &tooBig):
+			release()
+			return nil, nil, http.StatusRequestEntityTooLarge, errors.New("request body too large")
+		case errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil:
+			release()
+			return nil, nil, http.StatusRequestTimeout, errors.New("request body not received in time")
+		default:
+			release()
+			return nil, nil, http.StatusBadRequest, errors.New("cannot read body")
+		}
+	}
+}
+
+// decode decompresses and parses raw. A non-zero code is a failure of the
+// whole request; invalid records are only counted and reported in res.
+func (s *Server) decode(enc string, raw io.Reader) (recs []*record.Record, res IngestResult, code int, msg string) {
+	in := raw
+	switch enc {
+	case "zstd":
+		dec, err := zstd.NewReader(in, zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderMaxMemory(uint64(s.opts.MaxDecodedBytes)),                     //nolint:gosec // positive
+			zstd.WithDecoderMaxWindow(uint64(min(s.opts.MaxDecodedBytes, maxZstdWindow)))) //nolint:gosec // positive
+		if err != nil {
+			return nil, res, http.StatusBadRequest, truncate("bad zstd stream: " + err.Error())
+		}
+		// Closed before the records are stored: it holds the window.
+		defer dec.Close()
+		in = dec
+	case "gzip":
+		gz, err := gzip.NewReader(in)
+		if err != nil {
+			return nil, res, http.StatusBadRequest, truncate("bad gzip stream: " + err.Error())
+		}
+		defer gz.Close()
+		in = gz
+	}
+	limited := &io.LimitedReader{R: in, N: s.opts.MaxDecodedBytes + 1}
+	sc := bufio.NewScanner(limited)
+	sc.Buffer(make([]byte, 64<<10), maxLineBytes)
+	now := s.ingester.now()
+	line := 0
+	for sc.Scan() {
+		line++
+		b := sc.Bytes()
+		if len(bytes.TrimSpace(b)) == 0 {
+			continue
+		}
+		rec, err := parseRecord(b, now, s.ingester.maxRecordAge)
+		if err != nil {
+			res.Rejected++
+			if len(res.Errors) < maxReportedErrors {
+				res.Errors = append(res.Errors, truncate(fmt.Sprintf("line %d: %v", line, err)))
+			}
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	if err := sc.Err(); err != nil {
+		switch {
+		case errors.Is(err, bufio.ErrTooLong):
+			return nil, res, http.StatusRequestEntityTooLarge, "a line exceeds the record size limit"
+		case errors.Is(err, zstd.ErrDecoderSizeExceeded), errors.Is(err, zstd.ErrWindowSizeExceeded):
+			return nil, res, http.StatusRequestEntityTooLarge, "decompressed body too large"
+		default:
+			return nil, res, http.StatusBadRequest, truncate("cannot read body: " + err.Error())
+		}
+	}
+	if limited.N <= 0 {
+		return nil, res, http.StatusRequestEntityTooLarge, "decompressed body too large"
+	}
+	return recs, res, 0, ""
+}
+
+// truncate cuts an error message reported to agents and logged to
+// maxErrorLen bytes (of valid UTF-8).
+func truncate(s string) string {
+	if len(s) <= maxErrorLen {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxErrorLen-3], "") + "..."
+}
+
+// parseRecord decodes and validates one line. Its errors name fields, not
+// what they held: they are reported to the agent and logged.
+func parseRecord(b []byte, now time.Time, maxAge time.Duration) (*record.Record, error) {
 	var rec record.Record
 	if err := json.Unmarshal(b, &rec); err != nil {
-		return nil, fmt.Errorf("not a record: %w", err)
+		return nil, jsonError(err)
 	}
 	if rec.Schema != record.SchemaVersion {
 		return nil, fmt.Errorf("unsupported schema %d", rec.Schema)
@@ -376,7 +502,31 @@ func parseRecord(b []byte) (*record.Record, error) {
 	if err := rec.Validate(); err != nil {
 		return nil, err
 	}
+	// Bounding ts also bounds the monthly partitions a batch can touch.
+	switch {
+	case rec.TS.Before(now.Add(-maxAge)):
+		return nil, fmt.Errorf("ts more than %s old (ingest.max_record_age)", maxAge)
+	case rec.TS.After(now.Add(maxFutureSkew)):
+		return nil, fmt.Errorf("ts more than %s ahead of the server's clock", maxFutureSkew)
+	}
 	return &rec, nil
+}
+
+// jsonError describes a decoding error without the value that caused it
+// (encoding/json quotes values of addresses and times in its messages).
+func jsonError(err error) error {
+	var syn *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &syn):
+		return fmt.Errorf("not a record: invalid JSON at byte %d", syn.Offset)
+	case errors.As(err, &typ) && typ.Field != "":
+		return fmt.Errorf("not a record: invalid value for %s", truncate(typ.Field))
+	case errors.As(err, &typ):
+		return errors.New("not a record: want a JSON object")
+	default:
+		return errors.New("not a record: invalid address or ts")
+	}
 }
 
 // queryParams holds the common read-API parameters.

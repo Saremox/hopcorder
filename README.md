@@ -447,15 +447,27 @@ errors show what happened.
 the content types a web page can send without a CORS preflight are refused),
 bodies up to `ingest.max_body_bytes` (8 MiB) and `max_decoded_bytes` (32 MiB),
 at most 16 agents and 4096 streams per request, and `ingest.max_concurrent`
-requests at once. Records are validated against the schema's limits:
-`agent_id` from `[A-Za-z0-9._:-]` (at most 128 characters), targets from
-`[A-Za-z0-9._:%-]` (255), protocol `icmp`, `udp` or `tcp`, at most 255 hops and
-16 MPLS labels per hop. The server keeps state for at most
-`ingest.max_streams` streams and drops idle ones after `stream_idle_timeout`
-(they are restored from ClickHouse when they return). Read-API queries are
-limited to `query.max_concurrent` at once and to `query.max_memory_bytes`
-(1 GiB) each in ClickHouse, run read-only, and are stopped there after the
-client timeout or when the client goes away.
+requests at once. A body is read in full (within 20 s, at most 64 at once,
+buffering together at most 32 MiB or twice `max_body_bytes`) before its
+request waits for one of the `max_concurrent` slots, so slow clients hold
+none. Records are validated against the schema's limits: `agent_id` from
+`[A-Za-z0-9._:-]` (at most 128 characters), targets from `[A-Za-z0-9._:%-]`
+(255; an IPv6 zone at most 15 characters from `[A-Za-z0-9._-]`), protocol
+`icmp`, `udp` or `tcp`, at most 255 hops and 16 MPLS labels per hop, hop and
+loop addresses of the record's address family and without a zone, and `ts`
+at most `ingest.max_record_age` (30 days) old and at most a day ahead of the
+server's clock. Errors reported for rejected records are at most 200 bytes and
+never quote the record. The server keeps state for at most
+`ingest.max_streams` streams (20,000; 1 to 9 KiB each) and `ingest.max_agents`
+agents (10,000), drops idle ones after `stream_idle_timeout`, and the least
+recently used beyond the limits; they are restored from ClickHouse when they
+return, at most 256 per request within 5 s (the rest with their next batch,
+counted in `hopcorder_server_unrestored_cycles_total`). Running in a cgroup
+with a memory limit (a container, or a systemd unit with `MemoryMax=`), the
+server sets the Go memory limit to 90% of it unless `GOMEMLIMIT` is set.
+Read-API queries are limited to `query.max_concurrent` at once and to
+`query.max_memory_bytes` (1 GiB) each in ClickHouse, run read-only, and are
+stopped there after the client timeout or when the client goes away.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
 the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on

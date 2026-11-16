@@ -91,6 +91,9 @@ func runServer(args []string, stderr io.Writer) int {
 		return 2
 	}
 	logger := newLogger(cfg.Log, stderr)
+	if limit := setMemoryLimit(os.DirFS("/")); limit > 0 {
+		logger.Info("Go memory limit set from the cgroup's (set GOMEMLIMIT to override)", "bytes", limit)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := serve(ctx, cfg, logger, nil); err != nil {
@@ -152,7 +155,8 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 	srv := server.New(server.Options{Store: ch, Pinger: ch, Enricher: en, Logger: logger, Registry: reg,
 		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
 		MaxConcurrentIngest: cfg.Ingest.MaxConcurrent, MaxConcurrentQueries: cfg.Query.MaxConcurrent,
-		MaxStreams: cfg.Ingest.MaxStreams, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
+		MaxStreams: cfg.Ingest.MaxStreams, MaxAgents: cfg.Ingest.MaxAgents, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
+		MaxRecordAge:     cfg.Ingest.MaxRecordAge.D(),
 		MaxResponseBytes: int64(cfg.Query.MaxResponseBytes), MaxQueryMemory: int64(cfg.Query.MaxMemoryBytes),
 		AllowedHosts: cfg.HostAllowlist(), UI: uiHandler})
 

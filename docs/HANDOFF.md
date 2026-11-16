@@ -1090,3 +1090,126 @@ decisions:
   the dashboards' `percentencode`, read-API parameter escaping, and rDNS
   (Go's resolver drops PTR names that are not host names; bounded cache and
   queue).
+
+**Ingest and storage**
+- **IPv6 zones are bounded** (`record.Validate`, `record.ValidTarget`).
+  netip accepts any text after `%`, so `target_ip`, hop and loop addresses
+  could carry a megabyte of anything (quotes, markup, newlines): 30 zstd
+  requests totalling 126 KiB made the server hold 953 MiB of stream state,
+  and the text was stored and served by the read API. Hop and loop
+  addresses may not have a zone at all (routers' addresses never do; the
+  agent strips them). `target_ip` keeps a zone of at most 15 characters from
+  `[A-Za-z0-9._-]` (an interface name or index), because a link-local target
+  such as `fe80::1%eth0` is legitimate; `ValidTarget` applies the same rule
+  to address-literal targets, so the agent's config check refuses what the
+  server would. Hop and loop addresses must also match the record's `af`
+  (IPv4-mapped ones are not IPv6).
+- **A record's `ts` must lie within [now − `ingest.max_record_age`, now +
+  1 day]** (default 720h; the agent's spool keeps records for 7 days).
+  Outside, the record is rejected like any invalid one. Before, any ts from
+  1970 to 2262 was accepted, and tables are partitioned by month: 28
+  requests (6 s) created 2290 partitions in `cycles`, permanent because the
+  TTL's `toDateTime(ts)` wraps past 2106, and a restore of an unrelated
+  agent's stream went from 16 ms to 270 ms. An agent offline for longer
+  than `max_record_age` loses its older records (raise the option if
+  spools are kept longer).
+- **Restores read a bounded window.** The sort key is (agent_id, target,
+  protocol, ts) and flow_id and seq are not in it, so the replay query read
+  the whole history of every flow of the agent, target and protocol (2M rows
+  / 247 MiB per restore in the measurement; 1M rows for a single-flow
+  stream). It now looks at the day before the new cycle first and, only if
+  that holds none of the stream's cycles, at `max_record_age` before it
+  (measured: unbounded 199k rows, 30 days 118k, one day 27k for a 60-day
+  stream). The outage-cycle count is bounded by the outage's start. The
+  open-outage lookup is not bounded by time: an outage can be older than
+  any window, and `outages` holds a row per outage, not per cycle. A change
+  across a gap longer than `max_record_age` is not reported.
+- **Restores have their own budget**: at most 256 per request, within 5 s
+  of its first restore, separate from the 30 s insert budget; storing a
+  batch's events has its own 10 s. Before, one request with 4096 new
+  streams held an ingest slot for 20 s of serial restore queries, and slow
+  restores used up the insert budget so that the batch's events were lost.
+- **A stream whose restore fails or does not fit the budget stays
+  unloaded**: its cycles in that batch derive no events (counted in
+  `hopcorder_server_unrestored_cycles_total`, one warning per batch) and it
+  is restored with its next batch, from storage, which then holds them.
+  Before, it started from scratch: an outage open in storage was never
+  closed and a second one opened, permanently. If a restore finds the
+  stream down but no open outage stored (its first cycle was in a skipped
+  batch, or its event insert failed), it opens one at the first of the
+  trailing unreached cycles it replayed. Consequence: if restores fail for
+  good (ClickHouse broken for reads only), streams derive no events until
+  they succeed; the metric and the warning show it.
+- **Request bodies are read before a request takes an ingest slot**, into
+  64 KiB chunks: at most 64 requests read at once (others wait 10 s, then
+  503), each body within 20 s (`http.ResponseController.SetReadDeadline`;
+  agents give a request 30 s; then 408), and all of them together hold at
+  most the larger of 32 MiB and twice `max_body_bytes`; a request waits for
+  chunks others hold rather than adding memory. Before, the slot was taken
+  first, so four connections trickling bodies blocked all ingest for the
+  server's 2-minute ReadTimeout. A slow client can still fill the 64
+  reading slots, which needs 64 connections renewed every 20 s; a buffering
+  reverse proxy (nginx's default) removes that.
+- **Cycles are inserted in parts of at most 8 MiB**, each moving the
+  high-water mark; if a later part fails, the retry stores only the rest,
+  and the events of the stored parts are still derived. Enrichment makes a
+  row up to about seven times its record (a 128-byte AS name and a 253-byte
+  PTR name on every hop, which an attacker gets by putting one address with
+  a PTR it controls at every TTL): one 19 KiB request (31 MiB decoded) held
+  507 MiB at insert time, now 65 MiB. An agent's normal batch (1 MiB) is
+  still one insert. The zstd decoder (and its window) is closed before the
+  records are stored. A request being processed holds about twice
+  `max_decoded_bytes`.
+- **The Go memory limit follows the cgroup's**: at start, unless GOMEMLIMIT
+  is set, the server sets it to 90% of the memory limit of its cgroup (v2:
+  the lowest `memory.max` from its own cgroup up; v1:
+  `memory.limit_in_bytes`); no limit, no change. Without it the heap grows
+  to twice what is live before a collection, so 600 MiB of live state is
+  OOM-killed in a 1 GiB container.
+- **`ingest.max_streams` defaults to 20,000** (was 100,000). A stream costs
+  about 1 KiB (15 IPv4 hops) to 9 KiB (255 IPv6 hops, 255-character target),
+  measured; 100,000 worst-case streams were 860 MiB, more than the Helm
+  chart's 1 GiB limit allows with GOGC's headroom. 20,000 hold at most about
+  170 MiB.
+- **`ingest.max_agents` (10,000) bounds agent states** like streams: least
+  recently used first (with their streams), restored from storage (the
+  high-water mark is re-read) when they come back. Before, a request could
+  name 16 new agent_ids and each kept its state for an hour: 5000 requests
+  left 80,000 states (850 B each) while `max_streams` was 1000. 10,000 is
+  far above the agents one server serves (normally fewer agents than
+  streams) and costs under 10 MiB. The sweep walks all state at most every
+  minute, or every second while over a limit, so its cost is bounded by
+  the two limits plus one second's growth.
+- **Errors reported for rejected records are at most 200 bytes and never
+  quote the record**: validation messages name fields, JSON errors are
+  reduced to their offset or field (Go's messages quote the text of bad
+  addresses and times). Before, a 233-byte zstd request (a 1 MiB invalid
+  `status` of invalid UTF-8, each byte becoming a 3-byte U+FFFD) wrote a
+  3 MiB log line, 28 MiB of log per second from one client.
+- **Stale batches: the gap that stays.** The 409 needs every seq of the
+  batch to lie more than 100,000 below the stored mark. An agent whose mark
+  is at most 100,000 (in its first day or so) and whose spool is wiped
+  still has its new records dropped as duplicates until its seq passes the
+  old mark. Agents quarantine a corrupt spool with a time-based first seq,
+  so only a deleted spool (which starts at seq 1) hits this; give such an
+  agent a new agent_id (README). Starting every new spool at the current
+  time in microseconds, as the quarantine does, would close the gap on the
+  agent's side; the server cannot tell a reset from a retry.
+- **Recovering an agent_id suppressed by a huge seq.** One record with
+  `seq` 2^64−1 under someone else's agent_id makes every later batch of
+  that agent 409 for good (`agent_seq` never expires). Authenticating
+  agents stays the proxy's job (§2); to recover, delete the spoofed cycles
+  and reset the mark from what is left, then restart the server (it keeps
+  the mark in memory):
+
+  ```sql
+  ALTER TABLE hopcorder.cycles DELETE WHERE agent_id = 'AGENT' AND seq >= SPOOFED SETTINGS mutations_sync = 2;
+  ALTER TABLE hopcorder.agent_seq DELETE WHERE agent_id = 'AGENT' SETTINGS mutations_sync = 2;
+  INSERT INTO hopcorder.agent_seq SELECT agent_id, max(seq) FROM hopcorder.cycles
+      WHERE agent_id = 'AGENT' GROUP BY agent_id;
+  ```
+
+  (checked on 25.8; `hops`, `loop_events`, `path_changes` and `outages`
+  rows of the spoofed seqs can be deleted the same way). Deleting only the
+  `agent_seq` row would reset the mark to 0, and the agent's retries of
+  stored batches would be stored again.

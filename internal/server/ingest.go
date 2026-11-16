@@ -36,7 +36,7 @@ const replayDepth = 30
 // and only moves on once a batch was accepted, so everything at or below the
 // highest seq stored for that agent has been stored already. Each agent's
 // batches are processed one at a time under its own lock, the high-water
-// mark moves only after the cycles insert succeeded, and so a retried batch
+// mark moves only after a cycles insert succeeded, and so a retried batch
 // (say, after a lost response) is stored exactly once.
 type Ingester struct {
 	store   Store
@@ -45,13 +45,21 @@ type Ingester struct {
 	metrics *serverMetrics
 
 	// State is kept per agent and per stream, keyed by what agents send, so
-	// it is bounded: streams idle for idleTTL are dropped (a stream that
-	// comes back is restored from storage, as after a restart), and beyond
-	// maxStreams the least recently used ones go first.
+	// it is bounded: streams and agents idle for idleTTL are dropped (a
+	// stream that comes back is restored from storage, as after a restart),
+	// and beyond maxStreams and maxAgents the least recently used go first.
 	maxStreams int
+	maxAgents  int
 	idleTTL    time.Duration
-	now        func() time.Time
-	nstreams   atomic.Int64
+	// maxRecordAge is how old a record may be (the handler refuses older
+	// ones); restores look no further back than that.
+	maxRecordAge time.Duration
+	// Each request restores at most maxRestores streams, within
+	// restoreTimeout of its first restore.
+	maxRestores    int
+	restoreTimeout time.Duration
+	now            func() time.Time
+	nstreams       atomic.Int64
 
 	mu        sync.Mutex
 	agents    map[string]*agentState
@@ -69,17 +77,46 @@ type agentState struct {
 
 // Defaults for the ingester's state bounds.
 const (
-	DefaultMaxStreams    = 100000
+	// DefaultMaxStreams: a stream costs about 1 KiB (15 IPv4 hops) to 9 KiB
+	// (255 IPv6 hops and a 255-character target), so 20,000 hold at most
+	// about 170 MiB.
+	DefaultMaxStreams = 20000
+	// DefaultMaxAgents: an agent's state without its streams is under
+	// 1 KiB; agents normally have several streams each, so this only binds
+	// when someone sends many agent_ids.
+	DefaultMaxAgents     = 10000
 	DefaultStreamIdleTTL = time.Hour
-	sweepInterval        = time.Minute
+	// DefaultMaxRecordAge bounds how old a record may be; the agent's spool
+	// keeps records for 7 days by default.
+	DefaultMaxRecordAge = 30 * 24 * time.Hour
+	sweepInterval       = time.Minute
 	// staleWindow: a batch whose seqs all lie this far below the agent's
 	// stored ones is not a retry but a reset spool or a second agent with
 	// the same agent_id.
 	staleWindow = 100000
-	// insertTimeout bounds a cycles insert, which is not cancelled when the
-	// agent disconnects: an insert that ClickHouse committed must be
-	// accounted for.
+	// insertTimeout bounds the cycles inserts of one agent's batch, which
+	// are not cancelled when the agent disconnects: an insert that
+	// ClickHouse committed must be accounted for.
 	insertTimeout = 30 * time.Second
+	// maxInsertBytes bounds one cycles insert. Enrichment makes a row up to
+	// about seven times its record (AS and rDNS names on every hop), so a
+	// large batch is inserted in parts; an agent's normal batch (1 MiB) is
+	// one insert.
+	maxInsertBytes = 8 << 20
+	// A request restores at most maxRestores streams, within restoreTimeout
+	// of its first restore. Each restore is one to four queries, run while
+	// the request holds an ingest slot; the streams left over are restored
+	// with their next batch.
+	maxRestores    = 256
+	restoreTimeout = 5 * time.Second
+	// restoreRecent is where a restore looks for a stream's previous cycles
+	// first, before the new cycle; only if it finds none does it look back
+	// maxRecordAge. A restore reads every cycle of the agent, target and
+	// protocol in its window, and the stream's last cycles are almost
+	// always within a day of its next one.
+	restoreRecent = 24 * time.Hour
+	// eventsTimeout bounds storing the derived events of one batch.
+	eventsTimeout = 10 * time.Second
 )
 
 // ErrStaleBatch is returned for a batch whose records all lie far below the
@@ -108,7 +145,8 @@ func NewIngester(store Store, en Enricher, log *slog.Logger, m *serverMetrics) *
 		m = newServerMetrics(nil)
 	}
 	return &Ingester{store: store, enrich: en, log: log, metrics: m, agents: map[string]*agentState{},
-		maxStreams: DefaultMaxStreams, idleTTL: DefaultStreamIdleTTL, now: time.Now}
+		maxStreams: DefaultMaxStreams, maxAgents: DefaultMaxAgents, idleTTL: DefaultStreamIdleTTL,
+		maxRecordAge: DefaultMaxRecordAge, maxRestores: maxRestores, restoreTimeout: restoreTimeout, now: time.Now}
 }
 
 // lockAgent returns the agent's state, locked.
@@ -129,25 +167,34 @@ func (in *Ingester) lockAgent(id string) *agentState {
 	}
 }
 
-// sweep drops idle streams and agents, and the least recently used streams
-// beyond maxStreams. Agents being ingested right now are skipped.
+// sweep drops idle streams and agents, and the least recently used agents
+// and streams beyond maxAgents and maxStreams (down to 90% of each). Agents
+// being ingested right now are skipped. It walks all state, which the
+// limits bound, at most every sweepInterval, or every second while over a
+// limit.
 func (in *Ingester) sweep() {
 	now := in.now()
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	over := in.nstreams.Load() > int64(in.maxStreams)
-	// Every sweepInterval, or every second while over the limit.
+	overStreams, overAgents := in.nstreams.Load() > int64(in.maxStreams), len(in.agents) > in.maxAgents
+	over := overStreams || overAgents
 	if since := now.Sub(in.lastSweep); since < sweepInterval && (!over || since < time.Second) {
 		return
 	}
 	in.lastSweep = now
 	cutoff := now.Add(-in.idleTTL)
-	type lru struct {
+	type lruStream struct {
 		a    *agentState
 		k    streamKey
 		used time.Time
 	}
-	var live []lru
+	type lruAgent struct {
+		id   string
+		a    *agentState
+		used time.Time
+	}
+	var streams []lruStream
+	var agents []lruAgent
 	for id, a := range in.agents {
 		if !a.mu.TryLock() {
 			continue
@@ -156,35 +203,84 @@ func (in *Ingester) sweep() {
 			if s.used.Before(cutoff) {
 				delete(a.streams, k)
 				in.nstreams.Add(-1)
-			} else if over {
-				live = append(live, lru{a, k, s.used})
+			} else if overStreams {
+				streams = append(streams, lruStream{a, k, s.used})
 			}
 		}
 		if len(a.streams) == 0 && a.used.Before(cutoff) {
 			a.evicted = true
 			delete(in.agents, id)
+		} else if overAgents {
+			agents = append(agents, lruAgent{id, a, a.used})
 		}
 		a.mu.Unlock()
 	}
-	if excess := in.nstreams.Load() - int64(in.maxStreams)*9/10; over && excess > 0 {
-		slices.SortFunc(live, func(x, y lru) int { return x.used.Compare(y.used) })
-		for _, l := range live[:min(int(excess), len(live))] {
+	if excess := len(in.agents) - in.maxAgents*9/10; overAgents && excess > 0 {
+		slices.SortFunc(agents, func(x, y lruAgent) int { return x.used.Compare(y.used) })
+		n := 0
+		for _, l := range agents[:min(excess, len(agents))] {
 			if l.a.mu.TryLock() {
-				if _, ok := l.a.streams[l.k]; ok {
+				l.a.evicted = true
+				delete(in.agents, l.id)
+				in.nstreams.Add(-int64(len(l.a.streams)))
+				l.a.streams = nil
+				l.a.mu.Unlock()
+				n++
+			}
+		}
+		in.metrics.evicted("agent", n)
+		in.log.Warn("tracking too many agents; dropped the least recently used (they are restored from storage when they come back)",
+			"max_agents", in.maxAgents, "dropped", n)
+	}
+	if excess := in.nstreams.Load() - int64(in.maxStreams)*9/10; overStreams && excess > 0 {
+		slices.SortFunc(streams, func(x, y lruStream) int { return x.used.Compare(y.used) })
+		n := 0
+		for _, l := range streams {
+			if int64(n) >= excess {
+				break
+			}
+			if l.a.mu.TryLock() {
+				if _, ok := l.a.streams[l.k]; ok && !l.a.evicted {
 					delete(l.a.streams, l.k)
 					in.nstreams.Add(-1)
+					n++
 				}
 				l.a.mu.Unlock()
 			}
 		}
+		in.metrics.evicted("stream", n)
 		in.log.Warn("tracking too many streams; dropped the least recently used (they are restored from storage when they come back)",
-			"max_streams", in.maxStreams)
+			"max_streams", in.maxStreams, "dropped", n)
 	}
 }
 
+// restoreBudget bounds the stream restores of one request.
+type restoreBudget struct {
+	left     int
+	timeout  time.Duration
+	deadline time.Time // set by the first restore
+}
+
+func (in *Ingester) newRestoreBudget() *restoreBudget {
+	return &restoreBudget{left: in.maxRestores, timeout: in.restoreTimeout}
+}
+
+// take reports whether another restore may start, and until when it may run.
+func (b *restoreBudget) take() (time.Time, bool) {
+	now := time.Now()
+	if b.deadline.IsZero() {
+		b.deadline = now.Add(b.timeout)
+	}
+	if b.left <= 0 || !now.Before(b.deadline) {
+		return time.Time{}, false
+	}
+	b.left--
+	return b.deadline, true
+}
+
 // Ingest stores recs (already validated). It returns an error only when
-// storage failed, in which case nothing was stored for the failing agent
-// and the batch should be retried.
+// storage failed, in which case the failing agent's records from the first
+// failed insert on are not stored and the batch should be retried.
 func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestResult, error) {
 	in.sweep()
 	var res IngestResult
@@ -197,8 +293,9 @@ func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestRe
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	rb := in.newRestoreBudget()
 	for _, id := range ids {
-		acc, dup, err := in.ingestAgent(ctx, id, byAgent[id])
+		acc, dup, err := in.ingestAgent(ctx, id, byAgent[id], rb)
 		res.Accepted += acc
 		res.Duplicates += dup
 		if err != nil {
@@ -208,7 +305,7 @@ func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestRe
 	return res, nil
 }
 
-func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.Record) (accepted, dups int, err error) {
+func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.Record, rb *restoreBudget) (accepted, dups int, err error) {
 	a := in.lockAgent(id)
 	defer a.mu.Unlock()
 	now := in.now()
@@ -242,42 +339,88 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 		return 0, dups, nil
 	}
 
-	rows := make([][]byte, len(fresh))
-	for i, r := range fresh {
-		if rows[i], err = buildCycleRow(r, in.enrich); err != nil {
-			return 0, dups, fmt.Errorf("encode record %s/%d: %w", id, r.Seq, err)
-		}
-	}
-	// Not cancelled with the request: if the agent disconnects after
-	// ClickHouse committed, the high-water mark must still move.
+	stored, err := in.insertCycles(ctx, a, fresh)
+	in.metrics.records(stored, dups)
+	// Derived events of what was stored, even if a later part failed: the
+	// retry sees those records as duplicates.
+	in.derive(ctx, a, fresh[:stored], now, rb)
+	return stored, dups, err
+}
+
+// insertCycles inserts recs (in seq order) in parts of at most
+// maxInsertBytes and moves a's high-water mark after each. It returns how
+// many records were stored. Not cancelled with the request: if the agent
+// disconnects after ClickHouse committed, the high-water mark must still
+// move.
+func (in *Ingester) insertCycles(ctx context.Context, a *agentState, recs []*record.Record) (int, error) {
 	ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
 	defer cancel()
-	start := time.Now()
-	if err := in.store.InsertJSON(ictx, "cycles", rows); err != nil {
-		in.metrics.insertError("cycles")
-		// The insert may have been committed all the same: re-read the
-		// high-water mark before the next batch rather than trusting ours.
-		a.loaded = false
-		return 0, dups, fmt.Errorf("insert cycles: %w", err)
+	stored := 0
+	for stored < len(recs) {
+		var rows [][]byte
+		size, end := 0, stored
+		for end < len(recs) && size < maxInsertBytes {
+			b, err := buildCycleRow(recs[end], in.enrich)
+			if err != nil {
+				return stored, fmt.Errorf("encode record %s/%d: %w", recs[end].AgentID, recs[end].Seq, err)
+			}
+			rows = append(rows, b)
+			size += len(b)
+			end++
+		}
+		start := time.Now()
+		if err := in.store.InsertJSON(ictx, "cycles", rows); err != nil {
+			in.metrics.insertError("cycles")
+			// The insert may have been committed all the same: re-read the
+			// high-water mark before the next batch rather than trusting ours.
+			a.loaded = false
+			return stored, fmt.Errorf("insert cycles: %w", err)
+		}
+		in.metrics.insertDuration(time.Since(start))
+		a.highWater = recs[end-1].Seq
+		stored = end
 	}
-	in.metrics.insertDuration(time.Since(start))
-	a.highWater = fresh[len(fresh)-1].Seq
-	in.metrics.records(len(fresh), dups)
+	return stored, nil
+}
 
-	// Derived events. The cycles are committed at this point; events are
-	// derived data, so a failure here is logged rather than failing (and
-	// re-sending) a batch that is already stored.
+// derive feeds stored records to their streams and stores the events they
+// produce. The cycles are committed at this point; events are derived data,
+// so a failure here is logged rather than failing (and re-sending) a batch
+// that is already stored. A stream whose state cannot be restored now
+// (budget used up, or storage failing) skips this batch's cycles and is
+// restored with its next batch, from storage, which then holds these
+// cycles: it never starts from scratch while ClickHouse has its history.
+func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Record, now time.Time, rb *restoreBudget) {
 	var ev events
-	for _, r := range fresh {
+	tried := map[*stream]bool{}
+	var skipped, failed int
+	for _, r := range recs {
 		s := in.stream(a, keyOf(r))
 		s.used = now
+		if !s.loaded && !tried[s] {
+			tried[s] = true
+			if deadline, ok := rb.take(); ok {
+				if err := in.restore(ctx, deadline, s, r, &ev); err != nil {
+					failed++
+					in.log.Debug("cannot restore stream state", "stream", s.key, "err", err)
+				}
+			}
+		}
 		if !s.loaded {
-			in.restore(ictx, s, r.Seq)
+			skipped++
+			continue
 		}
 		s.observe(r, &ev)
 	}
-	in.insertEvents(ictx, ev)
-	return len(fresh), dups, nil
+	if skipped > 0 {
+		in.metrics.unrestoredCycles(skipped)
+		in.log.Warn("stream state not restored in time; these cycles derive no path changes or outages "+
+			"(the streams are restored with their next batch)", "agent_id", recs[0].AgentID, "cycles", skipped,
+			"failed_restores", failed)
+	}
+	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventsTimeout)
+	defer cancel()
+	in.insertEvents(ectx, ev)
 }
 
 // stream returns a's stream k, creating it; a must be locked.
@@ -308,19 +451,23 @@ func (in *Ingester) loadHighWater(ctx context.Context, id string) (uint64, error
 	return hw, err
 }
 
-// restore primes a stream from storage after a server restart: the last
-// cycles before seq are replayed into the path tracker, and an outage left
-// open is resumed. Failures leave the stream starting fresh.
-func (in *Ingester) restore(ctx context.Context, s *stream, before uint64) {
-	s.loaded = true
+// restore primes stream s from storage before its cycle first (after a
+// server restart or after s was dropped): the stream's last cycles are
+// replayed into the path tracker, and an outage left open is resumed. Only
+// a complete restore marks s loaded; on an error s is left as it was.
+// Queries run until deadline, not cancelled with the request.
+func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, first *record.Record, ev *events) error {
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancel()
 	k := s.key
 	params := clickhouse.Params{"agent": k.Agent, "target": k.Target, "protocol": k.Protocol,
-		"flow": strconv.Itoa(k.Flow), "before": strconv.FormatUint(before, 10), "depth": strconv.Itoa(replayDepth)}
+		"flow": strconv.Itoa(k.Flow), "before": strconv.FormatUint(first.Seq, 10), "depth": strconv.Itoa(replayDepth)}
 	where := `agent_id = {agent:String} AND target = {target:String} AND protocol = {protocol:String}
 		AND flow_id = {flow:UInt16}`
 
 	type cyc struct {
 		Seq       uint64   `json:"seq"`
+		TS        string   `json:"ts"`
 		TargetIP  string   `json:"target_ip"`
 		Reached   bool     `json:"reached"`
 		PathLen   int      `json:"path_len"`
@@ -329,17 +476,29 @@ func (in *Ingester) restore(ctx context.Context, s *stream, before uint64) {
 		HopStatus []string `json:"hops.status"`
 		HopIP     []string `json:"hops.ip"`
 	}
-	rows, err := clickhouseQuery[cyc](ctx, in.store, `SELECT seq, target_ip, reached, path_len, path_hash,
-		hops.ttl, hops.status, hops.ip FROM cycles WHERE `+where+` AND seq < {before:UInt64}
-		ORDER BY seq DESC LIMIT {depth:UInt32}`, params)
-	if err != nil {
-		in.log.Warn("cannot restore stream state; path changes restart from scratch", "stream", k, "err", err)
-		return
+	// ts bounds what ClickHouse reads: the sort key is (agent_id, target,
+	// protocol, ts), so without it a restore reads the whole history of
+	// every flow of the agent, target and protocol.
+	var rows []cyc
+	for _, back := range []time.Duration{min(restoreRecent, in.maxRecordAge), in.maxRecordAge} {
+		var err error
+		rows, err = clickhouseQuery[cyc](ctx, in.store, `SELECT seq, ts, target_ip, reached, path_len,
+			path_hash, hops.ttl, hops.status, hops.ip FROM cycles WHERE `+where+` AND seq < {before:UInt64}
+			AND ts >= {since:DateTime64(3)} ORDER BY seq DESC LIMIT {depth:UInt32}`,
+			withParam(params, "since", clickhouse.Time(first.TS.Add(-back))))
+		if err != nil {
+			return fmt.Errorf("replay cycles: %w", err)
+		}
+		if len(rows) > 0 || back >= in.maxRecordAge {
+			break
+		}
 	}
 	slices.Reverse(rows)
 	recs := make([]*record.Record, 0, len(rows))
 	for _, c := range rows {
-		r := &record.Record{Seq: c.Seq, Reached: c.Reached, PathLen: c.PathLen, PathHash: c.PathHash}
+		r := &record.Record{AgentID: k.Agent, Target: k.Target, Protocol: k.Protocol, FlowID: k.Flow,
+			Seq: c.Seq, Reached: c.Reached, PathLen: c.PathLen, PathHash: c.PathHash}
+		r.TS = parseTime64(c.TS)
 		r.TargetIP, _ = netip.ParseAddr(c.TargetIP)
 		for i := range c.HopTTL {
 			h := record.Hop{TTL: c.HopTTL[i], Status: record.Status(c.HopStatus[i])}
@@ -350,37 +509,69 @@ func (in *Ingester) restore(ctx context.Context, s *stream, before uint64) {
 		}
 		recs = append(recs, r)
 	}
-	s.replay(recs)
-	if len(recs) == 0 || recs[len(recs)-1].Reached {
-		return
-	}
-	// The stream was down when the server stopped: resume its outage.
-	open, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
-		toString(start_ts) AS start_ts, end_seq, NULL AS end_ts, cycles, last_hop_ttl, last_hop_ip, version
-		FROM outages FINAL WHERE `+where+` AND end_ts IS NULL AND start_seq < {before:UInt64}
-		ORDER BY start_seq DESC LIMIT 1`, params)
-	if err != nil || len(open) == 0 {
+	restored := stream{key: k}
+	restored.replay(recs)
+	if len(recs) == 0 || !recs[len(recs)-1].Reached {
+		// The stream may have been down when its state was lost (or its
+		// last cycles lie beyond the window): resume its open outage. Not
+		// bounded by time: an outage can be older than any window, and
+		// outages has a row per outage, not per cycle.
+		open, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
+			toString(start_ts) AS start_ts, end_seq, NULL AS end_ts, cycles, last_hop_ttl, last_hop_ip, version
+			FROM outages FINAL WHERE `+where+` AND end_ts IS NULL AND start_seq < {before:UInt64}
+			ORDER BY start_seq DESC LIMIT 1`, params)
 		if err != nil {
-			in.log.Warn("cannot restore open outage", "stream", k, "err", err)
+			return fmt.Errorf("find open outage: %w", err)
 		}
-		return
+		switch {
+		case len(open) == 1:
+			type n struct {
+				N int `json:"n"`
+			}
+			cnt, err := clickhouseQuery[n](ctx, in.store, `SELECT count() AS n FROM cycles WHERE `+where+`
+				AND seq >= {start:UInt64} AND seq < {before:UInt64} AND ts >= {start_ts:DateTime64(3)}`,
+				withParam(withParam(params, "start", strconv.FormatUint(open[0].StartSeq, 10)), "start_ts", open[0].StartTS))
+			if err != nil {
+				return fmt.Errorf("count outage cycles: %w", err)
+			}
+			if len(cnt) == 1 {
+				open[0].Cycles = cnt[0].N
+			}
+			restored.outage = &open[0]
+		case len(recs) > 0:
+			// Down, but no open outage stored: its start was in cycles that
+			// derived no events (a batch whose restore did not happen in
+			// time, or whose events could not be stored). It starts at the
+			// first of the trailing unreached cycles replayed.
+			i := len(recs)
+			for i > 0 && !recs[i-1].Reached {
+				i--
+			}
+			o := newOutage(recs[i], len(recs)-i)
+			restored.outage = &o
+			ev.outages = append(ev.outages, o)
+		}
 	}
-	type n struct {
-		N int `json:"n"`
+	s.tracker, s.last, s.outage, s.loaded = restored.tracker, restored.last, restored.outage, true
+	return nil
+}
+
+// parseTime64 reads a DateTime64 as the client returns it (ISO 8601), or
+// as clickhouse.Time writes it.
+func parseTime64(s string) time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t
 	}
-	cnt, err := clickhouseQuery[n](ctx, in.store, `SELECT count() AS n FROM cycles WHERE `+where+`
-		AND seq >= {start:UInt64} AND seq < {before:UInt64}`,
-		withParam(params, "start", strconv.FormatUint(open[0].StartSeq, 10)))
-	if err == nil && len(cnt) == 1 {
-		open[0].Cycles = cnt[0].N
-	}
-	s.outage = &open[0]
+	t, _ := time.Parse("2006-01-02 15:04:05.000", s)
+	return t
 }
 
 func withParam(p clickhouse.Params, k, v string) clickhouse.Params {
 	out := clickhouse.Params{k: v}
 	for kk, vv := range p {
-		out[kk] = vv
+		if kk != k {
+			out[kk] = vv
+		}
 	}
 	return out
 }
