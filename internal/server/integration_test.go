@@ -443,6 +443,21 @@ func TestTopologyClickHouse(t *testing.T) {
 	}
 }
 
+// Parameter values reach ClickHouse unchanged, backslashes and control
+// characters included (ClickHouse parses them in its escaped format).
+func TestQueryParamsRoundTrip(t *testing.T) {
+	c := testClickHouse(t)
+	for _, v := range []string{`corp\lab1`, `ends\`, "tab\there", "new\nline", `quote'd`, `\\`} {
+		type row struct {
+			V string `json:"v"`
+		}
+		rows, err := clickhouse.QueryInto[row](t.Context(), c, "SELECT {x:String} AS v", clickhouse.Params{"x": v})
+		if err != nil || len(rows) != 1 || rows[0].V != v {
+			t.Errorf("%q: %v %v", v, rows, err)
+		}
+	}
+}
+
 func TestApplyRetention(t *testing.T) {
 	c := testClickHouse(t)
 	ttlTables := func() int {

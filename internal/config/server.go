@@ -21,8 +21,12 @@ const (
 	DefaultClickHouseDB      = "hopcorder"
 	DefaultClickHouseUser    = "default"
 	DefaultASNURL            = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
-	DefaultMaxBodyBytes      = ByteSize(64 << 20)
-	DefaultMaxDecodedBytes   = ByteSize(512 << 20)
+	DefaultMaxBodyBytes      = ByteSize(8 << 20)
+	DefaultMaxDecodedBytes   = ByteSize(32 << 20)
+	DefaultIngestConcurrency = 4
+	DefaultQueryConcurrency  = 8
+	DefaultMaxStreams        = 100000
+	DefaultStreamIdleTimeout = time.Hour
 	defaultClickHouseTimeout = 30 * time.Second
 	DefaultRetentionDays     = 90
 )
@@ -37,6 +41,7 @@ type ServerConfig struct {
 	ClickHouse ClickHouseConfig `yaml:"clickhouse"`
 	Ingest     IngestConfig     `yaml:"ingest"`
 	Enrich     EnrichConfig     `yaml:"enrich"`
+	Query      QueryConfig      `yaml:"query"`
 	Metrics    *bool            `yaml:"metrics"` // serve /metrics; default true
 	UI         *bool            `yaml:"ui"`      // serve the web UI under /ui/; default true
 }
@@ -54,10 +59,23 @@ type ClickHouseConfig struct {
 	RetentionDays *int `yaml:"retention_days"`
 }
 
-// IngestConfig bounds ingest requests.
+// IngestConfig bounds ingest requests and the state kept per stream.
 type IngestConfig struct {
 	MaxBodyBytes    ByteSize `yaml:"max_body_bytes"`
 	MaxDecodedBytes ByteSize `yaml:"max_decoded_bytes"`
+	// MaxConcurrent ingest requests are processed at once; more wait up to
+	// 10s, then get 503 and the agent retries.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// MaxStreams streams (agent, target, protocol, flow) are tracked in
+	// memory; idle ones are dropped after StreamIdleTimeout. A dropped
+	// stream is restored from ClickHouse when it comes back.
+	MaxStreams        int      `yaml:"max_streams"`
+	StreamIdleTimeout Duration `yaml:"stream_idle_timeout"`
+}
+
+// QueryConfig bounds the read API.
+type QueryConfig struct {
+	MaxConcurrent int `yaml:"max_concurrent"` // read-API requests at once
 }
 
 // EnrichConfig configures hop enrichment.
@@ -142,6 +160,10 @@ func (c *ServerConfig) Finalize() error {
 	if c.Ingest.MaxDecodedBytes == 0 {
 		c.Ingest.MaxDecodedBytes = DefaultMaxDecodedBytes
 	}
+	setInt(&c.Ingest.MaxConcurrent, DefaultIngestConcurrency)
+	setInt(&c.Ingest.MaxStreams, DefaultMaxStreams)
+	setDur(&c.Ingest.StreamIdleTimeout, DefaultStreamIdleTimeout)
+	setInt(&c.Query.MaxConcurrent, DefaultQueryConcurrency)
 	if c.Metrics == nil {
 		c.Metrics = ptr(true)
 	}
@@ -179,7 +201,9 @@ func (c *ServerConfig) Finalize() error {
 		fail("log.format %q: want text or json", c.Log.Format)
 	}
 	if u, err := url.Parse(ch.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		fail("clickhouse.url %q: want http(s)://host:port", ch.URL)
+		fail("clickhouse.url: want http(s)://host:port")
+	} else if u.User != nil {
+		fail("clickhouse.url: put credentials in user and password (or password_file), not in the URL")
 	}
 	if strings.ContainsAny(ch.Database, "`;. ") {
 		fail("clickhouse.database %q: invalid name", ch.Database)
@@ -200,6 +224,10 @@ func (c *ServerConfig) Finalize() error {
 	}
 	if c.Ingest.MaxBodyBytes < 1<<20 || c.Ingest.MaxDecodedBytes < c.Ingest.MaxBodyBytes {
 		fail("ingest: need max_body_bytes >= 1MiB and max_decoded_bytes >= max_body_bytes")
+	}
+	if c.Ingest.MaxConcurrent < 1 || c.Ingest.MaxStreams < 1 || c.Ingest.StreamIdleTimeout.D() < time.Minute ||
+		c.Query.MaxConcurrent < 1 {
+		fail("ingest/query: max_concurrent and max_streams must be positive, stream_idle_timeout at least 1m")
 	}
 	if *r.Enabled && (r.Workers < 1 || r.MaxEntries < 1 || r.TTL.D() <= 0 || r.NegativeTTL.D() <= 0) {
 		fail("enrich.rdns: workers, max_entries, ttl and negative_ttl must be positive")

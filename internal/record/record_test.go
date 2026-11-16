@@ -314,6 +314,38 @@ func TestValidateRejects(t *testing.T) {
 		{"nil loops", func(r *Record) { r.Loops = nil }},
 		{"mpls on a reply", func(r *Record) { r.Hops[1].MPLS = []MPLSLabel{{Label: 16, S: true, TTL: 1}} }},
 		{"mpls label too large", func(r *Record) { r.Hops[0].MPLS = []MPLSLabel{{Label: 1 << 20, S: true}} }},
+		// Bounds and character sets (security review): everything the
+		// server stores from an agent is bounded and safe to quote.
+		{"agent with a backslash", func(r *Record) { r.AgentID = `lab\x` }},
+		{"agent with a quote", func(r *Record) { r.AgentID = "lab'1" }},
+		{"agent too long", func(r *Record) { r.AgentID = strings.Repeat("a", MaxAgentIDLen+1) }},
+		{"target with html", func(r *Record) { r.Target = "<b>dc1</b>" }},
+		{"target with a space", func(r *Record) { r.Target = "dc 1" }},
+		{"target too long", func(r *Record) { r.Target = strings.Repeat("t", MaxTargetLen+1) }},
+		{"unknown protocol", func(r *Record) { r.Protocol = "sctp" }},
+		{"ts before 1970", func(r *Record) { r.TS = time.Date(1969, 1, 1, 0, 0, 0, 0, time.UTC) }},
+		{"ts after 2261", func(r *Record) { r.TS = time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC) }},
+		{"path_hash with control", func(r *Record) { r.PathHash = "ab\ncd" }},
+		{"too many hops", func(r *Record) {
+			for len(r.Hops) <= MaxHops {
+				r.Hops = append(r.Hops, Hop{TTL: len(r.Hops) + 1, Status: StatusNoReply})
+			}
+			r.PathLen = len(r.Hops)
+		}},
+		{"more loops than hops", func(r *Record) {
+			r.Loops = []Loop{{IP: ip("10.0.0.1"), TTLs: []int{1, 2}}, {IP: ip("10.0.0.2"), TTLs: []int{1, 2}}, {IP: ip("10.0.0.3"), TTLs: []int{1, 2}}}
+		}},
+		{"loop ttl out of path", func(r *Record) { r.Loops = []Loop{{IP: ip("10.0.0.1"), TTLs: []int{1, 70000}}} }},
+		{"loop ttls not increasing", func(r *Record) { r.Loops = []Loop{{IP: ip("10.0.0.1"), TTLs: []int{2, 1}}} }},
+		{"loop of one ttl", func(r *Record) { r.Loops = []Loop{{IP: ip("10.0.0.1"), TTLs: []int{1}}} }},
+		{"loop without ip", func(r *Record) { r.Loops = []Loop{{TTLs: []int{1, 2}}} }},
+		{"code out of range", func(r *Record) {
+			r.Hops[0].Status, r.Hops[0].Code = StatusUnreachable, IntPtr(99999)
+		}},
+		{"rtt beyond UInt32", func(r *Record) { r.Hops[0].RTTMicros = 1 << 33 }},
+		{"too many mpls labels", func(r *Record) {
+			r.Hops[0].MPLS = make([]MPLSLabel, MaxMPLSLabels+1)
+		}},
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("baseline invalid: %v", err)
@@ -438,5 +470,23 @@ func TestPathTrackerChangeDetail(t *testing.T) {
 	}
 	if ch, ok := p.ObserveChange(rec("192.0.2.10", hops("x:10.0.0.1", "r:192.0.2.10"))); ok {
 		t.Errorf("no change reported as %+v", ch)
+	}
+}
+
+func TestValidNames(t *testing.T) {
+	for _, s := range []string{"lab-01", "node.example.net", "agent_7", "fe80::1"} {
+		if !ValidAgentID(s) {
+			t.Errorf("agent_id %q refused", s)
+		}
+	}
+	for _, s := range []string{"example.net", "192.0.2.1", "2001:db8::1", "fe80::1%eth0", "_srv.example"} {
+		if !ValidTarget(s) {
+			t.Errorf("target %q refused", s)
+		}
+	}
+	for _, s := range []string{"", "a b", `a\b`, "a'b", "a/b", "ä"} {
+		if ValidAgentID(s) || ValidTarget(s) {
+			t.Errorf("%q accepted", s)
+		}
 	}
 }

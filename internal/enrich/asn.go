@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // ASNInfo is the origin AS of an address.
@@ -41,9 +42,22 @@ type ASNDB struct {
 	infos  []ASNInfo
 }
 
+// Limits on an ASN database, whose source is a download: the real file is
+// about 7 MB gzipped, 30 MB and 600,000 ranges uncompressed.
+const (
+	maxASNDownload = 64 << 20 // compressed
+	maxASNRanges   = 5_000_000
+	maxASNameLen   = 128
+	maxCountryLen  = 8
+)
+
+var maxASNDecoded int64 = 256 << 20 // uncompressed; a variable for tests
+
 // ParseIPToASN reads the iptoasn.com TSV format (ip2asn-combined.tsv,
 // optionally gzipped): range_start, range_end, AS number, country, AS
-// description. Ranges with AS 0 ("Not routed") are skipped.
+// description. Ranges with AS 0 ("Not routed") are skipped. Its size,
+// range count and field lengths are bounded, and control characters are
+// removed from names.
 func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 	br := bufio.NewReader(r)
 	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
@@ -54,13 +68,18 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 		defer gz.Close()
 		br = bufio.NewReader(gz)
 	}
+	limited := &io.LimitedReader{R: br, N: maxASNDecoded + 1}
+	br = bufio.NewReader(limited)
 	db := &ASNDB{}
 	index := map[ASNInfo]int32{}
 	sc := bufio.NewScanner(br)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
+	sc.Buffer(make([]byte, 64<<10), 64<<10)
 	line := 0
 	for sc.Scan() {
 		line++
+		if len(db.v4)+len(db.v6) >= maxASNRanges {
+			return nil, fmt.Errorf("asn db: more than %d ranges", maxASNRanges)
+		}
 		f := strings.Split(sc.Text(), "\t")
 		if len(f) < 5 {
 			if strings.TrimSpace(sc.Text()) == "" {
@@ -81,7 +100,7 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 		if asn == 0 {
 			continue
 		}
-		info := ASNInfo{ASN: uint32(asn), Country: f[3], Name: f[4]}
+		info := ASNInfo{ASN: uint32(asn), Country: cleanField(f[3], maxCountryLen), Name: cleanField(f[4], maxASNameLen)}
 		idx, ok := index[info]
 		if !ok {
 			idx = int32(len(db.infos)) //nolint:gosec // far fewer than 2^31 ASes
@@ -97,6 +116,9 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("asn db: %w", err)
+	}
+	if limited.N <= 0 {
+		return nil, fmt.Errorf("asn db: larger than %d MiB uncompressed", maxASNDecoded>>20)
 	}
 	if len(db.v4)+len(db.v6) == 0 {
 		return nil, errors.New("asn db: no routed ranges")
@@ -159,6 +181,21 @@ func (s *ASNSource) Age() time.Duration {
 	return time.Since(time.Unix(at, 0))
 }
 
+// cleanField removes control characters and invalid UTF-8 from a field of
+// the downloaded database and truncates it to limit bytes.
+func cleanField(s string, limit int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < ' ' || r == 0x7f || r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(s, ""))
+	if len(s) > limit {
+		s = strings.ToValidUTF8(s[:limit], "")
+	}
+	return strings.TrimSpace(s)
+}
+
 func (s *ASNSource) defaults() {
 	if s.Refresh <= 0 {
 		s.Refresh = 24 * time.Hour
@@ -167,7 +204,7 @@ func (s *ASNSource) defaults() {
 		s.Logger = slog.Default()
 	}
 	if s.HTTP == nil {
-		s.HTTP = &http.Client{Timeout: 5 * time.Minute}
+		s.HTTP = &http.Client{Timeout: 5 * time.Minute, CheckRedirect: noDowngrade}
 	}
 }
 
@@ -240,9 +277,12 @@ func (s *ASNSource) download(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %s", resp.Status)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxASNDownload+1))
 	if err != nil {
 		return err
+	}
+	if len(raw) > maxASNDownload {
+		return fmt.Errorf("download larger than %d MiB", maxASNDownload>>20)
 	}
 	db, err := ParseIPToASN(bytes.NewReader(raw))
 	if err != nil {
@@ -281,4 +321,15 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+// noDowngrade follows redirects, but not from https to plain http.
+func noDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect from https to %s", req.URL.Redacted())
+	}
+	return nil
 }
