@@ -965,6 +965,18 @@ fixes. The decisions:
   (`verify-tag`), and the chart and release jobs run in the `release`
   environment, where required reviewers can be added. The release build is
   `scripts/release-build.sh`, shared with the dry run.
+- **When workflows run**: `ci` runs on pull requests, on main and by hand,
+  not on every branch push (a pull request's branch ran everything twice,
+  once per event) and not on tags (a release tag is a commit of main, which
+  it ran on). A new commit on a pull request cancels the older runs of both
+  workflows. `images` runs one at a time per ref: two merges in a row would
+  otherwise race to push, and whichever finished last would own `:main`. A
+  run still waiting is replaced by a newer one, so that commit gets no
+  `:sha-` image. Every job has a timeout. `go vet` runs inside golangci-lint
+  (with all build tags), not as a step of its own. The images are still built
+  by three pull request jobs (the compose stack for Grafana and the kind test
+  for amd64, `image-check` for both platforms). They run in parallel, and
+  sharing one build would make two of them wait for it.
 - **Still to do in the repository settings** (not possible from here):
   enforce the main ruleset (it is disabled), add a tag ruleset limiting who
   may create `v*` tags, and add required reviewers to the `release`
