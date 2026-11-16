@@ -322,6 +322,10 @@ func TestKill9(t *testing.T) {
 		sc := bufio.NewScanner(out)
 		var acked []uint64
 		killAt := 20 + round*37
+		killed := false
+		// Keep reading after the kill: lines the child printed before it
+		// died may still sit in the pipe, and each of them reports a
+		// committed append.
 		for sc.Scan() {
 			line := sc.Text()
 			if !strings.HasPrefix(line, "appended ") {
@@ -329,9 +333,9 @@ func TestKill9(t *testing.T) {
 			}
 			seq, _ := strconv.ParseUint(strings.TrimPrefix(line, "appended "), 10, 64)
 			acked = append(acked, seq)
-			if len(acked) == killAt {
+			if !killed && len(acked) == killAt {
 				_ = cmd.Process.Signal(syscall.SIGKILL)
-				break
+				killed = true
 			}
 		}
 		_ = cmd.Wait()

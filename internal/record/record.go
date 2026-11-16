@@ -62,6 +62,18 @@ type Hop struct {
 	// because code 0 (net unreachable / no route) is meaningful. Codes are
 	// raw ICMPv4 or ICMPv6 codes; interpret them according to Record.AF.
 	Code *int `json:"code,omitempty"`
+	// MPLS is the label stack the router reported in its ICMP error
+	// (RFC 4884/4950 extensions), outermost label first; absent when the
+	// router sent none.
+	MPLS []MPLSLabel `json:"mpls,omitempty"`
+}
+
+// MPLSLabel is one entry of an MPLS label stack as quoted by a router.
+type MPLSLabel struct {
+	Label uint32 `json:"label"` // 20-bit label value
+	TC    uint8  `json:"tc"`    // traffic class (formerly EXP)
+	S     bool   `json:"s"`     // bottom of stack
+	TTL   uint8  `json:"ttl"`   // the label's TTL when the packet arrived
 }
 
 // Loop is an IP address that answered at more than one TTL in one cycle.
@@ -250,8 +262,74 @@ func (h Hop) validate() error {
 	if (h.Status == StatusUnreachable) != (h.Code != nil) {
 		return errors.New("code must be set exactly for unreachable hops")
 	}
+	if len(h.MPLS) > 0 && h.Status != StatusTTLExpired && h.Status != StatusUnreachable {
+		return fmt.Errorf("status %s carries an MPLS label stack", h.Status)
+	}
+	for _, l := range h.MPLS {
+		if l.Label > 0xfffff || l.TC > 7 {
+			return fmt.Errorf("invalid MPLS label %+v", l)
+		}
+	}
 	return nil
 }
 
 // IntPtr returns a pointer to c, for Hop.Code.
 func IntPtr(c int) *int { return &c }
+
+// PathTracker decides whether a target's route changed from one cycle to
+// the next. Silent hops are wildcards, so a rate-limited router going quiet
+// and coming back is not a change (path_hash alone cannot tell those apart:
+// the router's address and "*" hash differently). The tracker remembers the
+// last address seen at each TTL, so a router replaced while it was silent is
+// still caught when the new one first answers. A change is any of:
+//
+//   - a different target address (the name resolved elsewhere);
+//   - a TTL answering from a different address than last seen there;
+//   - a reached destination at a different distance than last reached.
+//
+// Gaining or losing reachability alone is not a path change; it is visible
+// in Reached. The zero value is ready to use; it is not safe for concurrent
+// use.
+type PathTracker struct {
+	started bool
+	target  netip.Addr
+	ips     []netip.Addr // last address seen per TTL-1; invalid = unknown
+	dist    int          // last reached distance, 0 = unknown
+}
+
+// Observe records rec and reports whether its route differs from what the
+// tracker knew. The first observation is never a change. After a change the
+// tracker forgets everything rec does not confirm.
+func (p *PathTracker) Observe(rec *Record) bool {
+	changed := p.started && p.differs(rec)
+	if !p.started || changed {
+		p.started, p.target, p.ips, p.dist = true, rec.TargetIP, nil, 0
+	}
+	for _, h := range rec.Hops {
+		if h.Status.Responded() && h.IP.IsValid() && h.TTL >= 1 {
+			for len(p.ips) < h.TTL {
+				p.ips = append(p.ips, netip.Addr{})
+			}
+			p.ips[h.TTL-1] = h.IP
+		}
+	}
+	if rec.Reached {
+		p.dist = rec.PathLen
+	}
+	return changed
+}
+
+func (p *PathTracker) differs(rec *Record) bool {
+	if rec.TargetIP != p.target {
+		return true
+	}
+	for _, h := range rec.Hops {
+		if !h.Status.Responded() || h.TTL < 1 || h.TTL > len(p.ips) {
+			continue
+		}
+		if known := p.ips[h.TTL-1]; known.IsValid() && known != h.IP {
+			return true
+		}
+	}
+	return rec.Reached && p.dist != 0 && rec.PathLen != p.dist
+}

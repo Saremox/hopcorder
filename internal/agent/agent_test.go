@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -299,7 +301,9 @@ func TestRecordAssembly(t *testing.T) {
 	f.Set(addr(tg.Host), probe.Scenario{
 		Hops: []probe.FakeHop{
 			{IPs: []netip.Addr{addr("10.0.0.1")}, RTT: 400 * time.Nanosecond}, // rounds up to 1µs
-			hop("62.115.120.1"), hop("62.115.120.2"), hop("62.115.120.1"),
+			{IPs: []netip.Addr{addr("62.115.120.1")}, RTT: time.Millisecond,
+				MPLS: []record.MPLSLabel{{Label: 24005, S: true, TTL: 1}}},
+			hop("62.115.120.2"), hop("62.115.120.1"),
 			{IPs: []netip.Addr{addr("62.115.120.9")}, Unreachable: record.IntPtr(0)},
 		},
 	})
@@ -314,6 +318,9 @@ func TestRecordAssembly(t *testing.T) {
 	}
 	if r.Hops[0].RTTMicros != 1 {
 		t.Errorf("sub-microsecond rtt recorded as %d", r.Hops[0].RTTMicros)
+	}
+	if want := []record.MPLSLabel{{Label: 24005, S: true, TTL: 1}}; !reflect.DeepEqual(r.Hops[1].MPLS, want) {
+		t.Errorf("hop 2 mpls %+v, want %+v", r.Hops[1].MPLS, want)
 	}
 	last := r.Hops[len(r.Hops)-1]
 	if r.PathLen != 5 || last.Status != record.StatusUnreachable || last.Code == nil || *last.Code != 0 {
@@ -444,4 +451,63 @@ func eventually(t *testing.T, d time.Duration, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func TestAdaptiveTTL(t *testing.T) {
+	t0 := time.Now()
+	now := t0
+	var mu sync.Mutex
+	f := probe.NewFake()
+	f.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	dst := addr("198.51.100.7")
+	short := []probe.FakeHop{hop("10.0.0.1"), hop("10.0.0.2")}
+	long := append(append([]probe.FakeHop{}, short...), hop("10.0.0.3"), hop("10.0.0.4"), hop("10.0.0.5"),
+		hop("10.0.0.6"), hop("10.0.0.7"))
+	f.Set(dst,
+		probe.Scenario{Hops: short, Reachable: true},
+		probe.Scenario{From: t0.Add(time.Hour), Hops: long, Reachable: true}, // path grows by 5 at T
+		probe.Scenario{From: t0.Add(2 * time.Hour), Hops: short},             // destination stops answering
+	)
+	tg := target(dst.String(), time.Second)
+	tg.MaxTTL = 30
+	tg.AdaptiveTTL = true
+	a, _ := New(Options{AgentID: "test", Targets: []Target{tg}, Prober: f})
+	r := newRunner(a, &a.opts.Targets[0])
+
+	type want struct {
+		batches string // MinTTL-MaxTTL of each Trace call
+		pathLen int
+		reached bool
+	}
+	cycle := func(at time.Duration, w want) {
+		t.Helper()
+		mu.Lock()
+		now = t0.Add(at)
+		mu.Unlock()
+		before := len(f.Requests())
+		rec, err := r.cycle(t.Context(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b []string
+		for _, q := range f.Requests()[before:] {
+			b = append(b, fmt.Sprintf("%d-%d", q.FirstTTL(), q.MaxTTL))
+		}
+		if got := strings.Join(b, ","); got != w.batches || rec.PathLen != w.pathLen || rec.Reached != w.reached {
+			t.Errorf("at %v: batches %s path_len %d reached %v, want %s %d %v",
+				at, got, rec.PathLen, rec.Reached, w.batches, w.pathLen, w.reached)
+		}
+	}
+	cycle(0, want{"1-30", 3, true})                        // nothing known yet: full depth
+	cycle(time.Minute, want{"1-6", 3, true})               // destination at 3: probe 3 past it
+	cycle(time.Hour, want{"1-6,7-30", 8, true})            // grown to 8: the follow-up finds it in the same cycle
+	cycle(time.Hour+time.Minute, want{"1-11", 8, true})    // and the next cycle adapts
+	cycle(2*time.Hour, want{"1-11,12-30", 4, false})       // destination silent: follow-up, unreached
+	cycle(2*time.Hour+time.Minute, want{"1-30", 4, false}) // unreached targets get full depth
+
+	tg.AdaptiveTTL = false
+	a, _ = New(Options{AgentID: "test", Targets: []Target{tg}, Prober: f})
+	r = newRunner(a, &a.opts.Targets[0])
+	cycle(time.Minute, want{"1-30", 3, true}) // disabled: always full depth
+	cycle(time.Minute, want{"1-30", 3, true})
 }

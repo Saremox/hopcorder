@@ -78,8 +78,14 @@ sudo systemctl enable --now hopcorder
   load-balanced path is traced as one consistent path instead of flapping
   between members. ICMP keeps identifier and checksum constant (the payload
   compensates for the sequence number); UDP keeps both ports fixed and makes
-  the UDP checksum the probe id. `flow_id` (ICMP id / UDP source port) is on
-  every record. `paris: false` gives classic traceroute behaviour.
+  the UDP checksum the probe id; TCP keeps both ports fixed and carries the
+  probe id in the SYN's sequence number. `flow_id` (ICMP id / UDP or TCP
+  source port) is on every record. `paris: false` gives classic traceroute
+  behaviour.
+- **TCP SYN probes** reach destinations behind firewalls that drop ICMP and
+  UDP. The destination's SYN-ACK or RST counts as `reply` (so does an ICMP
+  port unreachable from the destination itself, i.e. a REJECT rule). The
+  kernel resets the half-open connection; no connection is ever established.
 - **One shared listener per address family**, replies matched to probes by
   parsing the original packet quoted inside ICMP errors. No goroutine per
   probe.
@@ -94,7 +100,9 @@ One JSON record per (target, cycle). `seq` is monotonic per agent and survives
 restarts; `(agent_id, seq)` is the idempotency key. Per hop, `status` is
 `reply` (the destination answered; for UDP, its port-unreachable),
 `ttl-expired`, `unreachable` (with the ICMP `code`) or `no-reply`; `ip` and
-`rtt_us` are present unless `no-reply`.
+`rtt_us` are present unless `no-reply`. Routers inside an MPLS tunnel often
+report the label stack in their ICMP errors (RFC 4950); hopcorder records it
+as `mpls: [{label, tc, s, ttl}, …]` on that hop.
 
 Derived per cycle:
 
@@ -103,10 +111,13 @@ Derived per cycle:
   the last responding hop and the rest dropped. `path_len` is the number of
   hops kept.
 - **`path_hash`**: first 16 hex chars of SHA-1 over the hop IPs joined with
-  `|`, `*` for silent hops. A different router at any TTL changes it. Note
-  that a hop which answers in some cycles and not in others alternates
-  between two hashes (its address vs `*`); see the open question in
-  `docs/HANDOFF.md` §10.
+  `|`, `*` for silent hops: a fingerprint of the exact snapshot. A hop that
+  answers in some cycles and not others alternates between two hashes, so
+  don't count route changes by comparing hashes. hopcorder decides route
+  changes (for `hopcorder_path_changes_total`) by remembering the last
+  address at each TTL and treating silent hops as wildcards: a change is a
+  TTL answering from a different address, a reached destination at a
+  different distance, or a different target address.
 - **`loops`**: addresses that answered *time exceeded* at more than one TTL.
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
@@ -132,13 +143,22 @@ next to a running agent.
 - **NAT** in front of the agent usually rewrites and restores the probe
   headers transparently; a NAT that does not restore the quoted header breaks
   reply matching (every hop beyond it shows `no-reply`).
+- **TCP "reply" may come from a middlebox.** Transparent proxies, SYN proxies
+  and some load balancers answer the SYN with the destination's address, so a
+  TCP trace can "reach" the target hops early (seen on the first test: port
+  443 answered at TTL 2 behind a proxy). Compare with an ICMP or UDP trace to
+  the same target when TCP distances look short.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
   probing the same target with the same `flow_id` can occasionally pick up
   each other's replies. Use a different `flow_id` for side-by-side runs.
-- **Beyond the destination**, every TTL up to `max_ttl` is still probed and
-  answered by the destination (trimmed from the record). Keep `max_ttl` near
-  your longest path if destination rate limiting matters (UDP port-unreachable
-  replies are rate limited by most hosts).
+- **Beyond the destination**: with `adaptive_max_ttl` (default), once a
+  target has been reached, cycles probe only 3 TTLs past its distance. If such
+  a cycle neither reaches the destination nor hits an unreachable (the path
+  grew, or the destination went silent), the same cycle probes the remaining
+  TTLs up to `max_ttl`, so records are identical to full-depth probing.
+  Unreached targets are always probed to `max_ttl`. This also keeps the
+  destination from being asked for ~20 replies per cycle, which matters for
+  UDP, whose port-unreachable replies most hosts rate-limit.
 
 ## Configuration
 
@@ -154,8 +174,9 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `timeout` | `1s` | `--timeout` | Per-probe timeout; must be shorter than the interval |
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
-| `protocol` | `icmp` | `--protocol` | Default protocol: `icmp` or `udp` (`tcp` is planned) |
+| `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
 | `paris` | `true` | `--paris` | Flow-stable probing |
+| `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
 | `log.level` | `info` | `--log-level` | `debug`, `info`, `warn`, `error` |
 | `log.format` | `text` | `--log-format` | `text` or `json` (to stderr) |
@@ -164,17 +185,18 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `spool.max_bytes` | `1GiB` | | Stored (compressed) record bytes kept |
 
 **Targets** (`targets:` list): `host` (name or address, required), and
-overrides `protocol`, `port` (UDP destination, default 33434), `af` (`4` or
+overrides `protocol`, `port` (destination port: default 33434 for UDP, 443
+for TCP), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
-arguments), `flow_id` (default 33434), `paris`, `interval`, `timeout`,
-`max_ttl`, `probe_past`.
+arguments), `flow_id` (default 33434), `paris`, `adaptive_max_ttl`,
+`interval`, `timeout`, `max_ttl`, `probe_past`.
 
 **Outputs** (at least one):
 
 - `jsonl.path` (`--jsonl`): append records to a file, `-` for stdout. Synced to
   disk per batch. After a crash records may repeat (dedup on
   `(agent_id, seq)`); a torn write never runs into the next record. Rotate
-  with `copytruncate`.
+  by renaming and sending SIGHUP (see Operations) or with `copytruncate`.
 - `http`: POST zstd-compressed NDJSON to `<url>/api/v1/ingest`. Options: `url`,
   `headers`, `bearer_token` or `bearer_token_file`, `basic_auth`
   (`username`, `password` or `password_file`), `tls` (`ca_file`, `cert_file`,
@@ -198,7 +220,7 @@ hop addresses.
 | `hopcorder_cycles_total` | target, protocol, result=`reached`\|`unreached` | Completed cycles |
 | `hopcorder_e2e_rtt_seconds` | target, protocol | Histogram of destination RTT |
 | `hopcorder_path_length` | target, protocol | Hops in the last cycle |
-| `hopcorder_path_changes_total` | target, protocol | Cycles whose `path_hash` changed |
+| `hopcorder_path_changes_total` | target, protocol | Route changes (silent hops match anything; see above) |
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
@@ -216,6 +238,26 @@ hop addresses.
 - **Shutdown** (SIGINT/SIGTERM): probing stops at once (in-flight cycles are
   abandoned), outputs get up to 3 seconds to ship what is spooled, and the rest
   stays in the spool for the next start.
+- **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
+  again with the same command-line flags applied on top. If it is invalid, the
+  error is logged and the running configuration stays. Otherwise the agent
+  restarts in-process with it (raw sockets stay open, seq continues); if the
+  new configuration cannot start, for example because its metrics address is
+  taken, the previous one is started again. Every reload reopens the JSONL
+  file, so log rotation can rename it and send SIGHUP instead of using
+  `copytruncate`:
+
+  ```
+  /var/log/hopcorder/records.jsonl {
+      daily
+      rotate 14
+      compress
+      delaycompress
+      postrotate
+          systemctl reload hopcorder
+      endscript
+  }
+  ```
 - **No route to a target** (uplink down) is recorded as a cycle in which
   nothing answered, so outages are visible as data rather than gaps.
 - **DNS**: names are re-resolved in the background every `dns_ttl`; if that
