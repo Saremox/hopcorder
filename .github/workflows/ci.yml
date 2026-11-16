@@ -198,7 +198,7 @@ jobs:
         run: |
           docker build --target server -t hopcorder-server:ci .
           docker build --target agent -t hopcorder-agent:ci .
-      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           cluster_name: hc
       - run: kind load docker-image hopcorder-server:ci hopcorder-agent:ci --name hc
