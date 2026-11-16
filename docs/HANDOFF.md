@@ -269,20 +269,21 @@ for HTTP, logging, and everything else. Ask before adding anything else.
 
 ### M1 — Agent (this handoff)
 
-- [ ] `internal/record`: types, `path_hash`, loop detection, trimming;
+- [x] `internal/record`: types, `path_hash`, loop detection, trimming;
       table-driven tests
-- [ ] `internal/probe`: interface + fake; ICMP v4/v6 raw implementation with
-      reply demux; UDP; paris mode
-- [ ] `internal/agent`: per-target scheduler, stagger, DNS refresh, overrun
+- [x] `internal/probe`: interface + fake; ICMP v4/v6 raw implementation with
+      reply demux; UDP; paris mode (TCP SYN deferred to M2; IPv6 verified by
+      golden bytes and the in-memory network only, see §10)
+- [x] `internal/agent`: per-target scheduler, stagger, DNS refresh, overrun
       handling
-- [ ] `internal/spool`: durable, bounded, crash-safe; tests incl. simulated
+- [x] `internal/spool`: durable, bounded, crash-safe; tests incl. simulated
       crash
-- [ ] `internal/output`: jsonl, http (with auth options + backoff), metrics
-- [ ] `internal/config`: YAML + flags + validation
-- [ ] `hopcorder agent` and `hopcorder agent --once`
-- [ ] README: install, `setcap`, config reference, the rate-limiting/ECMP
+- [x] `internal/output`: jsonl, http (with auth options + backoff), metrics
+- [x] `internal/config`: YAML + flags + validation (SIGHUP reload not done)
+- [x] `hopcorder agent` and `hopcorder agent --once`
+- [x] README: install, `setcap`, config reference, the rate-limiting/ECMP
       caveats
-- [ ] systemd unit in `deploy/`
+- [x] systemd unit in `deploy/`
 
 **M1 done when:** against a real target, `hopcorder agent --once` produces
 records matching the schema above; a 24h run against a few targets shows no
