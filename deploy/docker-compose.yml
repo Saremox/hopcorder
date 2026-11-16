@@ -4,21 +4,29 @@
 #
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
-# then open http://localhost:3000 (anonymous read access; admin/admin to edit).
-# The agent's targets are in deploy/compose/agent.yaml. Every published port
-# listens on localhost only, and nothing here has a password: this is not a
-# production setup (see README.md).
+# then open http://localhost:3000 (anonymous read access; admin/admin to edit)
+# or the server's UI at http://localhost:8080/ui/. The agent's targets are in
+# deploy/compose/agent.yaml. Published ports listen on localhost only;
+# ClickHouse is not published at all (`docker compose exec clickhouse
+# clickhouse-client` to query it), and Grafana reads it with a read-only
+# user. The passwords below are fixed: this is not a production setup (see
+# README.md).
 name: hopcorder
 
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
     environment:
-      CLICKHOUSE_SKIP_USER_SETUP: "1" # the passwordless default user, as in ClickHouse's own defaults
-    ports: ["127.0.0.1:8123:8123"]
-    volumes: ["clickhouse:/var/lib/clickhouse"]
+      # The server's user; it may create users, for the init script below.
+      CLICKHOUSE_USER: hopcorder
+      CLICKHOUSE_PASSWORD: hopcorder
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse:/var/lib/clickhouse
+      # Creates Grafana's read-only user on the first start (an empty volume).
+      - ./compose/clickhouse-init.sql:/docker-entrypoint-initdb.d/grafana.sql:ro
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      test: ["CMD", "clickhouse-client", "--user", "hopcorder", "--password", "hopcorder", "--query", "SELECT 1"]
       interval: 2s
       timeout: 5s
       retries: 60
@@ -61,8 +69,8 @@ services:
       HOPCORDER_CLICKHOUSE_HOST: clickhouse
       HOPCORDER_CLICKHOUSE_PORT: "8123"
       HOPCORDER_CLICKHOUSE_DATABASE: hopcorder
-      HOPCORDER_CLICKHOUSE_USER: default
-      HOPCORDER_CLICKHOUSE_PASSWORD: ""
+      HOPCORDER_CLICKHOUSE_USER: grafana # read-only (compose/clickhouse-init.sql)
+      HOPCORDER_CLICKHOUSE_PASSWORD: grafana
     ports: ["127.0.0.1:3000:3000"]
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro

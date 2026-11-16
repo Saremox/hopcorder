@@ -3,6 +3,8 @@
 listen: 0.0.0.0:8080            # published on 127.0.0.1:8080 only
 clickhouse:
   url: http://clickhouse:8123
+  user: hopcorder               # the try-out's fixed credentials (docker-compose.yml)
+  password: hopcorder
   retention_days: 30
 enrich:
   asn:

@@ -690,8 +690,9 @@ added in the commit that introduced it.
 - **One dashboard**, `hopcorder-overview`, in three rows following the
   prototype's questions. Variables: `datasource`, `agent`, `target`,
   `protocol`, and `target_b` (the second target to compare, defaulting to
-  one other than `target`). Values go into SQL as `${name:sqlstring}`
-  (quoted and escaped by Grafana), never inside hand-written quotes.
+  one other than `target`). Values go into SQL as
+  `decodeURLComponent('${name:percentencode}')`: Grafana's `sqlstring`
+  format turned out unsafe for ClickHouse (see "Security review").
 - **Prototype queries → panels**:
   - Q1 reachability: from `cycles` (one row per cycle, so no `ttl = 1`
     trick), one series per target and protocol. Next to it the server's
@@ -897,4 +898,26 @@ fixes. The decisions:
   is about 7 and 30 MB), 5 million ranges, AS names cut to 128 bytes without
   control characters; redirects from https to http are refused; a plain-http
   URL is warned about at startup.
+
+**Dashboards and the compose stack**
+- **Variables are percent-encoded**: every dashboard query takes values as
+  `decodeURLComponent('${name:percentencode}')`. Grafana's `sqlstring`
+  format only doubles `'`, but ClickHouse also reads `\'` as an escaped
+  quote, so a value with a backslash ended the string: an agent_id like
+  `!\' OR 1=1 UNION ALL SELECT name FROM system.users --` ran its SQL for
+  every viewer (confirmed on ClickHouse 25.8; the `!` sorted it first in the
+  agent variable). `percentencode` only emits `[A-Za-z0-9-_.~%]` (checked in
+  Grafana's source), and the server's new character sets refuse such values
+  anyway. `go test ./dashboards/` refuses any other variable form, and
+  `TestDashboardQueriesInjection` (clickhouse tag) runs every query with that
+  payload.
+- **Grafana reads ClickHouse with a read-only user** in the compose stack
+  (`deploy/compose/clickhouse-init.sql`): SELECT on the hopcorder database,
+  `readonly = 2` (no writes; the plugin may still set query settings), and no
+  privileges for table functions (`url()`, `file()`). Any viewer, anonymous
+  ones included, can send Grafana SQL, so that user is the boundary.
+- **ClickHouse is no longer published** on the host (`docker compose exec
+  clickhouse clickhouse-client` instead), so web pages a user visits cannot
+  post SQL to `127.0.0.1:8123`. The server uses its own ClickHouse user; the
+  passwords are fixed, as the stack is a try-out.
 
