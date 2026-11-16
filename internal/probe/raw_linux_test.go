@@ -321,12 +321,16 @@ type topoCase struct {
 	name   string
 	target string
 	hops   []string // routers at TTL 1, 2
+	// r1Link2 is r1's address on the r1–r2 link. A router may source an
+	// ICMP error from the interface the offending packet arrived on (Linux
+	// does for IPv6), so on the loop legs r1 can answer from this address.
+	r1Link2 string
 }
 
 func topoCases() []topoCase {
-	cs := []topoCase{{"v4", "10.99.3.2", []string{"10.99.1.1", "10.99.2.2"}}}
+	cs := []topoCase{{"v4", "10.99.3.2", []string{"10.99.1.1", "10.99.2.2"}, "10.99.2.1"}}
 	if ipv6Supported() {
-		cs = append(cs, topoCase{"v6", "fd99:3::2", []string{"fd99:1::1", "fd99:2::2"}})
+		cs = append(cs, topoCase{"v6", "fd99:3::2", []string{"fd99:1::1", "fd99:2::2"}, "fd99:2::1"})
 	}
 	return cs
 }
@@ -375,12 +379,22 @@ func TestInnerLoop(t *testing.T) {
 			for i, h := range res {
 				hops[i] = record.Hop{TTL: h.TTL, Status: h.Status, IP: h.From, RTTMicros: 1}
 			}
+			// r2 answers every even TTL, r1 every odd one beyond the first,
+			// from whichever of its addresses its kernel picks.
 			loops := record.DetectLoops(record.Trim(hops, 2))
-			if len(loops) != 2 {
-				t.Fatalf("detected loops %v in %+v, want r1 and r2 looping", loops, res)
+			var r1, r2 bool
+			for _, l := range loops {
+				ttls := fmt.Sprint(l.TTLs)
+				switch ip := l.IP.String(); {
+				case ip == c.hops[1] && ttls == "[2 4 6]":
+					r2 = true
+				case (ip == c.hops[0] && ttls == "[1 3 5]") || (ip == c.r1Link2 && ttls == "[3 5]"):
+					r1 = true
+				}
 			}
-			if loops[0].IP.String() != c.hops[0] || loops[1].IP.String() != c.hops[1] {
-				t.Errorf("loops %v, want %v", loops, c.hops)
+			if len(loops) != 2 || !r1 || !r2 {
+				t.Errorf("detected loops %v in %+v, want r1 (%s or %s) and r2 (%s) looping",
+					loops, res, c.hops[0], c.r1Link2, c.hops[1])
 			}
 			time.Sleep(1100 * time.Millisecond)
 		})
