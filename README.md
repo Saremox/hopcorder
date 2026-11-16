@@ -45,6 +45,65 @@ or from a checkout:
 make build
 ```
 
+### Container images
+
+Every push to `main` publishes multi-arch (amd64, arm64) images built from
+the [`Dockerfile`](Dockerfile), static binaries on an empty base:
+
+| Image | Runs as | Default arguments |
+| --- | --- | --- |
+| `ghcr.io/saremox/hopcorder-agent` | root, needs `CAP_NET_RAW` only | `--config /etc/hopcorder/agent.yaml` |
+| `ghcr.io/saremox/hopcorder-server` | uid 65532 | `--listen :8080` |
+
+Tags: `main` and `sha-<commit>`; releases (`v*` tags) also `<version>` and
+`latest`.
+
+```bash
+docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET_RAW \
+  -v "$PWD/agent.yaml:/etc/hopcorder/agent.yaml:ro" -v hopcorder-spool:/var/lib/hopcorder \
+  ghcr.io/saremox/hopcorder-agent:main
+```
+
+```bash
+docker run -d --name hopcorder-server -p 8080:8080 \
+  ghcr.io/saremox/hopcorder-server:main --listen :8080 --clickhouse-url http://clickhouse:8123
+```
+
+The agent runs as root because container runtimes only grant capabilities to
+root; give it `NET_RAW` and nothing else. `docker build --target agent` (or
+`server`) builds them locally.
+
+### Kubernetes
+
+Helm charts for both live in [`deploy/helm`](deploy/helm) (published to
+`oci://ghcr.io/saremox/charts` with each release):
+
+```bash
+helm install hopcorder-server deploy/helm/hopcorder-server \
+  --set config.clickhouse.url=http://clickhouse.db:8123 \
+  --set clickhouse.passwordSecret.name=clickhouse-password
+```
+
+```bash
+helm install hopcorder-agent deploy/helm/hopcorder-agent \
+  --set server.url=http://hopcorder-server:8080 \
+  --set 'config.targets[0].host=example.net' \
+  --set 'config.targets[1].host=192.0.2.10' --set 'config.targets[1].protocol=tcp'
+```
+
+- **Server**: one replica (it derives route changes and outages from each
+  stream's history in memory), `Recreate` on upgrade, probes on `/healthz`
+  and `/readyz`, optional Ingress and ServiceMonitor. Bring your own
+  ClickHouse. Until the first release, add `--set image.tag=main`.
+- **Agent**: `mode: statefulset` (default) runs `replicas` agents named
+  after their pods, each with its own spool volume; `mode: daemonset` runs one
+  agent per node, named after the node, with its spool on the node.
+  `hostNetwork: true` traces from the node's network. The pods run as root
+  with only `NET_RAW`, so the namespace needs Pod Security `baseline`.
+
+Every value is documented in the charts' `values.yaml`. CI installs both
+charts into a kind cluster and checks that records arrive.
+
 ### Privileges: `CAP_NET_RAW`, not root
 
 hopcorder opens raw sockets, which needs `CAP_NET_RAW`. It never needs root.

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hopcorder-server.fullname" . }}
+  labels:
+    {{- include "hopcorder-server.labels" . | nindent 4 }}
+data:
+  server.yaml: |
+    {{- include "hopcorder-server.config" . | nindent 4 }}

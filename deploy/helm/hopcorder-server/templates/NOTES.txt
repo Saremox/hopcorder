@@ -1,0 +1,12 @@
+hopcorder server {{ .Chart.AppVersion }} is starting. It is ready once it has
+reached ClickHouse at {{ .Values.config.clickhouse.url }} and applied the schema:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "hopcorder-server.fullname" . }}
+
+Point agents at http://{{ include "hopcorder-server.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+(the hopcorder-agent chart's server.url). The UI and read API:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hopcorder-server.fullname" . }} 8080:{{ .Values.service.port }}
+  open http://127.0.0.1:8080/ui/
+
+hopcorder does no authentication: secure ingest and the UI at your ingress.

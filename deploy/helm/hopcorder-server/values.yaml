@@ -1,0 +1,105 @@
+# hopcorder server. Needs a ClickHouse reachable over its HTTP interface;
+# the server creates its database and applies migrations on startup.
+
+image:
+  repository: ghcr.io/saremox/hopcorder-server
+  tag: ""                     # default: the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# The server's configuration file (see deploy/server.example.yaml for every
+# key; unknown keys are rejected). The chart sets listen, the ASN cache file
+# and, with clickhouse.passwordSecret, clickhouse.password_file.
+config:
+  log:
+    level: info
+    format: json
+  clickhouse:
+    url: http://clickhouse:8123
+    database: hopcorder
+    user: default
+    timeout: 30s
+    retention_days: 90        # 0 keeps data forever
+  ingest:
+    max_body_bytes: 64MiB
+    max_decoded_bytes: 512MiB
+  enrich:
+    rdns:
+      enabled: true
+    asn:
+      enabled: true
+      # url: ""               # no internet: maintain the file yourself (persistence)
+      refresh: 24h
+  metrics: true
+  ui: true
+
+clickhouse:
+  # The ClickHouse password from an existing Secret.
+  passwordSecret:
+    name: ""
+    key: password
+
+# The ASN database cache. Without a volume it lives in an emptyDir and is
+# downloaded again whenever the pod is replaced (about 10 MB).
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  existingClaim: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# hopcorder does no authentication. Secure /api/v1/ingest (agents) and
+# /api/v1/query/ and /ui/ (readers) at the ingress or proxy, e.g. with
+# auth annotations of your ingress controller.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: hopcorder.example.net
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Prometheus Operator ServiceMonitor for /metrics (config.metrics: true).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 1Gi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+extraArgs: []

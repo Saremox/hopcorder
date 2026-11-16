@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "hopcorder-agent.fullname" . }}
+  labels:
+    {{- include "hopcorder-agent.labels" . | nindent 4 }}
+data:
+  agent.yaml: |
+    {{- include "hopcorder-agent.config" . | nindent 4 }}
