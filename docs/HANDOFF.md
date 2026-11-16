@@ -250,6 +250,7 @@ internal/config/        load, defaults, validation
 internal/server/        (milestone 2)
 deploy/                 systemd units, example configs, docker-compose, Grafana provisioning (Helm chart later)
 dashboards/             Grafana JSON, plus a Go package that reads its queries for tests
+ui/                     the web UI's source (Vue 3 + TypeScript + Vite); built into internal/ui/dist
 docs/                   this file, prototype/
 ```
 
@@ -332,6 +333,16 @@ Queries are in `docs/prototype/schema.sql`. Plus `deploy/docker-compose.yml`
 Vue 3 + TypeScript + Vite, embedded via `embed.FS`, served under `/ui/`. Main
 view: path topology over time (hop graph with time scrubber, highlighting path
 changes and loops). ECharts or Cytoscape.js.
+
+- [x] `/api/v1/query/topology` (nodes, edges, timeline per stream) and
+      `order=asc` on `cycles` for stepping
+- [x] `ui/`: stream list; stream view with the reachability timeline and
+      scrubber, the hop graph (ECharts), the selected cycle, route changes,
+      outages and loops
+- [x] Embedded from `internal/ui/dist` and served under `/ui/` with a CSP,
+      gzip and caching; `ui: false` turns it off
+- [x] Unit tests (Go and Vitest), a ClickHouse test of the aggregation, and
+      browser tests (Playwright) against a real server in CI (`ui` job)
 
 ## 8. Testing
 
@@ -719,3 +730,50 @@ added in the commit that introduced it.
   stack also ran in the development container: provisioning loaded, and the
   agent traced and shipped through the server to ClickHouse. How the panels
   look has not been reviewed by a person yet.
+
+### M4 — Embedded UI
+
+- **ECharts, not Cytoscape.js**: one library draws both the hop graph and
+  the timeline (Cytoscape.js would need a second one for the timeline).
+  Imported per chart type, so only the graph, bar and line charts and their
+  components are bundled (about 670 KB, 230 KB gzipped).
+- **Dependencies** (the npm side of "ask before adding dependencies"; the
+  handoff named Vue 3, TypeScript, Vite and ECharts): runtime `vue` and
+  `echarts`; build and test `vite`, `@vitejs/plugin-vue`, `typescript` (5.9:
+  `vue-tsc` does not run on the native TypeScript 7 yet), `vue-tsc`,
+  `vitest`, `@playwright/test`. Versions are pinned exactly, with the
+  lockfile committed. No router or state library: the view state is a few
+  fields kept in the URL hash.
+- **The build is committed** (`internal/ui/dist`), so `go build` and
+  `go install` need no Node.js. CI rebuilds it and fails if it differs from
+  the committed one.
+- **Hash routing and relative URLs**: assets load relative to `index.html`
+  and the API is `../api/v1/query/` from the UI, so the UI works under any
+  reverse-proxy prefix and the server needs no SPA fallback. `/` and `/ui`
+  redirect to `ui/` with a relative `Location` for the same reason.
+- **Serving**: files are read from the embedded build at startup; hashed
+  assets are cached for a year, `index.html` is revalidated by ETag; text
+  files are gzipped once at startup. Every response carries a CSP that only
+  allows the UI's own scripts and API; inline styles are allowed because
+  ECharts styles its tooltips inline. Tooltip text is HTML-escaped (hop
+  names come from reverse DNS, AS names from a downloaded file).
+- **Topology API**: nodes are (TTL, address) pairs that answered, with
+  cycles, median RTT, AS, name and whether they were seen in a loop; edges
+  join consecutive answering hops of a cycle, so an edge spans the silent
+  TTLs between (drawn dashed). Silent hops are not nodes: a rate-limited
+  router would otherwise add a `*` node per TTL. The timeline has at most
+  400 buckets of round sizes (5 s to 1 day). At most 2000 nodes and 5000
+  edges, busiest first, with `truncated: true` beyond.
+- **Layout**: one column per TTL; within a column, nodes are ordered by the
+  cycle-weighted mean position of their predecessors (barycenter), so routes
+  run straight where they can, and by traffic where there is no predecessor.
+  Node size and edge width follow the share of cycles; colour is the origin
+  AS (the seven busiest ASes get their own colour).
+- **Selected moment**: the newest cycle at or before it (`cycles?to=…&
+  limit=1`); without one, the UI follows the latest cycle and refreshes
+  relative ranges every 30 s.
+- **Found by the browser tests**: the timeline query failed for a bucket in
+  which no cycle reached the destination (`toUInt32` of a NaN median); the
+  medians now default to 0 there, and the ClickHouse test covers it.
+- **Not done**: on phone screens the graph's labels crowd (zoom works);
+  there is no per-address history view yet.

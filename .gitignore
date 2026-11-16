@@ -34,3 +34,8 @@ go.work.sum
 
 # Build output
 /hopcorder
+
+# UI dependencies and test output (the build in internal/ui/dist is committed)
+ui/node_modules/
+ui/test-results/
+ui/playwright-report/

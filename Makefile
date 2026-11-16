@@ -2,7 +2,7 @@ GO      ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test race vet lint rawsock clickhouse grafana up down setcap clean
+.PHONY: all build test race vet lint rawsock clickhouse grafana up down ui ui-test e2e setcap clean
 
 all: vet lint test build
 
@@ -33,6 +33,19 @@ rawsock:
 HOPCORDER_CLICKHOUSE_URL ?= http://127.0.0.1:8123
 clickhouse:
 	HOPCORDER_CLICKHOUSE_URL=$(HOPCORDER_CLICKHOUSE_URL) $(GO) test -tags clickhouse -count=1 ./internal/server/... ./cmd/hopcorder/...
+
+# The web UI (ui/). `make ui` rebuilds internal/ui/dist, which is committed
+# so that the Go build needs no Node.js; commit it with the source change.
+ui:
+	cd ui && npm ci && npm run build
+
+ui-test:
+	cd ui && npm ci && npm run typecheck && npm test
+
+# Browser tests against a running server (with ui/e2e/asn.tsv as its ASN
+# database for the AS assertions), e.g. HOPCORDER_URL=http://127.0.0.1:8080/
+e2e:
+	cd ui && npx playwright test
 
 # The docker-compose try-out stack (ClickHouse, server, agent, Grafana).
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
