@@ -39,3 +39,4 @@ enrich:
     refresh: 24h
 
 metrics: true                   # serve Prometheus metrics on /metrics
+ui: true                        # serve the web UI on /ui/

@@ -3,3 +3,5 @@
 /hopcorder
 **/*.test
 *.out
+ui/node_modules
+ui/test-results

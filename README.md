@@ -11,8 +11,8 @@ limiting on routers and shows 80–97% "loss" on hops that forward traffic fine.
 hopcorder sends **one probe per TTL per cycle, all TTLs in parallel**, and
 writes one record per cycle with the responding address at every TTL.
 
-Status: milestone 3. The agent, the ingest server (ClickHouse) and the
-Grafana dashboards are done; a topology UI is planned. See
+Status: milestone 4. The agent, the ingest server (ClickHouse), the Grafana
+dashboards and the built-in topology UI are done. See
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Try it out
@@ -25,8 +25,9 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 This starts ClickHouse, the server, an agent tracing three public resolvers
 (ICMP, UDP and TCP; edit [`deploy/compose/agent.yaml`](deploy/compose/agent.yaml)
-for your own targets) and Grafana with the dashboards at
-<http://localhost:3000>. Data shows up within a minute. Everything listens on
+for your own targets), the server's own UI at <http://localhost:8080/ui/>
+and Grafana with the dashboards at <http://localhost:3000>. Data shows up
+within a minute. Everything listens on
 localhost only and nothing has a password: it is a try-out, not a deployment.
 `docker compose -f deploy/docker-compose.yml down -v` removes it with its data.
 
@@ -308,10 +309,17 @@ reverse proxy in front and secure the path prefixes separately.
 | `GET /api/v1/query/path-changes` | readers | route changes with the TTLs and addresses that changed |
 | `GET /api/v1/query/loops` | readers | looping addresses per cycle |
 | `GET /api/v1/query/outages` | readers | reachability-loss windows (open ones have `end_ts: null`) |
+| `GET /api/v1/query/topology` | readers | one stream aggregated for the hop graph: `nodes`, `edges`, `timeline` (`agent`, `target` required) |
+| `GET /ui/` | readers | the web UI (`ui: false` turns it off) |
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
 Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
-ms; default the last 24h), `limit` (default 1000, max 10000).
+ms; default the last 24h), `limit` (default 1000, max 10000). Results are
+newest first; `cycles` also takes `order=asc`. `topology` returns every
+address that answered at each TTL (`nodes`), every pair of consecutive
+answering hops within a cycle (`edges`, which skip silent TTLs), and
+reachability per time bucket (`timeline`, at most 400 buckets); nodes and
+edges are capped (`truncated: true`).
 
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the
@@ -336,6 +344,28 @@ on current ClickHouse ([`docs/HANDOFF.md`](docs/HANDOFF.md) §10). Data expires 
 `clickhouse.retention_days` (default 90). Route changes use
 the same rule as the agent's metric: silent hops match anything, so a
 rate-limited router flickering does not count.
+
+## Web UI
+
+The server serves a UI at `/ui/` (behind the same reverse proxy as the read
+API; it works under any path prefix). Pick a stream, then:
+
+- **The timeline** shows the share of cycles that missed the destination and
+  its RTT, outage windows and route changes. Click or drag on it to select a
+  moment, or step with the buttons (← → cycle by cycle, Shift+← → route
+  change by route change).
+- **The path topology** draws every address that answered, one column per
+  TTL, coloured by origin AS, with edges as wide as the share of cycles that
+  took them (dashed where silent TTLs lie between). The selected cycle's path
+  is highlighted; at a route change the old and new hops are ringed, and
+  loops are drawn in magenta. Scroll to zoom, drag to pan, click an address
+  for details.
+- **The cycle** hop by hop (address, name, AS, RTT, status, MPLS labels), and
+  the range's route changes, outages and loops, each a click away.
+
+The URL holds the whole view, so links can be shared.
+
+![The topology UI at a route change](docs/images/ui.png)
 
 ## Dashboards
 
@@ -400,6 +430,25 @@ HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123 go test -tags clickhouse ./intern
 They include every dashboard query, expanded the way Grafana and the plugin
 would. The `grafana` tag runs them through Grafana itself, against the compose
 stack (`make up`, then `make grafana`).
+
+The UI lives in [`ui/`](ui/) (Vue 3, TypeScript, Vite, ECharts; Node.js 22).
+Its build in `internal/ui/dist` is committed, so building hopcorder needs no
+Node.js; rebuild and commit it with every UI change (`make ui`, which CI
+checks):
+
+```bash
+cd ui && npm ci
+npm run dev        # http://localhost:5173, API proxied to a server on :8080
+npm test           # unit tests
+npm run build      # type check, then write internal/ui/dist
+```
+
+Browser tests (Playwright) run against a server with ClickHouse and
+`ui/e2e/asn.tsv` as its ASN database (see the `ui` job in CI):
+
+```bash
+HOPCORDER_URL=http://127.0.0.1:8080/ make e2e
+```
 
 ## License
 
