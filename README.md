@@ -100,7 +100,9 @@ One JSON record per (target, cycle). `seq` is monotonic per agent and survives
 restarts; `(agent_id, seq)` is the idempotency key. Per hop, `status` is
 `reply` (the destination answered; for UDP, its port-unreachable),
 `ttl-expired`, `unreachable` (with the ICMP `code`) or `no-reply`; `ip` and
-`rtt_us` are present unless `no-reply`.
+`rtt_us` are present unless `no-reply`. Routers inside an MPLS tunnel often
+report the label stack in their ICMP errors (RFC 4950); hopcorder records it
+as `mpls: [{label, tc, s, ttl}, …]` on that hop.
 
 Derived per cycle:
 

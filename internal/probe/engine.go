@@ -307,7 +307,7 @@ func (e *engine) handle(from netip.Addr, msg []byte, at time.Time) {
 		r, err = parseICMPv6(from, msg)
 	}
 	if err == nil {
-		e.resolve(from, r, at)
+		e.resolve(from, r, at, msg)
 	}
 }
 
@@ -316,11 +316,13 @@ func (e *engine) handle(from netip.Addr, msg []byte, at time.Time) {
 func (e *engine) handleTCP(from netip.Addr, seg []byte, at time.Time) {
 	from = from.Unmap().WithZone("")
 	if r, err := parseTCP(from, seg); err == nil {
-		e.resolve(from, r, at)
+		e.resolve(from, r, at, nil)
 	}
 }
 
-func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time) {
+// resolve records reply r for its pending probe. msg is the ICMP message,
+// for extensions; nil for TCP replies.
+func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time, msg []byte) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p, ok := e.pending[r.key]
@@ -349,7 +351,9 @@ func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time) {
 		res.Status = record.StatusReply
 	case kindTimeExceeded:
 		res.Status = record.StatusTTLExpired
+		res.MPLS = parseMPLS(msg, from.Is6())
 	case kindUnreachable:
+		res.MPLS = parseMPLS(msg, from.Is6())
 		portUnreach := (from.Is4() && r.code == icmp4PortUnreach) || (from.Is6() && r.code == icmp6PortUnreach)
 		// For UDP this is the normal answer; for TCP it is a REJECTing
 		// firewall on the destination itself. Either way it answered.

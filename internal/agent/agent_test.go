@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -300,7 +301,9 @@ func TestRecordAssembly(t *testing.T) {
 	f.Set(addr(tg.Host), probe.Scenario{
 		Hops: []probe.FakeHop{
 			{IPs: []netip.Addr{addr("10.0.0.1")}, RTT: 400 * time.Nanosecond}, // rounds up to 1µs
-			hop("62.115.120.1"), hop("62.115.120.2"), hop("62.115.120.1"),
+			{IPs: []netip.Addr{addr("62.115.120.1")}, RTT: time.Millisecond,
+				MPLS: []record.MPLSLabel{{Label: 24005, S: true, TTL: 1}}},
+			hop("62.115.120.2"), hop("62.115.120.1"),
 			{IPs: []netip.Addr{addr("62.115.120.9")}, Unreachable: record.IntPtr(0)},
 		},
 	})
@@ -315,6 +318,9 @@ func TestRecordAssembly(t *testing.T) {
 	}
 	if r.Hops[0].RTTMicros != 1 {
 		t.Errorf("sub-microsecond rtt recorded as %d", r.Hops[0].RTTMicros)
+	}
+	if want := []record.MPLSLabel{{Label: 24005, S: true, TTL: 1}}; !reflect.DeepEqual(r.Hops[1].MPLS, want) {
+		t.Errorf("hop 2 mpls %+v, want %+v", r.Hops[1].MPLS, want)
 	}
 	last := r.Hops[len(r.Hops)-1]
 	if r.PathLen != 5 || last.Status != record.StatusUnreachable || last.Code == nil || *last.Code != 0 {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
@@ -47,6 +48,8 @@ type simPath struct {
 	blackhole bool
 	// dup sends every reply twice.
 	dup bool
+	// mpls maps TTL -> label stack the router at that TTL reports.
+	mpls map[int][]record.MPLSLabel
 }
 
 func newSim() *simNet {
@@ -135,7 +138,11 @@ func (s *simNet) reply(path *simPath, p *outPacket, ttl int) (netip.Addr, []byte
 		if v4 {
 			typ = icmp4TimeExceeded
 		}
-		return r, icmpError(typ, 0, p)
+		msg := icmpError(typ, 0, p)
+		if l, ok := path.mpls[ttl]; ok {
+			msg = withMPLS(msg, !v4, l)
+		}
+		return r, msg
 	case path.blackhole:
 		return netip.Addr{}, nil
 	case p.proto == protoTCP:
@@ -643,4 +650,55 @@ func TestEngineTCPRejectedByDestination(t *testing.T) {
 		{record.StatusTTLExpired, "10.0.0.1", 0},
 		{record.StatusReply, "198.51.100.7", 0},
 	})
+}
+
+// withMPLS turns an ICMP error into an RFC 4884 multi-part message: the
+// quoted datagram padded to 128 bytes, its length in the header, and an
+// extension carrying labels.
+func withMPLS(msg []byte, v6 bool, labels []record.MPLSLabel) []byte {
+	quoted := make([]byte, 128)
+	copy(quoted, msg[8:])
+	out := append(append([]byte{}, msg[:8]...), quoted...)
+	if v6 {
+		out[4] = 128 / 8
+	} else {
+		out[5] = 128 / 4
+	}
+	obj := []byte{0, byte(4 + 4*len(labels)), extClassMPLS, extCTypeLabelStack}
+	for _, l := range labels {
+		v := l.Label<<12 | uint32(l.TC)<<9 | uint32(l.TTL)
+		if l.S {
+			v |= 0x100
+		}
+		obj = binary.BigEndian.AppendUint32(obj, v)
+	}
+	ext := append([]byte{extVersion << 4, 0, 0, 0}, obj...)
+	binary.BigEndian.PutUint16(ext[2:], checksum(0, ext))
+	return append(out, ext...)
+}
+
+func TestEngineMPLSLabels(t *testing.T) {
+	labels := []record.MPLSLabel{{Label: 24005, TTL: 1}, {Label: 16, S: true, TTL: 1}}
+	for _, target := range []string{"198.51.100.7", "2001:db8:1::7"} {
+		t.Run(target, func(t *testing.T) {
+			s := newSim()
+			dst := netip.MustParseAddr(target)
+			router := netip.MustParseAddr("10.0.0.2")
+			if dst.Is6() {
+				router = netip.MustParseAddr("2001:db8:a::2")
+			}
+			s.setPath(dst, &simPath{routers: []netip.Addr{router}, mpls: map[int][]record.MPLSLabel{1: labels}})
+			res, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: ICMP, FlowID: 1, Paris: true,
+				MaxTTL: 2, Timeout: 200 * time.Millisecond})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res[0].Status != record.StatusTTLExpired || !reflect.DeepEqual(res[0].MPLS, labels) {
+				t.Errorf("hop 1: %+v", res[0])
+			}
+			if res[1].MPLS != nil {
+				t.Errorf("destination reply carries labels: %+v", res[1])
+			}
+		})
+	}
 }

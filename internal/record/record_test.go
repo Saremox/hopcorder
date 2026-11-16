@@ -262,7 +262,8 @@ func TestJSONShape(t *testing.T) {
 		Hops: []Hop{
 			{TTL: 1, Status: StatusTTLExpired, IP: ip("192.168.187.1"), RTTMicros: 1432},
 			{TTL: 2, Status: StatusNoReply},
-			{TTL: 3, Status: StatusUnreachable, IP: ip("10.1.1.1"), RTTMicros: 5000, Code: IntPtr(0)},
+			{TTL: 3, Status: StatusUnreachable, IP: ip("10.1.1.1"), RTTMicros: 5000, Code: IntPtr(0),
+				MPLS: []MPLSLabel{{Label: 24005, TC: 0, S: true, TTL: 1}}},
 		},
 	}
 	r.Finalize(2)
@@ -275,7 +276,8 @@ func TestJSONShape(t *testing.T) {
 		`"reached":false,"path_len":3,"path_hash":"` + r.PathHash + `","loops":[],"hops":[` +
 		`{"ttl":1,"status":"ttl-expired","ip":"192.168.187.1","rtt_us":1432},` +
 		`{"ttl":2,"status":"no-reply"},` +
-		`{"ttl":3,"status":"unreachable","ip":"10.1.1.1","rtt_us":5000,"code":0}]}`
+		`{"ttl":3,"status":"unreachable","ip":"10.1.1.1","rtt_us":5000,"code":0,` +
+		`"mpls":[{"label":24005,"tc":0,"s":true,"ttl":1}]}]}`
 	if string(b) != want {
 		t.Errorf("JSON mismatch\n got: %s\nwant: %s", b, want)
 	}
@@ -310,6 +312,8 @@ func TestValidateRejects(t *testing.T) {
 		{"ttl gap", func(r *Record) { r.Hops[1].TTL = 5 }},
 		{"bad status", func(r *Record) { r.Hops[0].Status = "lost" }},
 		{"nil loops", func(r *Record) { r.Loops = nil }},
+		{"mpls on a reply", func(r *Record) { r.Hops[1].MPLS = []MPLSLabel{{Label: 16, S: true, TTL: 1}} }},
+		{"mpls label too large", func(r *Record) { r.Hops[0].MPLS = []MPLSLabel{{Label: 1 << 20, S: true}} }},
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("baseline invalid: %v", err)
