@@ -399,6 +399,12 @@ added in the commit that introduced it.
 - **Destination answering for UDP** = ICMP port unreachable from the target
   address. Unreachable from any other address, or with another code, is
   `unreachable`.
+- **Probe ids are counted per flow** (dst, protocol, flow id) from a random
+  start, so a busy agent never reuses an id within the 30s tombstone window.
+  Two hopcorder *processes* on one host (e.g. `--once` next to the daemon)
+  both see every ICMP reply; with the same target and `flow_id` a reply can,
+  rarely, be attributed to the other process's probe. Give such runs a
+  different `flow_id`.
 - **Known limitations**: RTTs use user-space receive timestamps (tens of µs of
   scheduling noise; kernel `SO_TIMESTAMPNS` is a possible refinement). MPLS
   label extensions (RFC 4950) are not parsed. All TTLs up to `max_ttl` are
