@@ -406,3 +406,31 @@ added in the commit that introduced it.
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology
   (veth + `ip netns`) for real TTL expiry, plus a real two-router loop.
+- **Spool = bbolt** (§5.2 left the choice open). Why: appending a record,
+  bumping `seq` and enforcing the bounds is one ACID, fsynced transaction, and
+  so is advancing a cursor and deleting what every output has delivered. A
+  crash leaves the old or the new state; there is no torn-tail detection,
+  segment index or cursor file to keep consistent, which segment files would
+  need. Layout: `meta` (next seq, byte and record counters), `records` (8-byte
+  big-endian seq → 8-byte timestamp + zstd-compressed JSON, compressed per
+  record), `cursors` (output name → last delivered seq). Trade-off: a bbolt
+  file never shrinks; it reuses freed pages, so disk usage tracks the high-water
+  mark of `max_bytes` (which bounds the stored compressed bytes) plus B+tree
+  overhead.
+- **Spool consumers**: every shipping output (`jsonl`, `http`) is a spool
+  consumer with its own cursor and drain loop, so `jsonl` is crash-safe too
+  (it may repeat lines after a crash; dedup on `(agent_id, seq)`). Metrics are
+  not a consumer; they observe cycles in memory. Records are deleted once every
+  consumer has them; with no consumer they are not stored at all. A newly
+  configured output starts at the newest record; the cursor of an output
+  removed from the config is deleted. Records dropped by the bounds count as
+  dropped only if some output had not delivered them.
+- **Batching** (§5.2): a partial batch waits until its oldest record is
+  `flush_interval` old (or a full batch is pending), then ships everything
+  accumulated. Backoff doubles from `retry_min` to `retry_max`, each wait
+  jittered to 50–100%.
+- **`--once`** does not open the spool (so it can run next to a running agent)
+  and prints records with `seq: 0`; the spool assigns seqs from 1.
+- **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
+  outputs get up to 3s to drain what is spooled; whatever is left stays in the
+  spool for the next start.

@@ -19,7 +19,7 @@ import (
 	"github.com/saremox/hopcorder/internal/config"
 	"github.com/saremox/hopcorder/internal/output"
 	"github.com/saremox/hopcorder/internal/probe"
-	"github.com/saremox/hopcorder/internal/record"
+	"github.com/saremox/hopcorder/internal/spool"
 )
 
 const agentUsage = `Usage: hopcorder agent [flags] [target ...]
@@ -213,45 +213,90 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 	return 0
 }
 
+// shutdownGrace bounds how long the agent waits for outputs to stop after
+// SIGINT/SIGTERM. Nothing is lost by cutting it short: undelivered records
+// stay in the spool.
+const shutdownGrace = 3 * time.Second
+
 func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger) error {
 	if cfg.Outputs.HTTP != nil || cfg.Outputs.Metrics != nil {
 		return errors.New("http and metrics outputs are not implemented yet")
 	}
-	if cfg.Outputs.JSONL == nil {
-		return errors.New("no jsonl output configured")
+	var outs []output.Output
+	var drainOpts []output.DrainOptions
+	if j := cfg.Outputs.JSONL; j != nil {
+		o, err := output.NewJSONL(j.Path)
+		if err != nil {
+			return err
+		}
+		outs = append(outs, o)
+		drainOpts = append(drainOpts, output.DrainOptions{Logger: logger})
 	}
-	j, err := output.NewJSONL(cfg.Outputs.JSONL.Path)
-	if err != nil {
-		return err
+	defer func() {
+		for _, o := range outs {
+			if err := o.Close(); err != nil {
+				logger.Warn("closing output", "output", o.Name(), "err", err)
+			}
+		}
+	}()
+
+	names := make([]string, len(outs))
+	for i, o := range outs {
+		names[i] = o.Name()
 	}
-	defer j.Close()
-	a, err := agent.New(agent.Options{
-		AgentID: cfg.AgentID, Targets: agentTargets(cfg), DNSTTL: cfg.DNSTTL.D(),
-		Prober: prober, Sink: &directSink{out: j}, Logger: logger,
+	sp, err := spool.Open(spool.Options{
+		Dir: cfg.Spool.Dir, MaxAge: cfg.Spool.MaxAge.D(), MaxBytes: int64(cfg.Spool.MaxBytes),
+		Consumers: names, Logger: logger,
 	})
 	if err != nil {
 		return err
 	}
-	logger.Info("agent started", "agent_id", cfg.AgentID, "targets", len(cfg.Targets))
-	return a.Run(ctx)
-}
+	defer func() {
+		if err := sp.Close(); err != nil {
+			logger.Error("closing spool", "err", err)
+		}
+	}()
 
-// directSink writes records straight to an output with an in-memory seq.
-// It is replaced by the spool.
-type directSink struct {
-	mu  sync.Mutex
-	seq uint64
-	out output.Output
-}
-
-func (s *directSink) Publish(ctx context.Context, rec *record.Record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.seq++
-	rec.Seq = s.seq
-	b, err := json.Marshal(rec)
+	a, err := agent.New(agent.Options{
+		AgentID: cfg.AgentID, Targets: agentTargets(cfg), DNSTTL: cfg.DNSTTL.D(),
+		Prober: prober, Sink: sp, Logger: logger,
+	})
 	if err != nil {
 		return err
 	}
-	return s.out.Deliver(ctx, [][]byte{b})
+
+	// Outputs drain on their own context so they can be stopped after the
+	// schedulers, letting the last records reach them when that is quick.
+	drainCtx, stopDrains := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopDrains()
+	var drains sync.WaitGroup
+	for i, o := range outs {
+		drains.Go(func() { output.Drain(drainCtx, sp, o, drainOpts[i]) })
+	}
+
+	logger.Info("agent started", "agent_id", cfg.AgentID, "targets", len(cfg.Targets),
+		"outputs", names, "spool", cfg.Spool.Dir, "spool_records", sp.Stats().Records)
+	err = a.Run(ctx)
+	logger.Info("shutting down")
+	waitIdle(sp, names, shutdownGrace)
+	stopDrains()
+	drains.Wait()
+	return err
+}
+
+// waitIdle waits up to d for every consumer to catch up with the spool.
+func waitIdle(sp *spool.Spool, names []string, d time.Duration) {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		idle := true
+		for _, n := range names {
+			if sp.Pending(n) > 0 {
+				idle = false
+			}
+		}
+		if idle {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
