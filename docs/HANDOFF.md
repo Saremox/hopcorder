@@ -405,10 +405,17 @@ added in the commit that introduced it.
   both see every ICMP reply; with the same target and `flow_id` a reply can,
   rarely, be attributed to the other process's probe. Give such runs a
   different `flow_id`.
+- **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
+  review). Once a target was reached at distance d, cycles probe TTLs
+  1..d+3. If that batch neither reaches the destination nor hits an
+  unreachable, the same cycle probes d+4..`max_ttl` before the record is
+  built, so records never differ from full-depth probing; only the replies
+  the destination would send for TTLs past it are saved. Unreached targets
+  always get full depth. Implemented with `TraceRequest.MinTTL`.
 - **Known limitations**: RTTs use user-space receive timestamps (tens of µs of
   scheduling noise; kernel `SO_TIMESTAMPNS` is a possible refinement). MPLS
   label extensions (RFC 4950) are not parsed. All TTLs up to `max_ttl` are
-  probed every cycle; TTLs beyond the destination each draw a reply from it.
+  probed in cycles of unreached targets.
 - **Testing**: the demux engine sits behind a small socket interface and is
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology

@@ -65,6 +65,9 @@ func TestHandoffExample(t *testing.T) {
 		*t0.ProbePast != 2 || !*t0.Paris || t0.FlowID != DefaultFlowID {
 		t.Errorf("target 0 defaults: %+v", t0)
 	}
+	if !*t0.AdaptiveMaxTTL {
+		t.Error("adaptive_max_ttl must default to true")
+	}
 	if t1.Protocol != "udp" || t1.Port != 33434 || t1.AF != 4 {
 		t.Errorf("target 1: %+v", t1)
 	}
@@ -91,6 +94,7 @@ targets:
     probe_past: 0
     paris: true
     flow_id: 4242
+    adaptive_max_ttl: false
 spool: {dir: /tmp/x}
 outputs: {jsonl: {path: "-"}}
 `, FinalizeOptions{})
@@ -105,7 +109,7 @@ outputs: {jsonl: {path: "-"}}
 		t.Errorf("target a: %+v", a)
 	}
 	if b.Protocol != "icmp" || b.Interval.D() != 30*time.Second || b.MaxTTL != 12 || *b.ProbePast != 0 || !*b.Paris ||
-		b.FlowID != 4242 || b.AF != 6 {
+		b.FlowID != 4242 || b.AF != 6 || *b.AdaptiveMaxTTL {
 		t.Errorf("target b: %+v", b)
 	}
 }

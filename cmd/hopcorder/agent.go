@@ -196,16 +196,17 @@ func agentTargets(cfg *config.Config) []agent.Target {
 	out := make([]agent.Target, len(cfg.Targets))
 	for i, t := range cfg.Targets {
 		out[i] = agent.Target{
-			Host:      t.Host,
-			Protocol:  probe.Protocol(t.Protocol),
-			Port:      uint16(t.Port),   //nolint:gosec // validated 0..65535
-			FlowID:    uint16(t.FlowID), //nolint:gosec // validated 1..65535
-			Paris:     *t.Paris,
-			AF:        t.AF,
-			Interval:  t.Interval.D(),
-			Timeout:   t.Timeout.D(),
-			MaxTTL:    t.MaxTTL,
-			ProbePast: *t.ProbePast,
+			Host:        t.Host,
+			Protocol:    probe.Protocol(t.Protocol),
+			Port:        uint16(t.Port),   //nolint:gosec // validated 0..65535
+			FlowID:      uint16(t.FlowID), //nolint:gosec // validated 1..65535
+			Paris:       *t.Paris,
+			AF:          t.AF,
+			Interval:    t.Interval.D(),
+			Timeout:     t.Timeout.D(),
+			MaxTTL:      t.MaxTTL,
+			ProbePast:   *t.ProbePast,
+			AdaptiveTTL: *t.AdaptiveMaxTTL,
 		}
 	}
 	return out

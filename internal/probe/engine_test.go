@@ -566,3 +566,27 @@ func TestEngineSoak(t *testing.T) {
 		t.Errorf("goroutines grew from %d to %d", before, after)
 	}
 }
+
+func TestEngineMinTTL(t *testing.T) {
+	s := newSim()
+	dst := netip.MustParseAddr("198.51.100.7")
+	s.setPath(dst, &simPath{routers: addrs("10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4")})
+	res, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: UDP, Port: 33434, FlowID: 1,
+		MinTTL: 3, MaxTTL: 6, Timeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 4 || res[0].TTL != 3 || res[3].TTL != 6 {
+		t.Fatalf("results %+v", res)
+	}
+	if res[0].From.String() != "10.0.0.3" || res[1].From.String() != "10.0.0.4" || res[2].Status != record.StatusReply {
+		t.Errorf("results %+v", res)
+	}
+	// Classic mode keeps each TTL's destination port independent of MinTTL.
+	if got := binary.BigEndian.Uint16(s.sent[0].l4[2:4]); got != 33434+2 {
+		t.Errorf("classic dport for ttl 3 = %d", got)
+	}
+	if _, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: ICMP, MinTTL: 7, MaxTTL: 6, Timeout: time.Second}); err == nil {
+		t.Error("MinTTL > MaxTTL accepted")
+	}
+}
