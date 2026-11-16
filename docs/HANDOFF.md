@@ -272,8 +272,8 @@ for HTTP, logging, and everything else. Ask before adding anything else.
 - [x] `internal/record`: types, `path_hash`, loop detection, trimming;
       table-driven tests
 - [x] `internal/probe`: interface + fake; ICMP v4/v6 raw implementation with
-      reply demux; UDP; paris mode (TCP SYN deferred to M2; IPv6 verified by
-      golden bytes and the in-memory network only, see §10)
+      reply demux; UDP; paris mode (TCP SYN deferred to M2; IPv6 raw sockets run
+      in the CI `rawsock` job only, as the development container had no IPv6)
 - [x] `internal/agent`: per-target scheduler, stagger, DNS refresh, overrun
       handling
 - [x] `internal/spool`: durable, bounded, crash-safe; tests incl. simulated
@@ -412,7 +412,9 @@ added in the commit that introduced it.
 - **Testing**: the demux engine sits behind a small socket interface and is
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology
-  (veth + `ip netns`) for real TTL expiry, plus a real two-router loop.
+  (veth + `ip netns`) for real TTL expiry, plus a real two-router loop. The
+  loop is made with host routes (`/32`, `/128`) on r2: an IPv6 `/64` added
+  with `ip route replace` gets metric 1024 and loses to the connected `/64`.
 - **Spool = bbolt** (§5.2 left the choice open). Why: appending a record,
   bumping `seq` and enforcing the bounds is one ACID, fsynced transaction, and
   so is advancing a cursor and deleting what every output has delivered. A
