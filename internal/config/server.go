@@ -38,6 +38,7 @@ type ServerConfig struct {
 	Ingest     IngestConfig     `yaml:"ingest"`
 	Enrich     EnrichConfig     `yaml:"enrich"`
 	Metrics    *bool            `yaml:"metrics"` // serve /metrics; default true
+	UI         *bool            `yaml:"ui"`      // serve the web UI under /ui/; default true
 }
 
 // ClickHouseConfig is the connection to ClickHouse's HTTP interface.
@@ -143,6 +144,9 @@ func (c *ServerConfig) Finalize() error {
 	}
 	if c.Metrics == nil {
 		c.Metrics = ptr(true)
+	}
+	if c.UI == nil {
+		c.UI = ptr(true)
 	}
 	r := &c.Enrich.RDNS
 	if r.Enabled == nil {

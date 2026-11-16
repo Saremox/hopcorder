@@ -19,7 +19,7 @@ func TestServerDefaults(t *testing.T) {
 	if c.Listen != DefaultServerListen || c.ClickHouse.URL != DefaultClickHouseURL || c.ClickHouse.Database != "hopcorder" ||
 		!*c.Metrics || !*c.Enrich.RDNS.Enabled || *c.Enrich.ASN.URL != DefaultASNURL ||
 		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes ||
-		*c.ClickHouse.RetentionDays != 90 {
+		*c.ClickHouse.RetentionDays != 90 || !*c.UI {
 		t.Errorf("defaults %+v", c)
 	}
 }
