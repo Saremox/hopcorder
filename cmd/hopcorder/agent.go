@@ -76,14 +76,15 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&f.metricsListen, "metrics-listen", "", "serve Prometheus metrics on this address, e.g. 127.0.0.1:9469")
 	fs.StringVar(&f.logLevel, "log-level", "", "debug, info, warn or error (default info)")
 	fs.StringVar(&f.logFormat, "log-format", "", "text or json (default text)")
-	if err := fs.Parse(args); err != nil {
+	targets, err := parseInterspersed(fs, args)
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
 
-	cfg, err := buildConfig(fs, &f)
+	cfg, err := buildConfig(fs, &f, targets)
 	if err != nil {
 		fmt.Fprintf(stderr, "hopcorder agent: %v\n", err)
 		return 2
@@ -110,9 +111,30 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// parseInterspersed parses flags that may appear before, between or after
+// the positional targets (the standard flag package stops at the first
+// positional argument). Everything after "--" is positional.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		consumed := len(args) - fs.NArg()
+		if consumed > 0 && args[consumed-1] == "--" {
+			return append(positional, fs.Args()...), nil
+		}
+		if fs.NArg() == 0 {
+			return positional, nil
+		}
+		positional = append(positional, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+}
+
 // buildConfig loads the config file (if any), applies flags and positional
 // targets on top, then defaults and validates the result.
-func buildConfig(fs *flag.FlagSet, f *agentFlags) (*config.Config, error) {
+func buildConfig(fs *flag.FlagSet, f *agentFlags, targets []string) (*config.Config, error) {
 	cfg := &config.Config{}
 	if f.configPath != "" {
 		var err error
@@ -148,9 +170,9 @@ func buildConfig(fs *flag.FlagSet, f *agentFlags) (*config.Config, error) {
 			cfg.Log.Format = f.logFormat
 		}
 	})
-	if fs.NArg() > 0 {
+	if len(targets) > 0 {
 		cfg.Targets = nil
-		for _, h := range fs.Args() {
+		for _, h := range targets {
 			cfg.Targets = append(cfg.Targets, config.Target{Host: h, AF: f.af})
 		}
 	}
