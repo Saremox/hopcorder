@@ -138,7 +138,7 @@ func (c *Client) InsertJSON(ctx context.Context, table string, rows [][]byte) er
 }
 
 // Query runs a SELECT and calls row for every result row (JSONEachRow,
-// 64-bit integers as numbers). It waits for the end of the query before
+// 64-bit integers as numbers, date-times as ISO 8601 in UTC). It waits for the end of the query before
 // streaming, so a failure part-way is reported as an error rather than
 // as truncated output.
 func (c *Client) Query(ctx context.Context, query string, params Params, row func(json.RawMessage) error) error {
@@ -146,6 +146,7 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 	q.Set("wait_end_of_query", "1")
 	q.Set("output_format_json_quote_64bit_integers", "0")
 	q.Set("default_format", "JSONEachRow")
+	q.Set("date_time_output_format", "iso") // 2026-11-16T22:14:05.123Z
 	return c.do(ctx, true, q, params, strings.NewReader(query), func(r io.Reader) error {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64<<10), 64<<20)
