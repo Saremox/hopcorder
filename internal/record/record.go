@@ -255,3 +255,61 @@ func (h Hop) validate() error {
 
 // IntPtr returns a pointer to c, for Hop.Code.
 func IntPtr(c int) *int { return &c }
+
+// PathTracker decides whether a target's route changed from one cycle to
+// the next. Silent hops are wildcards, so a rate-limited router going quiet
+// and coming back is not a change (path_hash alone cannot tell those apart:
+// the router's address and "*" hash differently). The tracker remembers the
+// last address seen at each TTL, so a router replaced while it was silent is
+// still caught when the new one first answers. A change is any of:
+//
+//   - a different target address (the name resolved elsewhere);
+//   - a TTL answering from a different address than last seen there;
+//   - a reached destination at a different distance than last reached.
+//
+// Gaining or losing reachability alone is not a path change; it is visible
+// in Reached. The zero value is ready to use; it is not safe for concurrent
+// use.
+type PathTracker struct {
+	started bool
+	target  netip.Addr
+	ips     []netip.Addr // last address seen per TTL-1; invalid = unknown
+	dist    int          // last reached distance, 0 = unknown
+}
+
+// Observe records rec and reports whether its route differs from what the
+// tracker knew. The first observation is never a change. After a change the
+// tracker forgets everything rec does not confirm.
+func (p *PathTracker) Observe(rec *Record) bool {
+	changed := p.started && p.differs(rec)
+	if !p.started || changed {
+		p.started, p.target, p.ips, p.dist = true, rec.TargetIP, nil, 0
+	}
+	for _, h := range rec.Hops {
+		if h.Status.Responded() && h.IP.IsValid() && h.TTL >= 1 {
+			for len(p.ips) < h.TTL {
+				p.ips = append(p.ips, netip.Addr{})
+			}
+			p.ips[h.TTL-1] = h.IP
+		}
+	}
+	if rec.Reached {
+		p.dist = rec.PathLen
+	}
+	return changed
+}
+
+func (p *PathTracker) differs(rec *Record) bool {
+	if rec.TargetIP != p.target {
+		return true
+	}
+	for _, h := range rec.Hops {
+		if !h.Status.Responded() || h.TTL < 1 || h.TTL > len(p.ips) {
+			continue
+		}
+		if known := p.ips[h.TTL-1]; known.IsValid() && known != h.IP {
+			return true
+		}
+	}
+	return rec.Reached && p.dist != 0 && rec.PathLen != p.dist
+}

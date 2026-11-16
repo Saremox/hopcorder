@@ -466,18 +466,27 @@ added in the commit that introduced it.
   process collectors. `agent_id` is a constant label on every hopcorder
   metric; `target` is the configured host. `hopcorder_loops_detected_total`
   counts cycles with at least one loop; `hopcorder_path_changes_total` counts
-  cycles whose `path_hash` differs from the previous cycle of that target.
+  route changes as decided by `record.PathTracker` (see "Decided after
+  review" below), not `path_hash` changes.
   Overrun and per-target error counters carry `target`/`protocol`.
 
-### Open questions
+### Decided after review (2026-11-16)
 
-- **`path_hash` and flickering hops.** §3.2 says the `*` placeholder means "a
-  rate-limited router flickering in and out must not register as a path
-  change", but with the specified algorithm a hop that answers in cycle N and
-  is silent in cycle N+1 *does* change the hash (`…|10.0.0.2|…` vs `…|*|…`).
-  The placeholder only keeps positions aligned. M1 implements the algorithm
-  exactly as written, and `hopcorder_path_changes_total` counts hash changes,
-  so it also counts flicker. A flicker-proof alternative for the metric (and
-  for M2's path-change view): call it a change only if some TTL answered in
-  both cycles with different addresses, or a reached destination's distance
-  changed. Needs a decision before M2 builds its path-change table on it.
+- **Path change = wildcard comparison** (resolves the contradiction in §3.2:
+  the `*` placeholder is meant to keep a flickering rate-limited router from
+  counting as a route change, but with the specified algorithm such a hop
+  *does* change `path_hash`). `path_hash` stays in the wire format exactly as
+  specified. Route changes are decided by `record.PathTracker` instead: it
+  remembers the last address seen at each TTL, treats silent hops as
+  wildcards, and reports a change when a TTL answers from a different
+  address, a reached destination is at a different distance, or the target
+  address changed. Gaining or losing reachability alone is not a path change.
+  `hopcorder_path_changes_total` uses it; **M2's path-change table must use
+  the same algorithm** per `(agent_id, target, protocol, flow_id)` stream
+  rather than comparing `path_hash`.
+- **The three deviations above are approved**: loops count only `ttl-expired`
+  answers; an ICMP unreachable ends the path; `--once` prints `seq: 0` and
+  does not open the spool.
+- **The 24h run** from the M1 done criteria is skipped for now; the
+  3-minute accelerated soak (4,645 cycles, flat goroutines/heap/RSS) stands
+  in. Revisit if growth shows up in production.
