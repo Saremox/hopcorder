@@ -297,11 +297,43 @@ type PathTracker struct {
 	dist    int          // last reached distance, 0 = unknown
 }
 
+// PathChange describes why PathTracker considered a cycle a route change.
+type PathChange struct {
+	Reason ChangeReason
+	// TTLs, From and To list, for ReasonRouter, each TTL that answered from
+	// a different address than last seen there.
+	TTLs     []int
+	From, To []netip.Addr
+	// PrevDistance and Distance are the destination's distances for
+	// ReasonDistance.
+	PrevDistance, Distance int
+}
+
+// ChangeReason is the kind of route change.
+type ChangeReason string
+
+// Route change reasons, in the order they are checked.
+const (
+	ReasonTarget   ChangeReason = "target"   // the target name resolved to another address
+	ReasonRouter   ChangeReason = "router"   // a TTL answered from a different address
+	ReasonDistance ChangeReason = "distance" // the destination answered at a different TTL
+)
+
 // Observe records rec and reports whether its route differs from what the
 // tracker knew. The first observation is never a change. After a change the
 // tracker forgets everything rec does not confirm.
 func (p *PathTracker) Observe(rec *Record) bool {
-	changed := p.started && p.differs(rec)
+	_, changed := p.ObserveChange(rec)
+	return changed
+}
+
+// ObserveChange is Observe that also describes the change.
+func (p *PathTracker) ObserveChange(rec *Record) (PathChange, bool) {
+	var ch PathChange
+	changed := false
+	if p.started {
+		ch, changed = p.differs(rec)
+	}
 	if !p.started || changed {
 		p.started, p.target, p.ips, p.dist = true, rec.TargetIP, nil, 0
 	}
@@ -316,20 +348,30 @@ func (p *PathTracker) Observe(rec *Record) bool {
 	if rec.Reached {
 		p.dist = rec.PathLen
 	}
-	return changed
+	return ch, changed
 }
 
-func (p *PathTracker) differs(rec *Record) bool {
+func (p *PathTracker) differs(rec *Record) (PathChange, bool) {
 	if rec.TargetIP != p.target {
-		return true
+		return PathChange{Reason: ReasonTarget}, true
 	}
+	var ch PathChange
 	for _, h := range rec.Hops {
 		if !h.Status.Responded() || h.TTL < 1 || h.TTL > len(p.ips) {
 			continue
 		}
 		if known := p.ips[h.TTL-1]; known.IsValid() && known != h.IP {
-			return true
+			ch.TTLs = append(ch.TTLs, h.TTL)
+			ch.From = append(ch.From, known)
+			ch.To = append(ch.To, h.IP)
 		}
 	}
-	return rec.Reached && p.dist != 0 && rec.PathLen != p.dist
+	if len(ch.TTLs) > 0 {
+		ch.Reason = ReasonRouter
+		return ch, true
+	}
+	if rec.Reached && p.dist != 0 && rec.PathLen != p.dist {
+		return PathChange{Reason: ReasonDistance, PrevDistance: p.dist, Distance: rec.PathLen}, true
+	}
+	return PathChange{}, false
 }

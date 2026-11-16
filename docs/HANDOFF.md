@@ -302,6 +302,14 @@ Materialized views for path-change events, loop events, and reachability-loss
 windows. Read API for the future UI. Health and readiness endpoints. Migrations
 applied on startup.
 
+- [x] HTTP ingest (zstd/gzip/plain NDJSON), dedup on `(agent_id, seq)`
+- [x] Per-hop table, extended as listed (plus rDNS name and MPLS)
+- [x] Enrichment: cached rDNS; ASN from iptoasn, refreshed daily
+- [x] Loop events (materialized view); path changes and reachability-loss
+      windows (derived by the server, see §10)
+- [x] Read API, `/healthz`, `/readyz`, migrations on startup
+- [ ] Reconcile the schema with `docs/prototype/schema.sql` once it is added
+
 ### M3 — Grafana
 
 Provisioned dashboards using the ClickHouse datasource: reachability timeline,
@@ -518,6 +526,69 @@ added in the commit that introduced it.
   route changes as decided by `record.PathTracker` (see "Decided after
   review" below), not `path_hash` changes.
   Overrun and per-target error counters carry `target`/`protocol`.
+
+### M2 — server
+
+- **Schema without the prototype.** `docs/prototype/schema.sql` was still not
+  in the repository when M2 was built, so the ClickHouse schema
+  (`internal/server/migrations/0001_init.sql`) was designed from this
+  document: the per-hop `hops` table carries the fields of §3.1 plus
+  `agent_id`, `seq`, `af`, `protocol`, `flow_id`, `hop_asn`, `hop_as_name`,
+  `hop_name` (rDNS) and `mpls`. When the prototype arrives, its analysis
+  queries should be checked against these names (a follow-up migration can
+  add views with the prototype's column names if they differ).
+- **One insert per batch, flattening in ClickHouse.** The server inserts only
+  into `cycles` (one row per cycle, hops and loops as `Nested` columns, plus
+  per-hop enrichment). `hops`, `loop_events` and `agent_seq` are materialized
+  views of it. So a cycle is stored atomically, and "flatten to one row per hop
+  at insert time" happens at insert time inside ClickHouse.
+- **No ClickHouse client library.** The server uses ClickHouse's HTTP
+  interface through `internal/clickhouse` (standard library, typed
+  `{name:Type}` parameters). This avoids a new dependency; the HTTP interface
+  covers DDL, `JSONEachRow` inserts and queries.
+- **Dedup on `(agent_id, seq)`** with a per-agent high-water mark rather than
+  a deduplicating table engine. Agents ship in seq order and advance only on
+  success, so "seq ≤ highest stored seq" means "already stored". Each agent's
+  batches are processed one at a time under its own lock, and the mark moves
+  only after the insert succeeded. A `ReplacingMergeTree` would not do: the
+  per-hop view would still see every duplicate insert. The mark is restored
+  from `agent_seq` after a restart. Consequence: an agent whose spool was
+  wiped (seq restarting at 1) must get a new `agent_id`.
+- **Path changes and outages are derived in Go, not by materialized views**
+  (deviation from the M2 line above). A path change uses the stateful
+  wildcard rule decided after M1 (`record.PathTracker`), and an outage window
+  needs to know whether the previous cycle reached the destination; neither
+  can be expressed as a per-insert view. The server keeps per-stream state
+  (stream = agent, target, protocol, flow), writes `path_changes` and
+  `outages` rows, and after a restart replays a stream's last 30 cycles and
+  resumes an open outage. Both tables are `ReplacingMergeTree`, so a replay
+  writes no duplicates (query with `FINAL`). Events are derived data: if
+  storing them fails after the cycles committed, that is logged and counted,
+  not retried by the agent. Loop events are a plain view.
+- **Outage window** = from the first cycle that did not reach the destination
+  to the first that did again (that cycle's time is `end_ts`). A routing loop
+  is therefore an outage too. The row is written at open (`end_ts` NULL) and
+  at close (higher version). `last_hop_ip`/`last_hop_ttl` are the last
+  responding hop of the first failing cycle, which is where it broke.
+- **ASN from iptoasn** rather than GeoLite2: free, no licence key, and a TSV
+  that the standard library parses (GeoLite2 needs a reader library and a
+  MaxMind account). Downloaded daily, cached on disk, used from the cache when
+  the download fails; or an operator-managed file.
+- **rDNS never blocks ingest**: cache misses return "" and are resolved by a
+  worker pool, so the first sightings of a new hop have no name (hops repeat
+  every cycle, so this lasts a cycle or two). Names are stored per hop row, as
+  they were known at ingest.
+- **Invalid records** are rejected for good (reported in the response, not
+  retried); a storage failure returns 503 so the agent retries the batch.
+  `seq: 0` (from `--once`) is rejected.
+- **Startup order**: the HTTP server starts at once and migrations retry every
+  2s until ClickHouse answers; until then `/readyz` and ingest return 503 and
+  agents keep spooling.
+- **Testing**: the default run uses an in-memory store that answers the
+  ingester's queries; the `clickhouse` build tag runs migrations, every query,
+  a retry and a restart against a real ClickHouse (25.8), plus the full agent
+  daemon → server → ClickHouse path. CI runs these with ClickHouse as a
+  service container.
 
 ### Decided after review (2026-11-16)
 
