@@ -33,7 +33,15 @@ localhost only and nothing has a password: it is a try-out, not a deployment.
 
 ## Install
 
-Requires Linux and Go 1.27+.
+Releases ([GitHub releases](https://github.com/Saremox/hopcorder/releases),
+changes in [`CHANGELOG.md`](CHANGELOG.md)) have static Linux binaries for
+amd64 and arm64, with the example configs and systemd units:
+
+```bash
+curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.0/hopcorder_0.1.0_linux_amd64.tar.gz | tar -xz
+```
+
+Or build it; requires Linux and Go 1.27+:
 
 ```bash
 go install github.com/saremox/hopcorder/cmd/hopcorder@latest
@@ -75,17 +83,18 @@ root; give it `NET_RAW` and nothing else. `docker build --target agent` (or
 
 ### Kubernetes
 
-Helm charts for both live in [`deploy/helm`](deploy/helm) (published to
-`oci://ghcr.io/saremox/charts` with each release):
+Helm charts for both live in [`deploy/helm`](deploy/helm); each release
+publishes them to `oci://ghcr.io/saremox/charts` (and attaches them to the
+GitHub release):
 
 ```bash
-helm install hopcorder-server deploy/helm/hopcorder-server \
+helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.0 \
   --set config.clickhouse.url=http://clickhouse.db:8123 \
   --set clickhouse.passwordSecret.name=clickhouse-password
 ```
 
 ```bash
-helm install hopcorder-agent deploy/helm/hopcorder-agent \
+helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --version 0.1.0 \
   --set server.url=http://hopcorder-server:8080 \
   --set 'config.targets[0].host=example.net' \
   --set 'config.targets[1].host=192.0.2.10' --set 'config.targets[1].protocol=tcp'
@@ -94,15 +103,17 @@ helm install hopcorder-agent deploy/helm/hopcorder-agent \
 - **Server**: one replica (it derives route changes and outages from each
   stream's history in memory), `Recreate` on upgrade, probes on `/healthz`
   and `/readyz`, optional Ingress and ServiceMonitor. Bring your own
-  ClickHouse. Until the first release, add `--set image.tag=main`.
+  ClickHouse.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
   after their pods, each with its own spool volume; `mode: daemonset` runs one
   agent per node, named after the node, with its spool on the node.
   `hostNetwork: true` traces from the node's network. The pods run as root
   with only `NET_RAW`, so the namespace needs Pod Security `baseline`.
 
-Every value is documented in the charts' `values.yaml`. CI installs both
-charts into a kind cluster and checks that records arrive.
+Every value is documented in the charts' `values.yaml`. A chart runs the
+image of its own version; `--set image.tag=main` follows `main` instead (or
+install from `deploy/helm` in a checkout). CI installs both charts into a
+kind cluster and checks that records arrive.
 
 ### Privileges: `CAP_NET_RAW`, not root
 
@@ -508,6 +519,20 @@ Browser tests (Playwright) run against a server with ClickHouse and
 ```bash
 HOPCORDER_URL=http://127.0.0.1:8080/ make e2e
 ```
+
+### Releasing
+
+Add a `## vX.Y.Z` section to [`CHANGELOG.md`](CHANGELOG.md) (it becomes the
+release notes), merge it, then tag `main` and push the tag:
+
+```bash
+git tag -a vX.Y.Z -m "hopcorder vX.Y.Z" && git push origin vX.Y.Z
+```
+
+The `images` workflow then pushes the images `:X.Y.Z`, `:X.Y` and `:latest`,
+pushes the charts with version X.Y.Z, and creates the GitHub release with
+the Linux binaries, the chart packages and checksums. Pull requests run all
+of it but the publishing.
 
 ## License
 
