@@ -3,5 +3,5 @@ and ships to {{ .Values.server.url }}.
 
   kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=20
 
-The agent runs as root with only CAP_NET_RAW: the namespace's Pod Security
-level must be "baseline" or "privileged".
+The agent runs as root with CAP_NET_RAW, which Pod Security "baseline" does
+not allow: keep it in a namespace of its own with the "privileged" level.

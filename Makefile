@@ -29,7 +29,8 @@ rawsock:
 	$(GO) test -tags rawsock -count=1 ./internal/probe/...
 
 # Server tests against a real ClickHouse, e.g.
-#   docker run -d --network host -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
+#   docker run -d -p 127.0.0.1:8123:8123 -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
+# (passwordless: keep it on 127.0.0.1)
 HOPCORDER_CLICKHOUSE_URL ?= http://127.0.0.1:8123
 clickhouse:
 	HOPCORDER_CLICKHOUSE_URL=$(HOPCORDER_CLICKHOUSE_URL) $(GO) test -tags clickhouse -count=1 ./internal/server/... ./cmd/hopcorder/...

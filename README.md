@@ -75,12 +75,13 @@ docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET
 ```
 
 ```bash
-docker run -d --name hopcorder-server -p 8080:8080 \
+docker run -d --name hopcorder-server -p 127.0.0.1:8080:8080 \
   ghcr.io/saremox/hopcorder-server:main --listen :8080 --clickhouse-url http://clickhouse:8123
 ```
 
-The agent runs as root because container runtimes only grant capabilities to
-root; give it `NET_RAW` and nothing else. `docker build --target agent` (or
+The server does no authentication: publish it on localhost and put a reverse
+proxy in front. The agent runs as root because container runtimes only grant
+capabilities to root; give it `NET_RAW` and nothing else. `docker build --target agent` (or
 `server`) builds them locally.
 
 ### Kubernetes
@@ -110,7 +111,13 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   after their pods, each with its own spool volume; `mode: daemonset` runs one
   agent per node, named after the node, with its spool on the node.
   `hostNetwork: true` traces from the node's network. The pods run as root
-  with only `NET_RAW`, so the namespace needs Pod Security `baseline`.
+  with `NET_RAW`, which Pod Security `baseline` does not allow: give the
+  agent a namespace of its own at the `privileged` level. Credentials for the
+  ingress come from Secrets (`server.bearerTokenSecret`, `server.basicAuth`,
+  `server.tls` for a CA and client certificate); inline ones are refused.
+- **Inside the cluster** the server's Service is reachable around the
+  ingress's authentication: `networkPolicy.enabled=true` limits it to the
+  agents and whatever you list.
 
 Every value is documented in the charts' `values.yaml`. A chart runs the
 image of its own version; `--set image.tag=main` follows `main` instead (or
@@ -157,6 +164,11 @@ sudo install -m 0644 deploy/hopcorder.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now hopcorder
 ```
+
+The unit runs as a dynamic user, which can only read world-readable files in
+`/etc/hopcorder`: keep secrets (an ingest token or password) out of the
+config and pass them as systemd credentials instead, as the comments in the
+unit and in `agent.example.yaml` show.
 
 ## How it works
 
@@ -516,7 +528,7 @@ routing loop.
 Server tests against a real ClickHouse live behind the `clickhouse` build tag:
 
 ```bash
-docker run -d --network host -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
+docker run -d -p 127.0.0.1:8123:8123 -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
 ```
 
 ```bash

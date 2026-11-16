@@ -39,3 +39,8 @@ go.work.sum
 ui/node_modules/
 ui/test-results/
 ui/playwright-report/
+
+# scripts/release-build.sh output
+/dist/
+/build/
+/notes.md

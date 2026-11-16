@@ -8,7 +8,7 @@ metadata:
     {{- include "hopcorder-agent.labels" . | nindent 4 }}
 spec:
   clusterIP: None
-  {{- if .Values.metrics.enabled }}
+  {{- if and .Values.metrics.enabled (ne .Values.metrics.listenAddress "127.0.0.1") }}
   ports:
     - name: metrics
       port: {{ .Values.metrics.port }}

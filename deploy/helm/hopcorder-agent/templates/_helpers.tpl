@@ -38,6 +38,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not .Values.server.url }}
 {{- fail "server.url: set the hopcorder server's URL" }}
 {{- end }}
+{{- $http := default dict (default dict .Values.config.outputs).http }}
+{{- if or $http.bearer_token $http.bearer_token_file $http.basic_auth $http.tls (hasKey (default dict $http.headers) "Authorization") }}
+{{- fail "config.outputs.http: set credentials and TLS with server.bearerTokenSecret, server.basicAuth and server.tls (from Secrets), not in config" }}
+{{- end }}
 {{- $cfg := deepCopy .Values.config }}
 {{- $spool := default dict $cfg.spool }}
 {{- $_ := set $spool "dir" "/var/lib/hopcorder" }}
@@ -48,9 +52,27 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if .Values.server.bearerTokenSecret.name }}
 {{- $_ := set $http "bearer_token_file" "/etc/hopcorder/secrets/token" }}
 {{- end }}
+{{- with .Values.server.basicAuth }}
+{{- if .username }}
+{{- if not .passwordSecret.name }}
+{{- fail "server.basicAuth: set passwordSecret.name" }}
+{{- end }}
+{{- $_ := set $http "basic_auth" (dict "username" .username "password_file" "/etc/hopcorder/basic-auth/password") }}
+{{- end }}
+{{- end }}
+{{- with .Values.server.tls }}
+{{- if .secretName }}
+{{- $tls := dict }}
+{{- if .caKey }}{{- $_ := set $tls "ca_file" "/etc/hopcorder/tls/ca.crt" }}{{- end }}
+{{- if .certKey }}{{- $_ := set $tls "cert_file" "/etc/hopcorder/tls/tls.crt" }}{{- end }}
+{{- if .keyKey }}{{- $_ := set $tls "key_file" "/etc/hopcorder/tls/tls.key" }}{{- end }}
+{{- if .serverName }}{{- $_ := set $tls "server_name" .serverName }}{{- end }}
+{{- $_ := set $http "tls" $tls }}
+{{- end }}
+{{- end }}
 {{- $_ := set $out "http" $http }}
 {{- if .Values.metrics.enabled }}
-{{- $_ := set $out "metrics" (dict "listen" (printf "0.0.0.0:%d" (int .Values.metrics.port))) }}
+{{- $_ := set $out "metrics" (dict "listen" (printf "%s:%d" .Values.metrics.listenAddress (int .Values.metrics.port))) }}
 {{- end }}
 {{- $_ := set $cfg "outputs" $out }}
 {{- toYaml $cfg }}
@@ -74,6 +96,8 @@ spec:
   imagePullSecrets:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  # The agent does not talk to the Kubernetes API.
+  automountServiceAccountToken: false
   hostNetwork: {{ .Values.hostNetwork }}
   {{- if .Values.hostNetwork }}
   dnsPolicy: ClusterFirstWithHostNet
@@ -98,7 +122,7 @@ spec:
         {{- with .Values.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if .Values.metrics.enabled }}
+      {{- if and .Values.metrics.enabled (ne .Values.metrics.listenAddress "127.0.0.1") }}
       ports:
         - name: metrics
           containerPort: {{ .Values.metrics.port }}
@@ -125,6 +149,16 @@ spec:
           mountPath: /etc/hopcorder/secrets
           readOnly: true
         {{- end }}
+        {{- if .Values.server.basicAuth.username }}
+        - name: basic-auth
+          mountPath: /etc/hopcorder/basic-auth
+          readOnly: true
+        {{- end }}
+        {{- if .Values.server.tls.secretName }}
+        - name: tls
+          mountPath: /etc/hopcorder/tls
+          readOnly: true
+        {{- end }}
   volumes:
     - name: config
       configMap:
@@ -142,6 +176,34 @@ spec:
         items:
           - key: {{ .Values.server.bearerTokenSecret.key }}
             path: token
+    {{- end }}
+    {{- if .Values.server.basicAuth.username }}
+    - name: basic-auth
+      secret:
+        secretName: {{ .Values.server.basicAuth.passwordSecret.name }}
+        items:
+          - key: {{ .Values.server.basicAuth.passwordSecret.key }}
+            path: password
+    {{- end }}
+    {{- with .Values.server.tls }}
+    {{- if .secretName }}
+    - name: tls
+      secret:
+        secretName: {{ .secretName }}
+        items:
+          {{- if .caKey }}
+          - key: {{ .caKey }}
+            path: ca.crt
+          {{- end }}
+          {{- if .certKey }}
+          - key: {{ .certKey }}
+            path: tls.crt
+          {{- end }}
+          {{- if .keyKey }}
+          - key: {{ .keyKey }}
+            path: tls.key
+          {{- end }}
+    {{- end }}
     {{- end }}
   {{- with .Values.nodeSelector }}
   nodeSelector:
