@@ -152,6 +152,9 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 		for attempt := 0; ; attempt++ {
 			err := server.Migrate(bgCtx, ch, logger)
 			if err == nil {
+				err = server.ApplyRetention(bgCtx, ch, *cfg.ClickHouse.RetentionDays)
+			}
+			if err == nil {
 				srv.SetReady()
 				logger.Info("ClickHouse schema is current; accepting ingest")
 				return

@@ -1,0 +1,13 @@
+# Loads the hopcorder dashboards from the repository's dashboards/ directory,
+# mounted at this path (see deploy/docker-compose.yml).
+apiVersion: 1
+
+providers:
+  - name: hopcorder
+    folder: hopcorder
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 60
+    options:
+      path: /var/lib/grafana/dashboards/hopcorder

@@ -11,9 +11,24 @@ limiting on routers and shows 80–97% "loss" on hops that forward traffic fine.
 hopcorder sends **one probe per TTL per cycle, all TTLs in parallel**, and
 writes one record per cycle with the responding address at every TTL.
 
-Status: milestone 2. The agent and the ingest server (ClickHouse) are done;
-Grafana dashboards and a topology UI are planned. See
+Status: milestone 3. The agent, the ingest server (ClickHouse) and the
+Grafana dashboards are done; a topology UI is planned. See
 [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+## Try it out
+
+On a Linux host with Docker, from a checkout:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+This starts ClickHouse, the server, an agent tracing three public resolvers
+(ICMP, UDP and TCP; edit [`deploy/compose/agent.yaml`](deploy/compose/agent.yaml)
+for your own targets) and Grafana with the dashboards at
+<http://localhost:3000>. Data shows up within a minute. Everything listens on
+localhost only and nothing has a password: it is a try-out, not a deployment.
+`docker compose -f deploy/docker-compose.yml down -v` removes it with its data.
 
 ## Install
 
@@ -313,9 +328,39 @@ background so ingest never waits on DNS.
 **Tables** (database `hopcorder`): `cycles` (one row per cycle, hops as Nested
 columns), `hops` (one row per hop per cycle, the table to query for latency
 and loss), `loop_events`, `path_changes` and `outages` (both
-`ReplacingMergeTree`: query them with `FINAL`), `agent_seq`. Route changes use
+`ReplacingMergeTree`: query them with `FINAL`), `agent_seq`. The view
+`path_probes` presents `hops` under the prototype's column names, so the
+queries in [`docs/prototype/schema.sql`](docs/prototype/schema.sql) run as they
+are (database `hopcorder` instead of `netpath`), except Q3, which needs a fix
+on current ClickHouse ([`docs/HANDOFF.md`](docs/HANDOFF.md) §10). Data expires after
+`clickhouse.retention_days` (default 90). Route changes use
 the same rule as the agent's metric: silent hops match anything, so a
 rate-limited router flickering does not count.
+
+## Dashboards
+
+[`dashboards/hopcorder.json`](dashboards/hopcorder.json) is a Grafana
+dashboard for the [ClickHouse data
+source](https://grafana.com/grafana/plugins/grafana-clickhouse-datasource/),
+built from the prototype's analysis queries. Pick an agent, a target and a
+protocol, and a second target to compare with:
+
+- **When does it break?** Unreachable cycles per target, the outage windows,
+  and two targets side by side (failing in the same minutes points at a shared
+  transit).
+- **Where does it break?** For failed cycles, the last hop that still answered
+  (with its AS); per-hop no-reply rate and RTT as heatmaps; end-to-end RTT;
+  and the *real loss vs rate limiting* table, which flags a hop's loss as real
+  only if the end-to-end loss is comparable.
+- **Did the route change?** Route changes with the hops that changed and the
+  full path before and after (also as annotations on every time series), loops,
+  and path length.
+
+To use it with your own Grafana, install the plugin, provision the data
+source and dashboard from [`deploy/grafana/provisioning`](deploy/grafana/provisioning)
+(it reads `HOPCORDER_CLICKHOUSE_HOST`, `_PORT`, `_DATABASE`, `_USER` and
+`_PASSWORD` from Grafana's environment; give it a read-only ClickHouse user),
+or import the JSON and pick your ClickHouse data source.
 
 ## Development
 
@@ -351,6 +396,10 @@ docker run -d --network host -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhou
 ```bash
 HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123 go test -tags clickhouse ./internal/server/... ./cmd/hopcorder/...
 ```
+
+They include every dashboard query, expanded the way Grafana and the plugin
+would. The `grafana` tag runs them through Grafana itself, against the compose
+stack (`make up`, then `make grafana`).
 
 ## License
 

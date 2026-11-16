@@ -1,0 +1,23 @@
+# Grafana data source for the hopcorder dashboards (dashboards/*.json). Needs
+# the ClickHouse plugin: GF_PLUGINS_PREINSTALL_SYNC=grafana-clickhouse-datasource
+# or `grafana cli plugins install grafana-clickhouse-datasource`.
+#
+# Grafana expands $VARIABLES from its environment here; the defaults below are
+# the docker-compose stack's (deploy/docker-compose.yml). Use a read-only
+# ClickHouse user in production.
+apiVersion: 1
+
+datasources:
+  - name: hopcorder ClickHouse
+    uid: hopcorder-clickhouse   # the dashboards' default data source
+    type: grafana-clickhouse-datasource
+    isDefault: true
+    editable: false
+    jsonData:
+      protocol: http
+      host: ${HOPCORDER_CLICKHOUSE_HOST}
+      port: ${HOPCORDER_CLICKHOUSE_PORT}
+      defaultDatabase: ${HOPCORDER_CLICKHOUSE_DATABASE}
+      username: ${HOPCORDER_CLICKHOUSE_USER}
+    secureJsonData:
+      password: ${HOPCORDER_CLICKHOUSE_PASSWORD}

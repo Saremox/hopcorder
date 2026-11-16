@@ -121,3 +121,45 @@ func Migrate(ctx context.Context, c *clickhouse.Client, log *slog.Logger) error 
 	}
 	return nil
 }
+
+// retentionTables lists the tables bounded by the retention setting and the
+// column their age is measured on. agent_seq is tiny and never expires: it
+// is what keeps deduplication correct.
+var retentionTables = []struct{ table, column string }{
+	{"cycles", "ts"}, {"hops", "ts"}, {"loop_events", "ts"}, {"path_changes", "ts"}, {"outages", "start_ts"},
+}
+
+// ApplyRetention sets (days > 0) or removes (days == 0) a TTL on every data
+// table. It runs on every start so the configured value always applies. The
+// TTL is not materialized on existing parts right away (that would rewrite
+// them all); ClickHouse drops old rows as it merges.
+func ApplyRetention(ctx context.Context, c *clickhouse.Client, days int) error {
+	if days < 0 {
+		return fmt.Errorf("retention days %d: must not be negative", days)
+	}
+	for _, t := range retentionTables {
+		var q string
+		if days > 0 {
+			q = fmt.Sprintf("ALTER TABLE %s MODIFY TTL toDateTime(%s) + INTERVAL %d DAY SETTINGS materialize_ttl_after_modify = 0",
+				clickhouse.QuoteIdent(t.table), clickhouse.QuoteIdent(t.column), days)
+		} else {
+			type row struct {
+				N int `json:"n"`
+			}
+			has, err := clickhouse.QueryInto[row](ctx, c, `SELECT count() AS n FROM system.tables
+				WHERE database = currentDatabase() AND name = {t:String} AND position(create_table_query, ' TTL ') > 0`,
+				clickhouse.Params{"t": t.table})
+			if err != nil {
+				return fmt.Errorf("retention: %w", err)
+			}
+			if len(has) == 0 || has[0].N == 0 {
+				continue
+			}
+			q = "ALTER TABLE " + clickhouse.QuoteIdent(t.table) + " REMOVE TTL"
+		}
+		if err := c.Exec(ctx, q, nil); err != nil {
+			return fmt.Errorf("retention on %s: %w", t.table, err)
+		}
+	}
+	return nil
+}
