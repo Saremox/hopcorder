@@ -27,8 +27,10 @@ This starts ClickHouse, the server, an agent tracing three public resolvers
 (ICMP, UDP and TCP; edit [`deploy/compose/agent.yaml`](deploy/compose/agent.yaml)
 for your own targets), the server's own UI at <http://localhost:8080/ui/>
 and Grafana with the dashboards at <http://localhost:3000>. Data shows up
-within a minute. Everything listens on
-localhost only and nothing has a password: it is a try-out, not a deployment.
+within a minute. Grafana and the server listen on localhost only, ClickHouse
+is not published (`docker compose -f deploy/docker-compose.yml exec clickhouse
+clickhouse-client` to query it) and Grafana reads it with a read-only user,
+but the passwords are fixed: it is a try-out, not a deployment.
 `docker compose -f deploy/docker-compose.yml down -v` removes it with its data.
 
 ## Install
@@ -473,8 +475,10 @@ protocol, and a second target to compare with:
 To use it with your own Grafana, install the plugin, provision the data
 source and dashboard from [`deploy/grafana/provisioning`](deploy/grafana/provisioning)
 (it reads `HOPCORDER_CLICKHOUSE_HOST`, `_PORT`, `_DATABASE`, `_USER` and
-`_PASSWORD` from Grafana's environment; give it a read-only ClickHouse user),
-or import the JSON and pick your ClickHouse data source.
+`_PASSWORD` from Grafana's environment), or import the JSON and pick your
+ClickHouse data source. Give Grafana a read-only ClickHouse user, as
+[`deploy/compose/clickhouse-init.sql`](deploy/compose/clickhouse-init.sql)
+does: anyone who can open a dashboard can send Grafana SQL.
 
 ## Development
 
