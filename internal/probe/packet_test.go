@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/saremox/hopcorder/internal/record"
 )
 
 func unhex(t testing.TB, s string) []byte {
@@ -41,6 +44,8 @@ func TestBuildGolden(t *testing.T) {
 		{"udp4 checksum 0x1234", buildUDP(src4, dst4, 33434, 33434, 0x1234), "829a829a00141234dd75686f70636f7264657200"},
 		{"udp6 checksum 0xabcd", buildUDP(src6, dst6, 33434, 33435, 0xabcd), "829a829b0014abcdd4a2686f70636f7264657200"},
 		{"ipv4 header", buildIPv4(src4, dst4, protoUDP, 5, 0x1234, 20), "45000028123400000511b755c0000201c6336407"},
+		{"tcp4 syn id 7", buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(7)), "829a01bb00070000000000006002faf02c9d0000020405b4"},
+		{"tcp6 syn id 0xabcd", buildTCPSyn(src6, dst6, 33434, 443, tcpSeq(0xabcd)), "829a01bbabcd0000000000006002faf0119e0000020405b4"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,7 +154,7 @@ func TestParseICMPv4(t *testing.T) {
 		{"redirect ignored", router, "0501 0000 c0000201" + "45000028 00010000 0101 0000 c0000201 c6336407 0800 56ba 829a 0001", icmpReply{}, errIgnored},
 		{"reassembly timeout ignored", router, "0b01 0000 00000000" + "45000028 00010000 0101 0000 c0000201 c6336407 0800 56ba 829a 0001", icmpReply{}, errIgnored},
 		{"quoted echo reply is not ours", router, "0b00 0000 00000000" + "45000028 00010000 0101 0000 c0000201 c6336407 0000 56ba 829a 0001", icmpReply{}, errIgnored},
-		{"quoted tcp unsupported", router, "0b00 0000 00000000" + "45000028 00010000 0106 0000 c0000201 c6336407 829a 0050 00000001", icmpReply{}, errIgnored},
+		{"quoted sctp unsupported", router, "0b00 0000 00000000" + "45000028 00010000 0184 0000 c0000201 c6336407 829a 0050 00000001", icmpReply{}, errIgnored},
 		{"quoted non-first fragment", router, "0b00 0000 00000000" + "45000028 00010010 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errIgnored},
 		{"quoted ipv6 in icmpv4", router, "0b00 0000 00000000" + "65000028 00010000 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errMalformed},
 		{"quoted ihl too small", router, "0b00 0000 00000000" + "44000028 00010000 0111 0000 c0000201 c6336407 829a 829a 0014 1234", icmpReply{}, errMalformed},
@@ -250,11 +255,114 @@ func TestBuiltProbesMatchQuotedKeys(t *testing.T) {
 
 func FuzzParseICMP(f *testing.F) {
 	for _, s := range []string{timeExceeded4Echo, portUnreach4UDP, timeExceeded4Options, echoReply4,
-		timeExceeded6Echo, portUnreach6UDP, echoReply6} {
+		timeExceeded6Echo, portUnreach6UDP, echoReply6, mplsV4Explicit, mplsV4Compat, mplsV6Explicit} {
 		f.Add(unhex(f, s))
 	}
 	f.Fuzz(func(_ *testing.T, b []byte) {
 		_, _ = parseICMPv4(dst4, b)
 		_, _ = parseICMPv6(dst6, b)
+		_, _ = parseTCP(dst4, b)
+		_ = parseMPLS(b, false)
+		_ = parseMPLS(b, true)
 	})
+}
+
+func TestParseTCP(t *testing.T) {
+	tests := []struct {
+		name string
+		seg  string
+		want icmpReply
+		err  error
+	}{
+		// 443 -> 33434, seq 0x11111111, ack 0x00070001 (probe id 7 + 1), SYN|ACK.
+		{"syn-ack", "01bb829a 11111111 00070001 5012 ffff 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"rst-ack", "01bb829a 00000000 00070001 5014 0000 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"ack wraps into the id", "01bb829a 00000000 00080000 5014 0000 0000 0000",
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+		{"incoming syn ignored", "01bb829a 11111111 00000000 5002 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"plain ack ignored", "01bb829a 11111111 00070001 5010 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"rst without ack ignored", "01bb829a 11111111 00000000 5004 ffff 0000 0000", icmpReply{}, errIgnored},
+		{"data offset too small", "01bb829a 11111111 00070001 4012 ffff 0000 0000", icmpReply{}, errMalformed},
+		{"data offset past end", "01bb829a 11111111 00070001 6012 ffff 0000 0000", icmpReply{}, errMalformed},
+		{"truncated", "01bb829a 11111111 0007", icmpReply{}, errTruncated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseTCP(dst4, unhex(t, tt.seg))
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("err = %v, want %v", err, tt.err)
+			}
+			if tt.err == nil && got != tt.want {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuotedTCPKey(t *testing.T) {
+	syn := buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(0x1234))
+	msg := append(unhex(t, "0b00 0000 00000000"), buildIPv4(src4, dst4, protoTCP, 1, 1, len(syn))...)
+	msg = append(msg, syn[:8]...)
+	r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 0x1234}); r.kind != kindTimeExceeded || r.key != want {
+		t.Errorf("got %+v, want key %+v", r, want)
+	}
+	if s := verifySum(src4, dst4, protoTCP, syn); s != 0xffff {
+		t.Errorf("syn checksum does not verify (sum %#x)", s)
+	}
+}
+
+// Golden RFC 4884/4950 messages built by an independent Python script: an
+// ICMP error quoting a 128-byte-padded original datagram followed by an
+// extension structure with an MPLS label stack object.
+const (
+	mplsV4Explicit  = "0b00000000200000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020007e13000c010105dc500100010b01"
+	mplsV4Compat    = "0b00000000000000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020007e13000c010105dc500100010b01"
+	mplsV4CompatBad = "0b00000000000000450000280001000001010000c0000201c6336407080056ba829a00010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020008113000c010105dc500100010b01"
+	mplsV6Explicit  = "03000000100000006000000000143a0120010db800000000000000000000000120010db8000000000000000000000002800082f6829a000700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000def600080101ffffffff"
+)
+
+func TestParseMPLS(t *testing.T) {
+	two := []record.MPLSLabel{{Label: 24005, TC: 0, S: false, TTL: 1}, {Label: 16, TC: 5, S: true, TTL: 1}}
+	tests := []struct {
+		name string
+		msg  string
+		v6   bool
+		want []record.MPLSLabel
+	}{
+		{"v4 with length field", mplsV4Explicit, false, two},
+		{"v4 length 0, extension at 128", mplsV4Compat, false, two},
+		{"v4 length 0, bad checksum", mplsV4CompatBad, false, nil},
+		{"v6 with length field", mplsV6Explicit, true, []record.MPLSLabel{{Label: 1048575, TC: 7, S: true, TTL: 255}}},
+		{"no extension", timeExceeded4Echo, false, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseMPLS(unhex(t, tt.msg), tt.v6); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+	// Truncations and a wrong version never panic and never invent labels.
+	full := unhex(t, mplsV4Explicit)
+	for n := range len(full) {
+		if got := parseMPLS(full[:n], false); len(got) > 2 {
+			t.Fatalf("prefix %d: %+v", n, got)
+		}
+	}
+	bad := unhex(t, mplsV4Explicit)
+	bad[8+128] = 0x10 // version 1
+	if got := parseMPLS(bad, false); got != nil {
+		t.Errorf("version 1 extension parsed: %+v", got)
+	}
+	// The quoted datagram still parses as usual.
+	if r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), unhex(t, mplsV4Explicit)); err != nil ||
+		r.key != (probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}) {
+		t.Errorf("quoted probe: %+v %v", r, err)
+	}
 }

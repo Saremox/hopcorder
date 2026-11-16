@@ -82,8 +82,10 @@ func TestRawLoopback(t *testing.T) {
 	}{
 		{"icmp4", "127.0.0.1", ICMP},
 		{"udp4", "127.0.0.1", UDP},
+		{"tcp4", "127.0.0.1", TCP},
 		{"icmp6", "::1", ICMP},
 		{"udp6", "::1", UDP},
+		{"tcp6", "::1", TCP},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -93,12 +95,15 @@ func TestRawLoopback(t *testing.T) {
 			}
 			req := TraceRequest{Target: dst, Protocol: c.proto, FlowID: DefaultFlowID, Paris: true,
 				MaxTTL: 3, Timeout: time.Second}
-			if c.proto == UDP {
+			switch c.proto {
+			case UDP:
 				if dst.Is4() {
 					req.Port = closedUDPPort(t, "udp4", "127.0.0.1:0")
 				} else {
 					req.Port = closedUDPPort(t, "udp6", "[::1]:0")
 				}
+			case TCP:
+				req.Port = closedTCPPort(t, dst) // answered by RST
 			}
 			start := time.Now()
 			res, err := r.Trace(t.Context(), req)
@@ -119,6 +124,42 @@ func TestRawLoopback(t *testing.T) {
 				t.Errorf("%d probes left pending", n)
 			}
 		})
+	}
+	if r.kernelStamped.Load() == 0 {
+		t.Error("no reply carried a kernel receive timestamp")
+	}
+}
+
+// closedTCPPort returns a local TCP port nothing listens on.
+func closedTCPPort(t *testing.T, dst netip.Addr) uint16 {
+	t.Helper()
+	ln, err := net.Listen("tcp", netip.AddrPortFrom(dst, 0).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return uint16(port)
+}
+
+// An open port answers the SYN with a SYN-ACK.
+func TestRawTCPOpenPort(t *testing.T) {
+	r := newRawOrSkip(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
+	res, err := r.Trace(t.Context(), TraceRequest{Target: netip.MustParseAddr("127.0.0.1"), Protocol: TCP, Port: port,
+		FlowID: 40123, Paris: true, MaxTTL: 2, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range res {
+		if h.Status != record.StatusReply {
+			t.Errorf("ttl %d: %+v", h.TTL, h)
+		}
 	}
 }
 
@@ -339,7 +380,7 @@ func TestInnerPath(t *testing.T) {
 	innerOnly(t)
 	r := newRawOrSkip(t)
 	for _, c := range topoCases() {
-		for _, proto := range []Protocol{ICMP, UDP} {
+		for _, proto := range []Protocol{ICMP, UDP, TCP} {
 			for _, paris := range []bool{true, false} {
 				t.Run(fmt.Sprintf("%s/%s/paris=%v", c.name, proto, paris), func(t *testing.T) {
 					dst := netip.MustParseAddr(c.target)

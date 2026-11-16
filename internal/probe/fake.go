@@ -72,6 +72,8 @@ type FakeHop struct {
 	// Unreachable, if set, makes the hop answer destination unreachable with
 	// this code for its TTL and every higher one.
 	Unreachable *int
+	// MPLS is the label stack the hop reports in its ICMP errors.
+	MPLS []record.MPLSLabel
 }
 
 // NewFake returns an empty Fake. Targets without scenarios fail Trace.
@@ -147,8 +149,9 @@ func (f *Fake) Trace(ctx context.Context, req TraceRequest) ([]HopResult, error)
 	if sc.Err != nil {
 		return nil, sc.Err
 	}
-	f.sent.Add(uint64(req.MaxTTL))
-	return f.simulate(sc, req, cycle), nil
+	first := req.FirstTTL()
+	f.sent.Add(uint64(req.MaxTTL - first + 1)) //nolint:gosec // validated range
+	return f.simulate(sc, req, cycle)[first-1:], nil
 }
 
 func (f *Fake) active(target netip.Addr, now time.Time) (Scenario, bool) {
@@ -182,6 +185,7 @@ func (f *Fake) simulate(sc Scenario, req TraceRequest, cycle int) []HopResult {
 				continue
 			}
 			res.From = pickECMP(h.IPs, req, ttl, cycle)
+			res.MPLS = h.MPLS
 			res.RTT = h.RTT
 			if res.RTT <= 0 {
 				res.RTT = time.Millisecond

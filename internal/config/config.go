@@ -25,7 +25,8 @@ const (
 	DefaultMaxTTL       = 30
 	DefaultProbePast    = 2
 	DefaultProtocol     = "icmp"
-	DefaultPort         = 33434
+	DefaultPort         = 33434 // UDP destination port
+	DefaultTCPPort      = 443
 	DefaultFlowID       = 33434
 	DefaultDNSTTL       = 5 * time.Minute
 	DefaultSpoolMaxAge  = 7 * 24 * time.Hour
@@ -52,11 +53,14 @@ type Config struct {
 	ProbePast *int     `yaml:"probe_past"`
 	Protocol  string   `yaml:"protocol"`
 	Paris     *bool    `yaml:"paris"`
-	DNSTTL    Duration `yaml:"dns_ttl"`
-	Log       Log      `yaml:"log"`
-	Spool     Spool    `yaml:"spool"`
-	Targets   []Target `yaml:"targets"`
-	Outputs   Outputs  `yaml:"outputs"`
+	// AdaptiveMaxTTL probes only a few TTLs past the destination's last
+	// distance; cycles that fall short are extended in the same cycle.
+	AdaptiveMaxTTL *bool    `yaml:"adaptive_max_ttl"`
+	DNSTTL         Duration `yaml:"dns_ttl"`
+	Log            Log      `yaml:"log"`
+	Spool          Spool    `yaml:"spool"`
+	Targets        []Target `yaml:"targets"`
+	Outputs        Outputs  `yaml:"outputs"`
 }
 
 // Log configures logging.
@@ -74,16 +78,18 @@ type Spool struct {
 
 // Target is one probed destination. Zero fields inherit the global value.
 type Target struct {
-	Host      string   `yaml:"host"`
-	Protocol  string   `yaml:"protocol"`
-	Port      int      `yaml:"port"`
-	AF        int      `yaml:"af"` // 4 or 6; 0 prefers IPv4
-	FlowID    int      `yaml:"flow_id"`
-	Paris     *bool    `yaml:"paris"`
-	Interval  Duration `yaml:"interval"`
-	Timeout   Duration `yaml:"timeout"`
-	MaxTTL    int      `yaml:"max_ttl"`
-	ProbePast *int     `yaml:"probe_past"`
+	Host     string `yaml:"host"`
+	Protocol string `yaml:"protocol"`
+	Port     int    `yaml:"port"`
+	AF       int    `yaml:"af"` // 4 or 6; 0 prefers IPv4
+	FlowID   int    `yaml:"flow_id"`
+	Paris    *bool  `yaml:"paris"`
+	// AdaptiveMaxTTL overrides the global setting.
+	AdaptiveMaxTTL *bool    `yaml:"adaptive_max_ttl"`
+	Interval       Duration `yaml:"interval"`
+	Timeout        Duration `yaml:"timeout"`
+	MaxTTL         int      `yaml:"max_ttl"`
+	ProbePast      *int     `yaml:"probe_past"`
 }
 
 // Outputs selects where records go. A nil output is disabled.
@@ -203,6 +209,9 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 	if c.Paris == nil {
 		c.Paris = ptr(true)
 	}
+	if c.AdaptiveMaxTTL == nil {
+		c.AdaptiveMaxTTL = ptr(true)
+	}
 	setDur(&c.DNSTTL, DefaultDNSTTL)
 	if c.Log.Level == "" {
 		c.Log.Level = "info"
@@ -290,14 +299,22 @@ func (c *Config) defaultTarget(t *Target) {
 	if t.Protocol == "" {
 		t.Protocol = c.Protocol
 	}
-	if t.Protocol == "udp" && t.Port == 0 {
-		t.Port = DefaultPort
+	if t.Port == 0 {
+		switch t.Protocol {
+		case "udp":
+			t.Port = DefaultPort
+		case "tcp":
+			t.Port = DefaultTCPPort
+		}
 	}
 	if t.FlowID == 0 {
 		t.FlowID = DefaultFlowID
 	}
 	if t.Paris == nil {
 		t.Paris = c.Paris
+	}
+	if t.AdaptiveMaxTTL == nil {
+		t.AdaptiveMaxTTL = c.AdaptiveMaxTTL
 	}
 	setDur(&t.Interval, c.Interval.D())
 	setDur(&t.Timeout, c.Timeout.D())
@@ -324,16 +341,14 @@ func validateTarget(t *Target) []error {
 	switch t.Protocol {
 	case "icmp":
 		if t.Port != 0 {
-			fail("port: only valid for udp")
+			fail("port: only valid for udp and tcp")
 		}
-	case "udp":
+	case "udp", "tcp":
 		if t.Port < 1 || t.Port > 65535 {
 			fail("port %d: out of range 1..65535", t.Port)
 		}
-	case "tcp":
-		fail("protocol tcp: not implemented yet (planned for milestone 2)")
 	default:
-		fail("protocol %q: want icmp or udp", t.Protocol)
+		fail("protocol %q: want icmp, udp or tcp", t.Protocol)
 	}
 	switch t.AF {
 	case 0, 4, 6:

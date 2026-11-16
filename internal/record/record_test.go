@@ -262,7 +262,8 @@ func TestJSONShape(t *testing.T) {
 		Hops: []Hop{
 			{TTL: 1, Status: StatusTTLExpired, IP: ip("192.168.187.1"), RTTMicros: 1432},
 			{TTL: 2, Status: StatusNoReply},
-			{TTL: 3, Status: StatusUnreachable, IP: ip("10.1.1.1"), RTTMicros: 5000, Code: IntPtr(0)},
+			{TTL: 3, Status: StatusUnreachable, IP: ip("10.1.1.1"), RTTMicros: 5000, Code: IntPtr(0),
+				MPLS: []MPLSLabel{{Label: 24005, TC: 0, S: true, TTL: 1}}},
 		},
 	}
 	r.Finalize(2)
@@ -275,7 +276,8 @@ func TestJSONShape(t *testing.T) {
 		`"reached":false,"path_len":3,"path_hash":"` + r.PathHash + `","loops":[],"hops":[` +
 		`{"ttl":1,"status":"ttl-expired","ip":"192.168.187.1","rtt_us":1432},` +
 		`{"ttl":2,"status":"no-reply"},` +
-		`{"ttl":3,"status":"unreachable","ip":"10.1.1.1","rtt_us":5000,"code":0}]}`
+		`{"ttl":3,"status":"unreachable","ip":"10.1.1.1","rtt_us":5000,"code":0,` +
+		`"mpls":[{"label":24005,"tc":0,"s":true,"ttl":1}]}]}`
 	if string(b) != want {
 		t.Errorf("JSON mismatch\n got: %s\nwant: %s", b, want)
 	}
@@ -310,6 +312,8 @@ func TestValidateRejects(t *testing.T) {
 		{"ttl gap", func(r *Record) { r.Hops[1].TTL = 5 }},
 		{"bad status", func(r *Record) { r.Hops[0].Status = "lost" }},
 		{"nil loops", func(r *Record) { r.Loops = nil }},
+		{"mpls on a reply", func(r *Record) { r.Hops[1].MPLS = []MPLSLabel{{Label: 16, S: true, TTL: 1}} }},
+		{"mpls label too large", func(r *Record) { r.Hops[0].MPLS = []MPLSLabel{{Label: 1 << 20, S: true}} }},
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("baseline invalid: %v", err)
@@ -320,6 +324,86 @@ func TestValidateRejects(t *testing.T) {
 			tt.mutate(r)
 			if r.Validate() == nil {
 				t.Error("Validate() accepted invalid record")
+			}
+		})
+	}
+}
+
+func TestPathTracker(t *testing.T) {
+	const dst = "192.0.2.9"
+	rec := func(target string, hs []Hop) *Record {
+		r := &Record{Schema: 1, AgentID: "a", TS: time.Unix(1, 0), Target: "t", TargetIP: ip(target), AF: 4,
+			Protocol: "icmp", Hops: hs}
+		r.Finalize(2)
+		return r
+	}
+	type step struct {
+		rec  *Record
+		want bool
+	}
+	base := func() *Record { return rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "r:"+dst)) }
+	tests := []struct {
+		name  string
+		steps []step
+	}{
+		{"first observation is not a change", []step{{base(), false}}},
+		{"identical cycles", []step{{base(), false}, {base(), false}}},
+		{"rate-limited hop flickers", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "*", "x:10.0.0.3", "r:"+dst)), false},
+			{base(), false},
+			{rec(dst, hops("*", "*", "*", "r:"+dst)), false},
+		}},
+		{"router replaced while silent", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "*", "x:10.0.0.3", "r:"+dst)), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "x:10.0.0.3", "r:"+dst)), true},
+			{rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "x:10.0.0.3", "r:"+dst)), false},
+		}},
+		{"different router at one ttl", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.9.9.9", "x:10.0.0.3", "r:"+dst)), true},
+		}},
+		{"destination one hop closer", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "r:"+dst)), true},
+		}},
+		{"destination one hop further", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "x:10.0.0.4", "r:"+dst)), true},
+		}},
+		{"destination moves behind a silent hop", []step{
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "*", "r:"+dst)), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "r:"+dst)), true},
+		}},
+		{"black hole, then recovery on the same path", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "*", "*", "*")), false},
+			{base(), false},
+		}},
+		{"loop replaces the tail", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.1", "x:10.0.0.2", "*")), true},
+		}},
+		{"target moved (DNS)", []step{
+			{base(), false},
+			{rec("192.0.2.10", hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "r:192.0.2.10")), true},
+		}},
+		{"change resets what is known", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.9.9.9", "*", "r:"+dst)), true},
+			// TTL 3 was only known from before the change; a new router
+			// there is first sight, not another change.
+			{rec(dst, hops("x:10.0.0.1", "x:10.9.9.9", "x:10.8.8.8", "r:"+dst)), false},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var p PathTracker
+			for i, s := range tt.steps {
+				if got := p.Observe(s.rec); got != s.want {
+					t.Errorf("step %d: Observe = %v, want %v", i, got, s.want)
+				}
 			}
 		})
 	}

@@ -68,7 +68,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&f.timeout, "timeout", 0, "per-probe timeout (default 1s)")
 	fs.IntVar(&f.maxTTL, "max-ttl", 0, "highest TTL probed (default 30)")
 	fs.IntVar(&f.probePast, "probe-past", 0, "TTLs kept beyond the last responding hop of an unreached target (default 2)")
-	fs.StringVar(&f.protocol, "protocol", "", "default probe protocol: icmp or udp (default icmp)")
+	fs.StringVar(&f.protocol, "protocol", "", "default probe protocol: icmp, udp or tcp (default icmp)")
 	fs.BoolVar(&f.paris, "paris", true, "keep the flow identifier constant across TTLs (paris traceroute)")
 	fs.IntVar(&f.af, "af", 0, "address family (4 or 6) for targets given as arguments")
 	fs.StringVar(&f.spoolDir, "spool-dir", "", "spool directory")
@@ -104,11 +104,67 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	if f.once {
 		return runOnce(ctx, cfg, prober, logger, stdout)
 	}
-	if err := runDaemon(ctx, cfg, prober, logger); err != nil {
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
+	err = superviseDaemon(ctx, cfg, prober, reload,
+		func() (*config.Config, error) { return buildConfig(fs, &f, targets) },
+		func(c *config.Config) *slog.Logger { return newLogger(c.Log, stderr) })
+	if err != nil {
 		logger.Error("agent stopped", "err", err)
 		return 1
 	}
 	return 0
+}
+
+// superviseDaemon runs the daemon and restarts it with a freshly loaded
+// configuration whenever reload fires (SIGHUP). An invalid configuration is
+// logged and the running one is kept. A valid one replaces everything except
+// the prober (raw sockets stay open); the spool persists, so seq continues.
+// If the new configuration then fails to start (say its metrics address is
+// taken), the previous one is started again.
+func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, reload <-chan os.Signal,
+	load func() (*config.Config, error), mkLogger func(*config.Config) *slog.Logger) error {
+	var previous *config.Config // set while a reloaded config is being tried
+	for {
+		logger := mkLogger(cfg)
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- runDaemon(runCtx, cfg, prober, logger) }()
+
+		var next *config.Config
+		for next == nil {
+			select {
+			case err := <-done:
+				cancel()
+				if err != nil && previous != nil && ctx.Err() == nil {
+					logger.Error("new configuration failed to start; reverting to the previous one", "err", err)
+					next, previous = previous, nil
+					continue
+				}
+				return err
+			case <-reload:
+				c, err := load()
+				if err != nil {
+					logger.Error("reload: invalid configuration; keeping the current one", "err", err)
+					continue
+				}
+				logger.Info("reloading configuration")
+				cancel()
+				if err := <-done; err != nil {
+					return err
+				}
+				next, previous = c, cfg
+			}
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return nil // SIGTERM arrived during the reload
+		default:
+		}
+		cfg = next
+	}
 }
 
 // parseInterspersed parses flags that may appear before, between or after
@@ -196,16 +252,17 @@ func agentTargets(cfg *config.Config) []agent.Target {
 	out := make([]agent.Target, len(cfg.Targets))
 	for i, t := range cfg.Targets {
 		out[i] = agent.Target{
-			Host:      t.Host,
-			Protocol:  probe.Protocol(t.Protocol),
-			Port:      uint16(t.Port),   //nolint:gosec // validated 0..65535
-			FlowID:    uint16(t.FlowID), //nolint:gosec // validated 1..65535
-			Paris:     *t.Paris,
-			AF:        t.AF,
-			Interval:  t.Interval.D(),
-			Timeout:   t.Timeout.D(),
-			MaxTTL:    t.MaxTTL,
-			ProbePast: *t.ProbePast,
+			Host:        t.Host,
+			Protocol:    probe.Protocol(t.Protocol),
+			Port:        uint16(t.Port),   //nolint:gosec // validated 0..65535
+			FlowID:      uint16(t.FlowID), //nolint:gosec // validated 1..65535
+			Paris:       *t.Paris,
+			AF:          t.AF,
+			Interval:    t.Interval.D(),
+			Timeout:     t.Timeout.D(),
+			MaxTTL:      t.MaxTTL,
+			ProbePast:   *t.ProbePast,
+			AdaptiveTTL: *t.AdaptiveMaxTTL,
 		}
 	}
 	return out
@@ -303,9 +360,11 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 			AgentID: cfg.AgentID, Version: versionString(), Targets: targets, Outputs: names,
 			Spool: sp, Prober: stats,
 		})
-		if err := m.Serve(ctx, mc.Listen, mc.Path, logger); err != nil {
+		stopMetrics, err := m.Serve(ctx, mc.Listen, mc.Path, logger)
+		if err != nil {
 			return err
 		}
+		defer stopMetrics()
 		for i := range drainOpts {
 			drainOpts[i].OnError = m.OutputError(names[i])
 		}

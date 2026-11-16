@@ -6,8 +6,9 @@ interval: 5s                    # minimum period between cycles, per target
 timeout: 1s                     # per-probe timeout; must be < interval
 max_ttl: 30                     # TTLs 1..max_ttl are probed at once each cycle
 probe_past: 2                   # silent TTLs kept past the last responder if unreached
-protocol: icmp                  # default for targets: icmp or udp
+protocol: icmp                  # default for targets: icmp, udp or tcp
 paris: true                     # flow-stable probing (keeps ECMP on one path)
+adaptive_max_ttl: true          # stop a few TTLs past the destination (records unchanged)
 dns_ttl: 5m                     # re-resolve hostnames this often
 
 log:
@@ -23,9 +24,11 @@ targets:                        # required: at least one
   - host: example.net
   - host: 192.0.2.10
     protocol: udp
-    port: 33434                 # udp only; default 33434
+    port: 33434                 # udp/tcp only; default 33434 (udp), 443 (tcp)
+  - host: example.org
+    protocol: tcp               # SYN probes: answered by SYN-ACK or RST
   # Per-target overrides: protocol, port, af (4|6), flow_id, paris,
-  # interval, timeout, max_ttl, probe_past.
+  # adaptive_max_ttl, interval, timeout, max_ttl, probe_past.
   # - host: dual-stack.example.net
   #   af: 6
   #   interval: 30s

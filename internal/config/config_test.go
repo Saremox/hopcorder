@@ -65,6 +65,16 @@ func TestHandoffExample(t *testing.T) {
 		*t0.ProbePast != 2 || !*t0.Paris || t0.FlowID != DefaultFlowID {
 		t.Errorf("target 0 defaults: %+v", t0)
 	}
+	c2, err := finalize(t, "targets: [{host: x.example, protocol: tcp}, {host: y.example, protocol: tcp, port: 22}]", FinalizeOptions{Once: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Targets[0].Port != DefaultTCPPort || c2.Targets[1].Port != 22 {
+		t.Errorf("tcp ports %d %d", c2.Targets[0].Port, c2.Targets[1].Port)
+	}
+	if !*t0.AdaptiveMaxTTL {
+		t.Error("adaptive_max_ttl must default to true")
+	}
 	if t1.Protocol != "udp" || t1.Port != 33434 || t1.AF != 4 {
 		t.Errorf("target 1: %+v", t1)
 	}
@@ -91,6 +101,7 @@ targets:
     probe_past: 0
     paris: true
     flow_id: 4242
+    adaptive_max_ttl: false
 spool: {dir: /tmp/x}
 outputs: {jsonl: {path: "-"}}
 `, FinalizeOptions{})
@@ -105,7 +116,7 @@ outputs: {jsonl: {path: "-"}}
 		t.Errorf("target a: %+v", a)
 	}
 	if b.Protocol != "icmp" || b.Interval.D() != 30*time.Second || b.MaxTTL != 12 || *b.ProbePast != 0 || !*b.Paris ||
-		b.FlowID != 4242 || b.AF != 6 {
+		b.FlowID != 4242 || b.AF != 6 || *b.AdaptiveMaxTTL {
 		t.Errorf("target b: %+v", b)
 	}
 }
@@ -121,7 +132,7 @@ targets:
   - host: 192.0.2.1
     af: 6
   - host: a.example
-    protocol: tcp
+    protocol: sctp
   - host: b.example
     protocol: icmp
     port: 80
@@ -151,7 +162,7 @@ outputs:
 		"agent_id", "log.level", "log.format",
 		"targets[0] (): host: required",
 		"af 6 does not match",
-		"protocol tcp: not implemented",
+		"protocol \"sctp\": want icmp, udp or tcp",
 		"port: only valid for udp",
 		"port 70000",
 		"must be shorter than the interval",

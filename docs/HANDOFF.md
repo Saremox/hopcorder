@@ -272,14 +272,15 @@ for HTTP, logging, and everything else. Ask before adding anything else.
 - [x] `internal/record`: types, `path_hash`, loop detection, trimming;
       table-driven tests
 - [x] `internal/probe`: interface + fake; ICMP v4/v6 raw implementation with
-      reply demux; UDP; paris mode (TCP SYN deferred to M2; IPv6 raw sockets run
+      reply demux; UDP; paris mode (TCP SYN added after review, see §10; IPv6 raw sockets run
       in the CI `rawsock` job only, as the development container had no IPv6)
 - [x] `internal/agent`: per-target scheduler, stagger, DNS refresh, overrun
       handling
 - [x] `internal/spool`: durable, bounded, crash-safe; tests incl. simulated
       crash
 - [x] `internal/output`: jsonl, http (with auth options + backoff), metrics
-- [x] `internal/config`: YAML + flags + validation (SIGHUP reload not done)
+- [x] `internal/config`: YAML + flags + validation; SIGHUP reload (added
+      after review, see §10)
 - [x] `hopcorder agent` and `hopcorder agent --once`
 - [x] README: install, `setcap`, config reference, the rate-limiting/ECMP
       caveats
@@ -399,16 +400,53 @@ added in the commit that introduced it.
 - **Destination answering for UDP** = ICMP port unreachable from the target
   address. Unreachable from any other address, or with another code, is
   `unreachable`.
+- **TCP SYN probing** (§4.3, done after M1 review): a SYN with an MSS option
+  to `port` (default 443), source port `flow_id`. The probe id is the top 16
+  bits of the sequence number (ECMP does not hash it; ICMP errors quote it;
+  SYN-ACK/RST acknowledge seq+1). Paris keeps both ports fixed; classic mode
+  walks the source port, since the destination port is the service being
+  reached. The destination's SYN-ACK or RST is `reply`, as is an ICMP port
+  unreachable from the destination itself (an iptables REJECT). Replies arrive
+  as TCP, so each family gets a raw TCP socket on first use, with a kernel BPF
+  filter passing only ACK+SYN or ACK+RST segments; on IPv6 that socket also
+  sends the SYNs. The kernel answers the SYN-ACK with an RST, so no
+  connection is ever established.
 - **Probe ids are counted per flow** (dst, protocol, flow id) from a random
   start, so a busy agent never reuses an id within the 30s tombstone window.
   Two hopcorder *processes* on one host (e.g. `--once` next to the daemon)
   both see every ICMP reply; with the same target and `flow_id` a reply can,
   rarely, be attributed to the other process's probe. Give such runs a
   different `flow_id`.
-- **Known limitations**: RTTs use user-space receive timestamps (tens of µs of
-  scheduling noise; kernel `SO_TIMESTAMPNS` is a possible refinement). MPLS
-  label extensions (RFC 4950) are not parsed. All TTLs up to `max_ttl` are
-  probed every cycle; TTLs beyond the destination each draw a reply from it.
+- **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
+  review). Once a target was reached at distance d, cycles probe TTLs
+  1..d+3. If that batch neither reaches the destination nor hits an
+  unreachable, the same cycle probes d+4..`max_ttl` before the record is
+  built, so records never differ from full-depth probing; only the replies
+  the destination would send for TTLs past it are saved. Unreached targets
+  always get full depth. Implemented with `TraceRequest.MinTTL`.
+- **Kernel receive timestamps** (added after review): listeners enable
+  `SO_TIMESTAMPNS`, and each reply's receive time is moved back by the lag
+  between the kernel's stamp and the user-space read. RTTs stay on the
+  monotonic clock; only the difference of two wall-clock readings taken
+  microseconds apart is used, and lags outside 0..100ms (a clock step) fall
+  back to the user-space time. On loopback this cut the median RTT from
+  ~55µs to ~24µs (p90 104 → 35µs), i.e. about 30µs of every RTT was Go
+  scheduling delay. Send times are still user-space, taken just before the
+  send call.
+- **MPLS label stacks** (added after review; **additive change to the locked
+  wire record §3.1**, approved with the "agent polish" scope): hops may carry
+  `"mpls": [{"label": 24005, "tc": 0, "s": true, "ttl": 1}, …]`, outermost
+  label first, parsed from RFC 4884 extensions (RFC 4950 MPLS object) of time
+  exceeded and unreachable messages. Absent when the router sent none, so
+  existing consumers are unaffected and `schema` stays 1. Both layouts are
+  read: the RFC 4884 length field, and the common "length 0, extension after
+  a 128-byte original datagram" form, which is accepted only with a valid
+  extension checksum. M2 should store the stack per hop (e.g.
+  `hop_mpls Array(Tuple(label UInt32, tc UInt8, s UInt8, ttl UInt8))`); it
+  shows which hops of a transit backbone sit inside an MPLS tunnel.
+- **Known limitations**: all TTLs up to `max_ttl` are probed in cycles of
+  unreached targets. Routers that hide MPLS hops (no TTL propagation) stay
+  invisible; labels only appear for hops that answer.
 - **Testing**: the demux engine sits behind a small socket interface and is
   tested in the default run against an in-memory network that answers with
   real ICMP bytes. The `rawsock` tests build a four-namespace routed topology
@@ -450,6 +488,17 @@ added in the commit that introduced it.
   jittered to 50–100%.
 - **`--once`** does not open the spool (so it can run next to a running agent)
   and prints records with `seq: 0`; the spool assigns seqs from 1.
+- **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
+  and the original command-line flags and positional targets are re-applied.
+  Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
+  metrics server, schedulers) shuts down as on SIGTERM and starts again with
+  the new config; only the prober and its raw sockets survive. A full
+  in-process restart was chosen over diffing configs because it applies every
+  setting the same way and has one code path; the cost is a pause of about
+  one shutdown (≤3s) and Prometheus counters restarting from zero, which
+  `rate()` handles. If the new config fails to start, the previous one is
+  started again. Every reload reopens the JSONL file, which makes
+  rename-and-HUP log rotation work.
 - **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
   outputs get up to 3s to drain what is spooled; whatever is left stays in the
   spool for the next start.
@@ -466,18 +515,27 @@ added in the commit that introduced it.
   process collectors. `agent_id` is a constant label on every hopcorder
   metric; `target` is the configured host. `hopcorder_loops_detected_total`
   counts cycles with at least one loop; `hopcorder_path_changes_total` counts
-  cycles whose `path_hash` differs from the previous cycle of that target.
+  route changes as decided by `record.PathTracker` (see "Decided after
+  review" below), not `path_hash` changes.
   Overrun and per-target error counters carry `target`/`protocol`.
 
-### Open questions
+### Decided after review (2026-11-16)
 
-- **`path_hash` and flickering hops.** §3.2 says the `*` placeholder means "a
-  rate-limited router flickering in and out must not register as a path
-  change", but with the specified algorithm a hop that answers in cycle N and
-  is silent in cycle N+1 *does* change the hash (`…|10.0.0.2|…` vs `…|*|…`).
-  The placeholder only keeps positions aligned. M1 implements the algorithm
-  exactly as written, and `hopcorder_path_changes_total` counts hash changes,
-  so it also counts flicker. A flicker-proof alternative for the metric (and
-  for M2's path-change view): call it a change only if some TTL answered in
-  both cycles with different addresses, or a reached destination's distance
-  changed. Needs a decision before M2 builds its path-change table on it.
+- **Path change = wildcard comparison** (resolves the contradiction in §3.2:
+  the `*` placeholder is meant to keep a flickering rate-limited router from
+  counting as a route change, but with the specified algorithm such a hop
+  *does* change `path_hash`). `path_hash` stays in the wire format exactly as
+  specified. Route changes are decided by `record.PathTracker` instead: it
+  remembers the last address seen at each TTL, treats silent hops as
+  wildcards, and reports a change when a TTL answers from a different
+  address, a reached destination is at a different distance, or the target
+  address changed. Gaining or losing reachability alone is not a path change.
+  `hopcorder_path_changes_total` uses it; **M2's path-change table must use
+  the same algorithm** per `(agent_id, target, protocol, flow_id)` stream
+  rather than comparing `path_hash`.
+- **The three deviations above are approved**: loops count only `ttl-expired`
+  answers; an ICMP unreachable ends the path; `--once` prints `seq: 0` and
+  does not open the spool.
+- **The 24h run** from the M1 done criteria is skipped for now; the
+  3-minute accelerated soak (4,645 cycles, flat goroutines/heap/RSS) stands
+  in. Revisit if growth shows up in production.
