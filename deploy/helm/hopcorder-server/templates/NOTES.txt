@@ -10,3 +10,7 @@ Point agents at http://{{ include "hopcorder-server.fullname" . }}.{{ .Release.N
   open http://127.0.0.1:8080/ui/
 
 hopcorder does no authentication: secure ingest and the UI at your ingress.
+Clients inside the cluster reach the Service directly, around the ingress:
+{{- if .Values.networkPolicy.enabled }} the NetworkPolicy limits them to networkPolicy.from.
+{{- else }} set networkPolicy.enabled=true to limit them (needs a CNI that enforces it).
+{{- end }}

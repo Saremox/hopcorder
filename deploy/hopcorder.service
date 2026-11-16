@@ -32,6 +32,11 @@ DynamicUser=yes
 StateDirectory=hopcorder
 LogsDirectory=hopcorder
 ConfigurationDirectory=hopcorder
+# Secrets (an ingest token or password): the dynamic user can only read
+# world-readable files in /etc/hopcorder, so do not put them there. Keep each
+# in a root-only file and pass it as a credential, then point the config at
+# it, e.g. bearer_token_file: /run/credentials/hopcorder.service/token
+#LoadCredential=token:/etc/hopcorder/secrets/token
 
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
