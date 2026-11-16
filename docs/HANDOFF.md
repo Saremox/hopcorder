@@ -434,3 +434,18 @@ added in the commit that introduced it.
 - **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
   outputs get up to 3s to drain what is spooled; whatever is left stays in the
   spool for the next start.
+- **HTTP output**: any non-2xx is retried (the M2 server must answer 2xx for
+  records it already has, since dedup is its job). `bearer_token_file` and
+  `basic_auth.password_file` are re-read on every request, so secrets rotate
+  without a restart; `tls.ca_file` replaces the system roots; client
+  certificates are loaded at startup. A `Host` entry in `headers` sets the
+  request's Host.
+- **Metrics** beyond §5.3's list: `hopcorder_cycle_errors_total`,
+  `hopcorder_resolve_errors_total`, `hopcorder_output_pending_records{output}`,
+  `hopcorder_spool_records`, `hopcorder_probes_sent_total`,
+  `hopcorder_probe_send_errors_total`, `hopcorder_build_info`, plus the Go and
+  process collectors. `agent_id` is a constant label on every hopcorder
+  metric; `target` is the configured host. `hopcorder_loops_detected_total`
+  counts cycles with at least one loop; `hopcorder_path_changes_total` counts
+  cycles whose `path_hash` differs from the previous cycle of that target.
+  Overrun and per-target error counters carry `target`/`protocol`.
