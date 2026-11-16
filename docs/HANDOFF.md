@@ -449,3 +449,16 @@ added in the commit that introduced it.
   counts cycles with at least one loop; `hopcorder_path_changes_total` counts
   cycles whose `path_hash` differs from the previous cycle of that target.
   Overrun and per-target error counters carry `target`/`protocol`.
+
+### Open questions
+
+- **`path_hash` and flickering hops.** §3.2 says the `*` placeholder means "a
+  rate-limited router flickering in and out must not register as a path
+  change", but with the specified algorithm a hop that answers in cycle N and
+  is silent in cycle N+1 *does* change the hash (`…|10.0.0.2|…` vs `…|*|…`).
+  The placeholder only keeps positions aligned. M1 implements the algorithm
+  exactly as written, and `hopcorder_path_changes_total` counts hash changes,
+  so it also counts flicker. A flicker-proof alternative for the metric (and
+  for M2's path-change view): call it a change only if some TTL answered in
+  both cycles with different addresses, or a reached destination's distance
+  changed. Needs a decision before M2 builds its path-change table on it.
