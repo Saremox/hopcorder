@@ -32,9 +32,10 @@ ClickHouse DDL and analysis queries in `docs/prototype/schema.sql`. Treat it as 
 behavioural reference, not code to port line by line. It shells out to
 `mtr-packet`; the Go version probes natively.
 
-> **Note (M1):** the prototype files were not present in the repository when M1
-> was implemented; M1 was built from this document alone. Add them under
-> `docs/prototype/` before starting M2/M3, which depend on `schema.sql`.
+> **Note:** the prototype files were not present when M1 and M2 were
+> implemented; both were built from this document alone. `schema.sql` was
+> added after M2 and the server schema reconciled with it (§10, "Prototype
+> reconciliation"). `pathwatch.py` is still not in the repository.
 
 ## 2. Architecture (locked)
 
@@ -308,7 +309,7 @@ applied on startup.
 - [x] Loop events (materialized view); path changes and reachability-loss
       windows (derived by the server, see §10)
 - [x] Read API, `/healthz`, `/readyz`, migrations on startup
-- [ ] Reconcile the schema with `docs/prototype/schema.sql` once it is added
+- [x] Reconcile the schema with `docs/prototype/schema.sql` (migration 0002, §10)
 
 ### M3 — Grafana
 
@@ -529,14 +530,13 @@ added in the commit that introduced it.
 
 ### M2 — server
 
-- **Schema without the prototype.** `docs/prototype/schema.sql` was still not
-  in the repository when M2 was built, so the ClickHouse schema
+- **Schema without the prototype.** `docs/prototype/schema.sql` was not in the
+  repository when M2 was built, so the ClickHouse schema
   (`internal/server/migrations/0001_init.sql`) was designed from this
   document: the per-hop `hops` table carries the fields of §3.1 plus
   `agent_id`, `seq`, `af`, `protocol`, `flow_id`, `hop_asn`, `hop_as_name`,
-  `hop_name` (rDNS) and `mpls`. When the prototype arrives, its analysis
-  queries should be checked against these names (a follow-up migration can
-  add views with the prototype's column names if they differ).
+  `hop_name` (rDNS) and `mpls`. Reconciled with the prototype afterwards, see
+  the next section.
 - **One insert per batch, flattening in ClickHouse.** The server inserts only
   into `cycles` (one row per cycle, hops and loops as `Nested` columns, plus
   per-hop enrichment). `hops`, `loop_events` and `agent_seq` are materialized
@@ -589,6 +589,41 @@ added in the commit that introduced it.
   a retry and a restart against a real ClickHouse (25.8), plus the full agent
   daemon → server → ClickHouse path. CI runs these with ClickHouse as a
   service container.
+
+### Prototype reconciliation (after M2)
+
+`docs/prototype/schema.sql` arrived after M2 and is kept verbatim. Migration
+`0002_prototype_compat.sql` reconciles with it:
+
+- **`path_probes` view** with the prototype's column names over `hops`
+  (`src` = `agent_id`, `cycle` = `seq`; hopcorder's extra columns appended),
+  so the prototype's seven analysis queries run against hopcorder data with
+  only the database name changed. `TestPrototypeQueriesRun` (clickhouse tag)
+  runs all seven, read straight from the file.
+- **`is_loop` / `loop_ttls` on `hops`**: the prototype keeps loops on the
+  per-hop rows; `hops_mv` now fills both from the cycle's loops. Rows stored
+  before the migration keep the defaults (`loop_events` has every loop).
+- **Retention**: the prototype expires data after 90 days.
+  `clickhouse.retention_days` (default 90, 0 = forever) sets a TTL on every
+  data table on each start (`agent_seq` never expires; it guards dedup).
+- **The prototype's Q3 is broken on current ClickHouse**, even against its
+  own `netpath.path_probes`: `min(ts) AS ts` is visible in the same
+  subquery's `WHERE ts >= …`, giving `ILLEGAL_AGGREGATION` (with the old and
+  the new analyzer, 25.8). Renaming the alias (`min(ts) AS first_ts`, and
+  `SELECT first_ts AS ts, …` one level up) fixes it; `neighbor()` also needs
+  `allow_deprecated_error_prone_window_functions = 1`. Q3 also detects
+  changes by `path_hash`, so it counts rate-limit flicker; the dashboards use
+  `path_changes` instead (decided rule, below).
+- **Differences that stay**:
+  - Status values: hopcorder has `unreachable` (with a code) where the
+    prototype had mtr-packet's `no-route` / `network-down`. hopcorder records
+    a local no-route as a cycle of `no-reply` hops (§10, M1).
+  - Partitioning: monthly instead of the prototype's daily, with
+    `ORDER BY (agent_id, target, protocol, ts, ttl)` instead of
+    `(target, ttl, ts)`. Neither can be changed without rebuilding the tables,
+    and both serve the queries.
+  - The prototype's queries filter on `target` only. With several agents or
+    protocols per target, add `src` and `protocol` filters.
 
 ### Decided after review (2026-11-16)
 

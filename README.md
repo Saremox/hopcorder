@@ -313,7 +313,11 @@ background so ingest never waits on DNS.
 **Tables** (database `hopcorder`): `cycles` (one row per cycle, hops as Nested
 columns), `hops` (one row per hop per cycle, the table to query for latency
 and loss), `loop_events`, `path_changes` and `outages` (both
-`ReplacingMergeTree`: query them with `FINAL`), `agent_seq`. Route changes use
+`ReplacingMergeTree`: query them with `FINAL`), `agent_seq`. The view
+`path_probes` presents `hops` under the prototype's column names, so the
+queries in [`docs/prototype/schema.sql`](docs/prototype/schema.sql) run as they
+are (database `hopcorder` instead of `netpath`). Data expires after
+`clickhouse.retention_days` (default 90). Route changes use
 the same rule as the agent's metric: silent hops match anything, so a
 rate-limited router flickering does not count.
 

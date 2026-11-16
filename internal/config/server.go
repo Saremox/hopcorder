@@ -24,6 +24,7 @@ const (
 	DefaultMaxBodyBytes      = ByteSize(64 << 20)
 	DefaultMaxDecodedBytes   = ByteSize(512 << 20)
 	defaultClickHouseTimeout = 30 * time.Second
+	DefaultRetentionDays     = 90
 )
 
 // ServerConfig configures `hopcorder server`.
@@ -47,6 +48,9 @@ type ClickHouseConfig struct {
 	Password     string   `yaml:"password"`
 	PasswordFile string   `yaml:"password_file"`
 	Timeout      Duration `yaml:"timeout"`
+	// RetentionDays bounds how long data is kept (like the prototype's 90
+	// days); 0 keeps it forever. Applied on every start.
+	RetentionDays *int `yaml:"retention_days"`
 }
 
 // IngestConfig bounds ingest requests.
@@ -128,6 +132,9 @@ func (c *ServerConfig) Finalize() error {
 		ch.User = DefaultClickHouseUser
 	}
 	setDur(&ch.Timeout, defaultClickHouseTimeout)
+	if ch.RetentionDays == nil {
+		ch.RetentionDays = ptr(DefaultRetentionDays)
+	}
 	if c.Ingest.MaxBodyBytes == 0 {
 		c.Ingest.MaxBodyBytes = DefaultMaxBodyBytes
 	}
@@ -183,6 +190,9 @@ func (c *ServerConfig) Finalize() error {
 	}
 	if ch.Timeout.D() <= 0 {
 		fail("clickhouse.timeout: must be positive")
+	}
+	if *ch.RetentionDays < 0 || *ch.RetentionDays > 36500 {
+		fail("clickhouse.retention_days %d: want 0 (keep forever) to 36500", *ch.RetentionDays)
 	}
 	if c.Ingest.MaxBodyBytes < 1<<20 || c.Ingest.MaxDecodedBytes < c.Ingest.MaxBodyBytes {
 		fail("ingest: need max_body_bytes >= 1MiB and max_decoded_bytes >= max_body_bytes")
