@@ -316,6 +316,133 @@ func TestDashboardQueriesRun(t *testing.T) {
 	}
 }
 
+// The UI's topology aggregation against the real schema: nodes per TTL and
+// address, edges between consecutive answering hops (across silent TTLs),
+// and the reachability timeline.
+func TestTopologyClickHouse(t *testing.T) {
+	c := testClickHouse(t)
+	seedTwoTargets(t, c)
+	flaky := mk("lab", 12, flaky...)
+	flaky.Target = "dc3.example"
+	if _, err := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil).Ingest(t.Context(), []*record.Record{flaky}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Options{Store: c, Pinger: c, Enricher: fakeEnrich{}, Logger: slog.New(slog.DiscardHandler)})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	type topo struct {
+		BucketMS  int64 `json:"bucket_ms"`
+		Truncated bool  `json:"truncated"`
+		Nodes     []struct {
+			TTL         int    `json:"ttl"`
+			IP          string `json:"ip"`
+			Name        string `json:"name"`
+			ASName      string `json:"as_name"`
+			Cycles      int    `json:"cycles"`
+			Destination bool   `json:"destination"`
+			LoopCycles  int    `json:"loop_cycles"`
+			RTT         int    `json:"rtt_p50_us"`
+		} `json:"nodes"`
+		Edges []struct {
+			FromTTL int    `json:"from_ttl"`
+			FromIP  string `json:"from_ip"`
+			ToTTL   int    `json:"to_ttl"`
+			ToIP    string `json:"to_ip"`
+			Cycles  int    `json:"cycles"`
+		} `json:"edges"`
+		Timeline []struct {
+			Cycles     int `json:"cycles"`
+			Reached    int `json:"reached_cycles"`
+			LoopCycles int `json:"loop_cycles"`
+			RTT        int `json:"rtt_p50_us"`
+		} `json:"timeline"`
+	}
+	get := func(target string, window ...string) topo {
+		t.Helper()
+		if window == nil {
+			window = []string{"2026-11-16T22:00:00Z", "2026-11-17T00:00:00Z"}
+		}
+		resp, err := http.Get(ts.URL + "/api/v1/query/topology?agent=lab&protocol=icmp&target=" + target +
+			"&from=" + window[0] + "&to=" + window[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var v topo
+		if err := json.NewDecoder(resp.Body).Decode(&v); err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d %v", target, resp.StatusCode, err)
+		}
+		return v
+	}
+
+	// dc1: pathA x3, the loop, brokenA, pathB.
+	d := get("dc1.example")
+	nodes := map[string]string{}
+	for _, n := range d.Nodes {
+		nodes[fmt.Sprint(n.TTL, " ", n.IP)] = fmt.Sprintf("%d %s %s dest=%v loops=%d", n.Cycles, n.Name, n.ASName, n.Destination, n.LoopCycles)
+	}
+	for k, want := range map[string]string{
+		"1 10.0.0.1":     "6 gw.lan  dest=false loops=0",
+		"2 198.18.120.1": "5  EXAMPLE-TRANSIT dest=false loops=1",
+		"2 198.18.120.7": "1  EXAMPLE-TRANSIT dest=false loops=0",
+		"3 192.0.2.9":    "4   dest=true loops=0",
+		"3 198.18.120.2": "1  EXAMPLE-TRANSIT dest=false loops=1",
+		"4 198.18.120.1": "1  EXAMPLE-TRANSIT dest=false loops=1",
+	} {
+		if nodes[k] != want {
+			t.Errorf("node %s = %q, want %q", k, nodes[k], want)
+		}
+	}
+	if len(d.Nodes) != 7 { // plus 198.18.120.2 at TTL 5
+		t.Errorf("%d nodes: %v", len(d.Nodes), nodes)
+	}
+	edges := map[string]int{}
+	for _, e := range d.Edges {
+		edges[fmt.Sprintf("%d %s > %d %s", e.FromTTL, e.FromIP, e.ToTTL, e.ToIP)] = e.Cycles
+	}
+	for k, want := range map[string]int{
+		"1 10.0.0.1 > 2 198.18.120.1":     5,
+		"2 198.18.120.1 > 3 192.0.2.9":    3,
+		"1 10.0.0.1 > 2 198.18.120.7":     1,
+		"2 198.18.120.7 > 3 192.0.2.9":    1,
+		"3 198.18.120.2 > 4 198.18.120.1": 1,
+	} {
+		if edges[k] != want {
+			t.Errorf("edge %s = %d, want %d (all: %v)", k, edges[k], want, edges)
+		}
+	}
+	var cycles, reached, loops int
+	for _, b := range d.Timeline {
+		cycles, reached, loops = cycles+b.Cycles, reached+b.Reached, loops+b.LoopCycles
+	}
+	if cycles != 6 || reached != 4 || loops != 1 || d.BucketMS != 30000 || d.Truncated || d.Timeline[0].RTT != 20000 {
+		t.Errorf("timeline %+v bucket %d truncated %v", d.Timeline, d.BucketMS, d.Truncated)
+	}
+
+	// 5 s buckets: the loop and brokenA cycles are buckets without a reached
+	// cycle, so no destination RTT.
+	d = get("dc1.example", "2026-11-16T23:00:00Z", "2026-11-16T23:01:00Z")
+	unreachedBuckets := 0
+	for _, b := range d.Timeline {
+		if b.Reached == 0 {
+			unreachedBuckets++
+			if b.RTT != 0 {
+				t.Errorf("RTT %d in a bucket without a reached cycle", b.RTT)
+			}
+		}
+	}
+	if d.BucketMS != 5000 || unreachedBuckets != 2 {
+		t.Errorf("5 s buckets: bucket %d, %d unreached buckets: %+v", d.BucketMS, unreachedBuckets, d.Timeline)
+	}
+
+	// A silent TTL between two answers: one edge across it.
+	d = get("dc3.example")
+	if len(d.Edges) != 1 || d.Edges[0].FromTTL != 1 || d.Edges[0].ToTTL != 3 || d.Edges[0].ToIP != "192.0.2.9" {
+		t.Errorf("dc3 edges %+v", d.Edges)
+	}
+}
+
 func TestApplyRetention(t *testing.T) {
 	c := testClickHouse(t)
 	ttlTables := func() int {

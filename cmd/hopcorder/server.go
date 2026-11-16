@@ -23,6 +23,7 @@ import (
 	"github.com/saremox/hopcorder/internal/config"
 	"github.com/saremox/hopcorder/internal/enrich"
 	"github.com/saremox/hopcorder/internal/server"
+	"github.com/saremox/hopcorder/internal/ui"
 )
 
 const serverUsage = `Usage: hopcorder server [flags]
@@ -129,8 +130,15 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 		reg.MustRegister(build)
 		server.RegisterEnrichmentMetrics(reg, en)
 	}
+	var uiHandler http.Handler
+	if *cfg.UI {
+		if uiHandler, err = ui.Handler(); err != nil {
+			return err
+		}
+	}
 	srv := server.New(server.Options{Store: ch, Pinger: ch, Enricher: en, Logger: logger, Registry: reg,
-		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes)})
+		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
+		UI: uiHandler})
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Listen)

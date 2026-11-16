@@ -94,3 +94,64 @@ jobs:
       - name: stack logs
         if: always()
         run: docker compose -f deploy/docker-compose.yml logs --no-color
+
+  ui:
+    # The embedded UI: type check, unit tests, the committed build in
+    # internal/ui/dist matches the source, and the browser tests against a
+    # real server and ClickHouse.
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: the committed build is current
+        run: |
+          npm run build
+          git status --porcelain -- ../internal/ui/dist
+          test -z "$(git status --porcelain -- ../internal/ui/dist)"
+      - name: start the server
+        working-directory: .
+        run: |
+          go build -o hopcorder ./cmd/hopcorder
+          cat > server-e2e.yaml <<EOF
+          listen: 127.0.0.1:8080
+          clickhouse: {url: http://127.0.0.1:8123, database: hopcorder_e2e}
+          enrich:
+            rdns: {enabled: false}
+            asn: {url: "", file: ui/e2e/asn.tsv}
+          EOF
+          ./hopcorder server --config server-e2e.yaml > server-e2e.log 2>&1 &
+          for i in $(seq 60); do curl -sf http://127.0.0.1:8080/readyz && exit 0; sleep 1; done
+          cat server-e2e.log
+          exit 1
+      - run: npx playwright install --with-deps chromium
+      - name: browser tests
+        env:
+          HOPCORDER_URL: http://127.0.0.1:8080/
+        run: npm run e2e
+      - name: server log
+        if: always()
+        working-directory: .
+        run: cat server-e2e.log || true

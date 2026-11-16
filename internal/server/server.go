@@ -47,14 +47,16 @@ type Options struct {
 	Registry *prometheus.Registry
 	// MaxBodyBytes and MaxDecodedBytes bound one ingest request.
 	MaxBodyBytes, MaxDecodedBytes int64
+	// UI serves the web UI under /ui/ (internal/ui); nil serves none.
+	UI http.Handler
 }
 
 // Server serves ingest, the read API and health endpoints.
 //
 // Paths are split by prefix so a reverse proxy can secure them differently
-// (HANDOFF.md §2): /api/v1/ingest for agents, /api/v1/query/ for readers,
-// /healthz, /readyz and /metrics for operators. The server itself does no
-// authentication.
+// (HANDOFF.md §2): /api/v1/ingest for agents, /api/v1/query/ and /ui/ for
+// readers, /healthz, /readyz and /metrics for operators. The server itself
+// does no authentication.
 type Server struct {
 	opts     Options
 	log      *slog.Logger
@@ -94,10 +96,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/query/path-changes", s.handlePathChanges)
 	mux.HandleFunc("GET /api/v1/query/loops", s.handleLoops)
 	mux.HandleFunc("GET /api/v1/query/outages", s.handleOutages)
+	mux.HandleFunc("GET /api/v1/query/topology", s.handleTopology)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	if s.opts.Registry != nil {
 		mux.Handle("GET /metrics", promhttp.HandlerFor(s.opts.Registry, promhttp.HandlerOpts{}))
+	}
+	if s.opts.UI != nil {
+		mux.Handle("GET /ui/", s.opts.UI)
+		// Relative redirects to ui/, so they stay under a proxy's path prefix.
+		redirect := func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", "ui/")
+			w.WriteHeader(http.StatusFound)
+		}
+		mux.HandleFunc("GET /ui", redirect)
+		mux.HandleFunc("GET /{$}", redirect)
 	}
 	return mux
 }
@@ -245,8 +258,9 @@ func parseRecord(b []byte) (*record.Record, error) {
 
 // queryParams holds the common read-API parameters.
 type queryParams struct {
-	params clickhouse.Params
-	limit  int
+	params   clickhouse.Params
+	limit    int
+	from, to time.Time
 }
 
 // parseQuery reads agent, target, protocol, from, to (RFC 3339 or Unix
@@ -274,7 +288,7 @@ func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	if needTarget && (q.Get("agent") == "" || q.Get("target") == "") {
 		return queryParams{}, errors.New("agent and target are required")
 	}
-	return queryParams{limit: limit, params: clickhouse.Params{
+	return queryParams{limit: limit, from: from, to: to, params: clickhouse.Params{
 		"agent": q.Get("agent"), "target": q.Get("target"), "protocol": q.Get("protocol"),
 		"from": clickhouse.Time(from), "to": clickhouse.Time(to), "limit": strconv.Itoa(limit),
 	}}, nil
@@ -349,10 +363,21 @@ type apiHop struct {
 	MPLS   []record.MPLSLabel `json:"mpls,omitempty"`
 }
 
+// handleCycles returns full cycles of one stream, newest first, or oldest
+// first with order=asc (the UI steps through cycles with limit=1 either way).
 func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	qp, err := parseQuery(r, true)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
+		return
+	}
+	order := "DESC"
+	switch r.URL.Query().Get("order") {
+	case "", "desc":
+	case "asc":
+		order = "ASC"
+	default:
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "order must be asc or desc"})
 		return
 	}
 	type row struct {
@@ -387,7 +412,7 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 		path_hash, loops.ip, loops.ttls, hops.ttl, hops.status, hops.ip, hops.rtt_us, hops.code, hops.asn,
 		hops.as_name, hops.name, hops.mpls
 		FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
-		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, func(m json.RawMessage) (any, error) {
+		ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp, func(m json.RawMessage) (any, error) {
 		var c row
 		if err := json.Unmarshal(m, &c); err != nil {
 			return nil, err
