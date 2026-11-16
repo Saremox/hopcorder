@@ -3,9 +3,12 @@ package clickhouse
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,5 +123,70 @@ func TestNewRejectsCredentialsInURL(t *testing.T) {
 	}
 	if _, err := New(Config{URL: "ftp://u:s3cret@x", Database: "d"}); err == nil || strings.Contains(err.Error(), "s3cret") {
 		t.Errorf("scheme error leaks the password: %v", err)
+	}
+}
+
+// Rows handed to the callback stay valid after it returns: the scanner
+// reuses its buffer, and callers keep rows (a result above the scanner's
+// first 64 KiB came back with rows overwritten by later ones).
+func TestQueryRowsMayBeKept(t *testing.T) {
+	const n = 3000 // about 300 KB
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		for i := range n {
+			fmt.Fprintf(w, "{\"i\":%d,\"pad\":%q}\n", i, strings.Repeat(strconv.Itoa(i%10), 80))
+		}
+	}))
+	defer srv.Close()
+	c, err := New(Config{URL: srv.URL, Database: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []json.RawMessage
+	if err := c.Query(t.Context(), "SELECT", nil, func(m json.RawMessage) error {
+		rows = append(rows, m)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != n {
+		t.Fatalf("%d rows", len(rows))
+	}
+	for i, m := range rows {
+		var r struct {
+			I   int    `json:"i"`
+			Pad string `json:"pad"`
+		}
+		if err := json.Unmarshal(m, &r); err != nil || r.I != i || r.Pad != strings.Repeat(strconv.Itoa(i%10), 80) {
+			t.Fatalf("row %d changed after the callback: %.60s (%v)", i, m, err)
+		}
+	}
+}
+
+// Queries are read-only (so ClickHouse cancels them when the connection
+// closes) and carry the settings of their context; statements do not.
+func TestQuerySettings(t *testing.T) {
+	var got []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Query())
+	}))
+	defer srv.Close()
+	c, err := New(Config{URL: srv.URL, Database: "d", Timeout: 20 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithSettings(t.Context(), Settings{"max_result_bytes": "1000", "result_overflow_mode": "break"})
+	if err := c.Query(ctx, "SELECT 1", nil, func(json.RawMessage) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Exec(ctx, "CREATE TABLE x", nil); err != nil {
+		t.Fatal(err)
+	}
+	q, e := got[0], got[1]
+	if q.Get("readonly") != "2" || q.Get("cancel_http_readonly_queries_on_client_close") != "1" ||
+		q.Get("max_execution_time") != "15" || q.Get("max_result_bytes") != "1000" || q.Get("result_overflow_mode") != "break" {
+		t.Errorf("query settings %v", q)
+	}
+	if e.Has("readonly") || e.Has("max_result_bytes") {
+		t.Errorf("statement settings %v", e)
 	}
 }

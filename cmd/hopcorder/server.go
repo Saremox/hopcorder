@@ -44,6 +44,8 @@ func runServer(args []string, stderr io.Writer) int {
 	}
 	configPath := fs.String("config", "", "path to the YAML config file")
 	listen := fs.String("listen", "", "HTTP listen address (default 127.0.0.1:8080)")
+	allowedHosts := fs.String("allowed-hosts", "",
+		"comma-separated host names the server answers (DNS rebinding protection; default: the localhost names when listening on loopback, else any; * for any)")
 	chURL := fs.String("clickhouse-url", "", "ClickHouse HTTP interface URL (default http://127.0.0.1:8123)")
 	logLevel := fs.String("log-level", "", "debug, info, warn or error")
 	logFormat := fs.String("log-format", "", "text or json")
@@ -69,6 +71,13 @@ func runServer(args []string, stderr io.Writer) int {
 		switch f.Name {
 		case "listen":
 			cfg.Listen = *listen
+		case "allowed-hosts":
+			cfg.AllowedHosts = nil
+			for _, h := range strings.Split(*allowedHosts, ",") {
+				if h = strings.TrimSpace(h); h != "" {
+					cfg.AllowedHosts = append(cfg.AllowedHosts, h)
+				}
+			}
 		case "clickhouse-url":
 			cfg.ClickHouse.URL = *chURL
 		case "log-level":
@@ -144,7 +153,8 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
 		MaxConcurrentIngest: cfg.Ingest.MaxConcurrent, MaxConcurrentQueries: cfg.Query.MaxConcurrent,
 		MaxStreams: cfg.Ingest.MaxStreams, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
-		UI: uiHandler})
+		MaxResponseBytes: int64(cfg.Query.MaxResponseBytes), MaxQueryMemory: int64(cfg.Query.MaxMemoryBytes),
+		AllowedHosts: cfg.HostAllowlist(), UI: uiHandler})
 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", cfg.Listen)
@@ -157,8 +167,12 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 		WriteTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
+	hosts := "any"
+	if h := cfg.HostAllowlist(); h != nil {
+		hosts = strings.Join(h, ",")
+	}
 	logger.Info("server listening", "addr", ln.Addr().String(), "clickhouse", cfg.ClickHouse.URL,
-		"database", cfg.ClickHouse.Database)
+		"database", cfg.ClickHouse.Database, "allowed_hosts", hosts)
 	if ready != nil {
 		ready <- ln.Addr().String()
 	}

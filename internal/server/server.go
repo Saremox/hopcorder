@@ -64,6 +64,15 @@ type Options struct {
 	// MaxConcurrentIngest and MaxConcurrentQueries bound the ingest and
 	// read-API requests processed at once; more wait up to 10s, then get 503.
 	MaxConcurrentIngest, MaxConcurrentQueries int
+	// MaxResponseBytes bounds the rows of one read-API response (rows
+	// beyond it are dropped and the response says "truncated": true);
+	// MaxQueryMemory is ClickHouse's max_memory_usage for each read-API
+	// query.
+	MaxResponseBytes, MaxQueryMemory int64
+	// AllowedHosts are the host names (without port) that requests may
+	// name in their Host header, against DNS rebinding; empty allows any.
+	// /healthz, /readyz and /metrics answer every host.
+	AllowedHosts []string
 	// MaxStreams and StreamIdleTTL bound the per-stream state kept in memory
 	// (see Ingester).
 	MaxStreams    int
@@ -105,6 +114,12 @@ func New(o Options) *Server {
 	if o.MaxConcurrentQueries <= 0 {
 		o.MaxConcurrentQueries = DefaultMaxConcurrentQueries
 	}
+	if o.MaxResponseBytes <= 0 {
+		o.MaxResponseBytes = DefaultMaxResponseBytes
+	}
+	if o.MaxQueryMemory <= 0 {
+		o.MaxQueryMemory = DefaultMaxQueryMemory
+	}
 	var reg prometheus.Registerer
 	if o.Registry != nil {
 		reg = o.Registry
@@ -140,15 +155,23 @@ func acquire(ctx context.Context, sem chan struct{}) bool {
 }
 
 // limitQueries bounds the read-API requests running at once, so readers
-// cannot crowd out ingest in ClickHouse.
+// cannot crowd out ingest in ClickHouse, and the memory and result size of
+// each of their queries there. max_result_bytes is a backstop at twice the
+// response budget (it counts ClickHouse's in-memory columns, not JSON, and
+// stops only between blocks); the response budget is what truncates.
 func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
+	settings := clickhouse.Settings{
+		"max_memory_usage":     strconv.FormatInt(s.opts.MaxQueryMemory, 10),
+		"max_result_bytes":     strconv.FormatInt(2*s.opts.MaxResponseBytes, 10),
+		"result_overflow_mode": "break",
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !acquire(r.Context(), s.querySem) {
 			writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
 			return
 		}
 		defer func() { <-s.querySem }()
-		h(w, r)
+		h(w, r.WithContext(clickhouse.WithSettings(r.Context(), settings)))
 	}
 }
 
@@ -180,7 +203,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET /ui", redirect)
 		mux.HandleFunc("GET /{$}", redirect)
 	}
-	return mux
+	return newHostCheck(s, s.opts.AllowedHosts, mux)
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
@@ -408,31 +431,47 @@ const streamFilter = `({agent:String} = '' OR agent_id = {agent:String})
 	AND ({target:String} = '' OR target = {target:String})
 	AND ({protocol:String} = '' OR protocol = {protocol:String})`
 
-// runQuery streams the rows of q as {"rows": [...]}.
+// runQuery streams the rows of q as {"rows": [...], "truncated": false},
+// row by row, within MaxResponseBytes ("truncated": true when rows were
+// left out).
 func (s *Server) runQuery(w http.ResponseWriter, r *http.Request, q string, qp queryParams, reshape func(json.RawMessage) (any, error)) {
-	var rows []any
+	js := newJSONStream(w, s.opts.MaxResponseBytes, streamFlushBytes)
+	js.beginArray("rows")
 	err := s.opts.Store.Query(r.Context(), q, qp.params, func(m json.RawMessage) error {
-		if reshape == nil {
-			rows = append(rows, m)
-			return nil
+		b := []byte(m)
+		if reshape != nil {
+			v, err := reshape(m)
+			if err != nil {
+				return err
+			}
+			if b, err = json.Marshal(v); err != nil {
+				return err
+			}
 		}
-		v, err := reshape(m)
-		if err != nil {
-			return err
-		}
-		rows = append(rows, v)
-		return nil
+		return js.row(b)
 	})
-	if err != nil {
-		s.metrics.queryErrors.Inc()
-		s.log.Error("query failed", "path", r.URL.Path, "err", err)
-		writeJSON(w, http.StatusBadGateway, errorBody{Error: "query failed"})
+	if err != nil && !errors.Is(err, errResponseFull) {
+		s.queryFailed(r, js, "", err)
 		return
 	}
-	if rows == nil {
-		rows = []any{}
+	js.endArray()
+	js.finish()
+}
+
+// queryFailed logs and answers a read query that failed (or whose client
+// went away).
+func (s *Server) queryFailed(r *http.Request, js *jsonStream, part string, err error) {
+	if js.err != nil || r.Context().Err() != nil {
+		s.log.Debug("query abandoned by the client", "path", r.URL.Path, "err", err)
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"rows": rows})
+	s.metrics.queryErrors.Inc()
+	if part != "" {
+		s.log.Error("query failed", "path", r.URL.Path, "part", part, "err", err)
+	} else {
+		s.log.Error("query failed", "path", r.URL.Path, "err", err)
+	}
+	js.fail()
 }
 
 func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
@@ -463,10 +502,19 @@ type apiHop struct {
 	MPLS   []record.MPLSLabel `json:"mpls,omitempty"`
 }
 
+// maxCycles bounds limit for cycles, the widest rows: a cycle can be
+// 230 KB of JSON (255 hops with 16 MPLS labels each), and ClickHouse formats
+// a result like this as one block, so 1000 of them took about 650 MiB in
+// ClickHouse and 10000 failed the default query.max_memory_bytes.
+const maxCycles = 1000
+
 // handleCycles returns full cycles of one stream, newest first, or oldest
 // first with order=asc (the UI steps through cycles with limit=1 either way).
 func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	qp, err := parseQuery(r, true)
+	if err == nil && qp.limit > maxCycles {
+		err = fmt.Errorf("limit must be 1..%d for cycles", maxCycles)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
 		return

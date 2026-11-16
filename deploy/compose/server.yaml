@@ -1,6 +1,10 @@
 # hopcorder server in the docker-compose try-out (deploy/docker-compose.yml).
 # See deploy/server.example.yaml for every option.
 listen: 0.0.0.0:8080            # published on 127.0.0.1:8080 only
+# Inside the container the server listens on every address, so it would
+# check no Host header by default; it is reached as localhost (browser) and
+# 127.0.0.1 (the agent), and answers nothing else (DNS rebinding).
+allowed_hosts: [localhost, 127.0.0.1]
 clickhouse:
   url: http://clickhouse:8123
   user: hopcorder               # the try-out's fixed credentials (docker-compose.yml)

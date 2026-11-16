@@ -4,13 +4,16 @@
 #
 #   docker compose -f deploy/docker-compose.yml up -d --build
 #
-# then open http://localhost:3000 (anonymous read access; admin/admin to edit)
-# or the server's UI at http://localhost:8080/ui/. The agent's targets are in
-# deploy/compose/agent.yaml. Published ports listen on localhost only;
-# ClickHouse is not published at all (`docker compose exec clickhouse
-# clickhouse-client` to query it), and Grafana reads it with a read-only
-# user. The passwords below are fixed: this is not a production setup (see
-# README.md).
+# then open http://localhost:3000 (anonymous read access; admin to edit, with
+# the password in HOPCORDER_GRAFANA_ADMIN_PASSWORD, default "admin") or the
+# server's UI at http://localhost:8080/ui/. The agent's targets are in
+# deploy/compose/agent.yaml. Published ports listen on localhost only, and
+# Grafana and the server only answer requests for localhost (Grafana
+# redirects other host names to it), so a web page cannot reach them through
+# DNS rebinding. ClickHouse is not published at all (`docker compose exec
+# clickhouse clickhouse-client` to query it), and Grafana reads it with a
+# read-only user whose queries are bounded in time and memory. The other
+# passwords below are fixed: this is not a production setup (see README.md).
 name: hopcorder
 
 services:
@@ -23,7 +26,10 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     volumes:
       - clickhouse:/var/lib/clickhouse
-      # Creates Grafana's read-only user on the first start (an empty volume).
+      # Creates Grafana's read-only user and its limits on the first start
+      # (an empty volume). The script can be re-run on an older volume:
+      #   docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client \
+      #     --user hopcorder --password hopcorder --multiquery < deploy/compose/clickhouse-init.sql
       - ./compose/clickhouse-init.sql:/docker-entrypoint-initdb.d/grafana.sql:ro
     healthcheck:
       test: ["CMD", "clickhouse-client", "--user", "hopcorder", "--password", "hopcorder", "--query", "SELECT 1"]
@@ -64,6 +70,14 @@ services:
       GF_PLUGINS_PREINSTALL_SYNC: grafana-clickhouse-datasource@4.23.5
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Requests for any other host name are redirected to localhost, so a
+      # page that rebinds its own name to 127.0.0.1 cannot use Grafana (or
+      # its admin login) from the browser.
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ENFORCE_DOMAIN: "true"
+      # Applied when Grafana's volume is created; to change it later, run
+      # `grafana cli admin reset-admin-password` in the container.
+      GF_SECURITY_ADMIN_PASSWORD: ${HOPCORDER_GRAFANA_ADMIN_PASSWORD:-admin}
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/hopcorder/hopcorder.json
       # Read by grafana/provisioning/datasources/hopcorder.yaml.
       HOPCORDER_CLICKHOUSE_HOST: clickhouse
@@ -80,7 +94,7 @@ services:
     depends_on:
       clickhouse: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
       interval: 2s
       timeout: 5s
       retries: 90

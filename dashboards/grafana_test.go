@@ -26,10 +26,12 @@ import (
 // Grafana and the real ClickHouse plugin with the provisioned data source.
 //
 //	docker compose -f deploy/docker-compose.yml up -d --build --wait
-//	HOPCORDER_SERVER_URL=http://127.0.0.1:8080 HOPCORDER_GRAFANA_URL=http://127.0.0.1:3000 \
+//	HOPCORDER_SERVER_URL=http://127.0.0.1:8080 HOPCORDER_GRAFANA_URL=http://localhost:3000 \
 //	  go test -tags grafana ./dashboards/
 //
-// HOPCORDER_GRAFANA_USER and HOPCORDER_GRAFANA_PASSWORD default to admin/admin.
+// The stack's Grafana only answers requests for localhost (it redirects
+// others there). HOPCORDER_GRAFANA_USER and HOPCORDER_GRAFANA_PASSWORD
+// default to admin/admin.
 
 const datasourceUID = "hopcorder-clickhouse"
 

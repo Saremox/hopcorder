@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,6 +27,8 @@ const (
 	DefaultMaxDecodedBytes   = ByteSize(32 << 20)
 	DefaultIngestConcurrency = 4
 	DefaultQueryConcurrency  = 8
+	DefaultMaxResponseBytes  = ByteSize(32 << 20)
+	DefaultMaxQueryMemory    = ByteSize(1 << 30)
 	DefaultMaxStreams        = 100000
 	DefaultStreamIdleTimeout = time.Hour
 	defaultClickHouseTimeout = 30 * time.Second
@@ -44,6 +48,14 @@ type ServerConfig struct {
 	Query      QueryConfig      `yaml:"query"`
 	Metrics    *bool            `yaml:"metrics"` // serve /metrics; default true
 	UI         *bool            `yaml:"ui"`      // serve the web UI under /ui/; default true
+
+	// AllowedHosts are the host names that requests may carry in their
+	// Host header (any port), against DNS rebinding: a web page whose own
+	// name resolves to the server's address still sends that name. Empty:
+	// localhost, 127.0.0.1, ::1 and the listen host when listening on a
+	// loopback address, else no check (see HostAllowlist). "*" turns the
+	// check off.
+	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
 // ClickHouseConfig is the connection to ClickHouse's HTTP interface.
@@ -76,6 +88,12 @@ type IngestConfig struct {
 // QueryConfig bounds the read API.
 type QueryConfig struct {
 	MaxConcurrent int `yaml:"max_concurrent"` // read-API requests at once
+	// MaxResponseBytes bounds one response's rows; beyond it rows are left
+	// out and the response says "truncated": true.
+	MaxResponseBytes ByteSize `yaml:"max_response_bytes"`
+	// MaxMemoryBytes is ClickHouse's max_memory_usage for each read-API
+	// query.
+	MaxMemoryBytes ByteSize `yaml:"max_memory_bytes"`
 }
 
 // EnrichConfig configures hop enrichment.
@@ -164,6 +182,12 @@ func (c *ServerConfig) Finalize() error {
 	setInt(&c.Ingest.MaxStreams, DefaultMaxStreams)
 	setDur(&c.Ingest.StreamIdleTimeout, DefaultStreamIdleTimeout)
 	setInt(&c.Query.MaxConcurrent, DefaultQueryConcurrency)
+	if c.Query.MaxResponseBytes == 0 {
+		c.Query.MaxResponseBytes = DefaultMaxResponseBytes
+	}
+	if c.Query.MaxMemoryBytes == 0 {
+		c.Query.MaxMemoryBytes = DefaultMaxQueryMemory
+	}
 	if c.Metrics == nil {
 		c.Metrics = ptr(true)
 	}
@@ -189,6 +213,11 @@ func (c *ServerConfig) Finalize() error {
 
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		fail("listen %q: want host:port: %v", c.Listen, err)
+	}
+	for _, h := range c.AllowedHosts {
+		if !validAllowedHost(h) {
+			fail("allowed_hosts %q: want a host name or IP address without port, or \"*\"", h)
+		}
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
@@ -229,6 +258,9 @@ func (c *ServerConfig) Finalize() error {
 		c.Query.MaxConcurrent < 1 {
 		fail("ingest/query: max_concurrent and max_streams must be positive, stream_idle_timeout at least 1m")
 	}
+	if c.Query.MaxResponseBytes < 1<<20 || c.Query.MaxMemoryBytes < 16<<20 {
+		fail("query: max_response_bytes must be at least 1MiB, max_memory_bytes at least 16MiB")
+	}
 	if *r.Enabled && (r.Workers < 1 || r.MaxEntries < 1 || r.TTL.D() <= 0 || r.NegativeTTL.D() <= 0) {
 		fail("enrich.rdns: workers, max_entries, ttl and negative_ttl must be positive")
 	}
@@ -246,6 +278,50 @@ func (c *ServerConfig) Finalize() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// HostAllowlist returns the host names the server answers (see
+// AllowedHosts), or nil for no check. Without allowed_hosts, a server on a
+// loopback address answers localhost, 127.0.0.1, ::1 and its listen host:
+// only a browser on the same machine can reach it, and DNS rebinding is how
+// a web page would. On other addresses it is reached under service names,
+// pod IPs and proxy hosts that it cannot know, so there is no check;
+// operators list their names to get one.
+func (c *ServerConfig) HostAllowlist() []string {
+	if len(c.AllowedHosts) > 0 {
+		if slices.Contains(c.AllowedHosts, "*") {
+			return nil
+		}
+		return slices.Clone(c.AllowedHosts)
+	}
+	host, _, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return nil
+	}
+	ip, err := netip.ParseAddr(host)
+	if !strings.EqualFold(host, "localhost") && (err != nil || !ip.IsLoopback()) {
+		return nil
+	}
+	hosts := []string{"localhost", "127.0.0.1", "::1"}
+	if !slices.Contains(hosts, strings.ToLower(host)) {
+		hosts = append(hosts, host)
+	}
+	return hosts
+}
+
+// validAllowedHost accepts "*", an IP address (IPv6 with or without
+// brackets) or a host name.
+func validAllowedHost(h string) bool {
+	if h == "*" {
+		return true
+	}
+	if _, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")); err == nil {
+		return true
+	}
+	return h != "" && len(h) <= 253 && !strings.ContainsFunc(h, func(c rune) bool {
+		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+		return !alnum && c != '.' && c != '-' && c != '_'
+	})
 }
 
 // ClickHousePassword returns the configured password, reading the file if

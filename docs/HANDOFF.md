@@ -996,3 +996,97 @@ fixes. The decisions:
   (`LoadCredential=`, `/run/credentials/<unit>/...`), as the units and
   example configs now describe.
 
+### Security review, round two
+
+A second review of the whole code base (the same four areas; every finding
+re-checked against the code, ClickHouse-dependent ones against ClickHouse
+25.8) found that three round-one fixes did not fully hold (query
+cancellation, spool quarantine, the record bounds) and that the server chart
+had brought back the large ingest limits. Four fixes followed. The
+decisions:
+
+**Read side, enrichment and the browser**
+- **Read queries run with `readonly = 2`.** Round one's
+  `cancel_http_readonly_queries_on_client_close = 1` did nothing: ClickHouse
+  applies it only to queries with `readonly > 0`, and a POST does not get
+  that by default. So a query whose reader had disconnected kept running
+  until `max_execution_time`, while its `query.max_concurrent` slot was
+  already free. 30 topology requests, each abandoned after 0.4 s, left 27
+  queries using 13.8 GiB running at once with a limit of 8 (ClickHouse 25.8).
+  With `readonly = 2` (URL settings still allowed) they stop within a second.
+  All of the server's `Query` calls are SELECTs; `Exec` and inserts are
+  unchanged.
+- **Read-API responses are streamed and bounded**: `query.max_response_bytes`
+  (32 MiB) of rows per response. Rows that do not fit are left out, and every
+  response now ends with `"truncated": true|false` (topology already had
+  it). Before, every row was held and then encoded twice into memory: one
+  `cycles?limit=10000` over valid 255-hop records with 16 MPLS labels each
+  returned 2.07 GB and took the server from 18 MB to 7.0 GB RSS; with the
+  limit (and the cycles cap below), three such requests at once peak at
+  33 MB. Row lists are written every 64 KiB. A failure before the first
+  write still gets 502; a failure after it aborts the response
+  (`http.ErrAbortHandler`) rather than ending the JSON cleanly. Topology is
+  kept whole until its three queries are done (at most the budget), so a
+  failure in any of them is a clean 502; its timeline comes first, and the
+  parts after the one that filled the budget stay empty.
+- **ClickHouse-side limits for read queries only** (through a context
+  setting, so the ingester's queries are unchanged): `max_memory_usage` =
+  `query.max_memory_bytes` (1 GiB), and `max_result_bytes` at twice the
+  response budget with `result_overflow_mode = break`. The latter is only a
+  backstop: it counts in-memory columns, not JSON (an MPLS label is 7 bytes
+  there and 44 in JSON), and stops between blocks, so the Go budget is what
+  truncates.
+- **`cycles` takes `limit` up to 1000** (other endpoints keep 10000).
+  ClickHouse formats such a result as one block: 3000 maximal cycles needed
+  1.64 GiB in ClickHouse and failed the 1 GiB limit, 1000 need about
+  650 MiB. The UI asks for one cycle at a time.
+- **Rows passed to `Query` callbacks are copies**: `bufio.Scanner` reuses
+  its buffer, and the read API kept rows across callbacks. A result above
+  the scanner's first 64 KiB came back with earlier rows overwritten.
+- **Host check against DNS rebinding** (`allowed_hosts`, `--allowed-hosts`).
+  A web page whose own name resolves to 127.0.0.1 could read every path and
+  post records (same-origin for the browser, so the ingest content-type rule
+  does not apply). The server now answers only the listed Host names (any
+  port), others get 421 (`hopcorder_server_host_refused_total`, a warning at
+  most once a minute). Default without the option: on a loopback listen
+  address, `localhost`, `127.0.0.1`, `::1` and the listen host; on any other
+  address no check, because the server is reached under service names, pod
+  IPs and ingress hosts it cannot know (Helm, containers). `"*"` turns it
+  off. `/healthz`, `/readyz` and `/metrics` answer every host (probes and
+  scrapers use addresses). A proxy on the same host that passes the client's
+  Host on (Caddy, Traefik; nginx sends the upstream's by default) needs its
+  public names listed. The compose stack's server listens on 0.0.0.0 in its
+  container, so its config lists `localhost` and `127.0.0.1`.
+- **Grafana in compose answers only `localhost`**
+  (`GF_SERVER_DOMAIN=localhost`, `GF_SERVER_ENFORCE_DOMAIN=true`): other
+  Host names get a 301 to localhost, which a rebinding page cannot follow.
+  Before, anonymous data-source queries worked under any Host, and so did
+  the API with the default `admin:admin`, which could add a data source
+  with the stack's fixed ClickHouse credentials (full SQL). The admin
+  password is `HOPCORDER_GRAFANA_ADMIN_PASSWORD` (default `admin`), applied
+  when Grafana's volume is created. The CI `grafana` job uses
+  `http://localhost:3000`.
+- **Grafana's ClickHouse user has bounded queries** (settings profile
+  `grafana_limits` in `deploy/compose/clickhouse-init.sql`).
+  `readonly = 2` lets a query set any setting, so an anonymous viewer could
+  run `SELECT sum(number) FROM numbers(1e15) SETTINGS max_execution_time = 0`
+  (`numbers()` needs no privilege), and it kept running after the client
+  gave up. Now: `max_execution_time` 60 s (at most 300), `max_memory_usage`
+  1 GB, `max_memory_usage_for_user` 2 GB, `max_concurrent_queries_for_user`
+  16, `cancel_http_readonly_queries_on_client_close = 1` CONST. The
+  constraints need `MIN 1`: 0 means unlimited and passes any `MAX`. A query
+  may lower these, not raise them, and cannot switch profiles. The
+  plugin's own query timeout must stay at or below 300 s. The script runs on
+  the first start of an empty volume and can be re-run on an older one
+  (every statement is `IF NOT EXISTS`).
+- **ASN names are copied out of their line** (`strings.Clone`): a name was
+  a substring of the line it came from, so a small, compressible download
+  with 60 KB lines kept up to the whole 256 MiB it inflated to (measured:
+  500 such lines kept 32 MB; with the copy, under 1 MB).
+- **Checked and unchanged**: the UI escapes everything it puts into
+  tooltips (rendered in Chromium with HTML in AS names and in IPv6 zones,
+  `{b}` and `$'` template tokens included; nothing was injected, no CSP
+  violations), UI serving (map lookup, no traversal, relative redirects),
+  the dashboards' `percentencode`, read-API parameter escaping, and rDNS
+  (Go's resolver drops PTR names that are not host names; bounded cache and
+  queue).

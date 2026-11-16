@@ -27,10 +27,14 @@ This starts ClickHouse, the server, an agent tracing three public resolvers
 (ICMP, UDP and TCP; edit [`deploy/compose/agent.yaml`](deploy/compose/agent.yaml)
 for your own targets), the server's own UI at <http://localhost:8080/ui/>
 and Grafana with the dashboards at <http://localhost:3000>. Data shows up
-within a minute. Grafana and the server listen on localhost only, ClickHouse
-is not published (`docker compose -f deploy/docker-compose.yml exec clickhouse
-clickhouse-client` to query it) and Grafana reads it with a read-only user,
-but the passwords are fixed: it is a try-out, not a deployment.
+within a minute. Grafana and the server listen on localhost only and answer
+only requests for `localhost` (so a web page cannot reach them through DNS
+rebinding), ClickHouse is not published (`docker compose -f
+deploy/docker-compose.yml exec clickhouse clickhouse-client` to query it) and
+Grafana reads it with a read-only user whose queries are bounded in time and
+memory. Grafana's `admin` password is `HOPCORDER_GRAFANA_ADMIN_PASSWORD`
+(default `admin`, set when Grafana's volume is created); the other passwords
+are fixed: it is a try-out, not a deployment.
 `docker compose -f deploy/docker-compose.yml down -v` removes it with its data.
 
 ## Install
@@ -76,11 +80,14 @@ docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET
 
 ```bash
 docker run -d --name hopcorder-server -p 127.0.0.1:8080:8080 \
-  ghcr.io/saremox/hopcorder-server:main --listen :8080 --clickhouse-url http://clickhouse:8123
+  ghcr.io/saremox/hopcorder-server:main --listen :8080 --clickhouse-url http://clickhouse:8123 \
+  --allowed-hosts localhost,127.0.0.1
 ```
 
 The server does no authentication: publish it on localhost and put a reverse
-proxy in front. The agent runs as root because container runtimes only grant
+proxy in front. `--allowed-hosts` (or `allowed_hosts`) names the hosts it
+answers, against DNS rebinding: inside a container it listens on every
+address, where there is no check by default. The agent runs as root because container runtimes only grant
 capabilities to root; give it `NET_RAW` and nothing else. `docker build --target agent` (or
 `server`) builds them locally.
 
@@ -393,6 +400,18 @@ Point agents at it with `outputs.http.url`. For production use
 hopcorder does **no authentication**: it listens on localhost by default; put a
 reverse proxy in front and secure the path prefixes separately.
 
+**Host names.** So that a web page cannot reach a server on localhost or an
+internal address through DNS rebinding (its own name resolving to the
+server's address), the server answers only requests whose `Host` header is in
+`allowed_hosts` (any port), others get 421. Without the option, a server on a
+loopback address answers `localhost`, `127.0.0.1`, `::1` and its listen host;
+on any other address it checks nothing, since it is reached under service
+names, pod IPs and ingress hosts it cannot know: list them to get the check.
+A reverse proxy on the same host that passes the client's `Host` on (Caddy,
+Traefik; nginx sends the upstream's by default) needs its public names in
+the list. `"*"` turns the check off; `/healthz`, `/readyz` and `/metrics`
+answer every host.
+
 | Path | For | |
 | --- | --- | --- |
 | `POST /api/v1/ingest` | agents | zstd/gzip/plain NDJSON of wire records |
@@ -406,12 +425,15 @@ reverse proxy in front and secure the path prefixes separately.
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
 Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
-ms; default the last 24h), `limit` (default 1000, max 10000). Results are
-newest first; `cycles` also takes `order=asc`. `topology` returns every
+ms; default the last 24h), `limit` (default 1000, max 10000; for `cycles`
+max 1000). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
 address that answered at each TTL (`nodes`), every pair of consecutive
 answering hops within a cycle (`edges`, which skip silent TTLs), and
 reachability per time bucket (`timeline`, at most 400 buckets); nodes and
-edges are capped (`truncated: true`).
+edges are capped. Every response is bounded by `query.max_response_bytes`
+(32 MiB, streamed as the rows arrive): rows beyond it are left out, and
+`truncated: true` says so (`false` otherwise); `topology` fills its
+`timeline` first.
 
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the
@@ -431,8 +453,9 @@ requests at once. Records are validated against the schema's limits:
 16 MPLS labels per hop. The server keeps state for at most
 `ingest.max_streams` streams and drops idle ones after `stream_idle_timeout`
 (they are restored from ClickHouse when they return). Read-API queries are
-limited to `query.max_concurrent` at once, and each is stopped in ClickHouse
-after the client timeout or when the client goes away.
+limited to `query.max_concurrent` at once and to `query.max_memory_bytes`
+(1 GiB) each in ClickHouse, run read-only, and are stopped there after the
+client timeout or when the client goes away.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
 the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on
@@ -496,9 +519,12 @@ To use it with your own Grafana, install the plugin, provision the data
 source and dashboard from [`deploy/grafana/provisioning`](deploy/grafana/provisioning)
 (it reads `HOPCORDER_CLICKHOUSE_HOST`, `_PORT`, `_DATABASE`, `_USER` and
 `_PASSWORD` from Grafana's environment), or import the JSON and pick your
-ClickHouse data source. Give Grafana a read-only ClickHouse user, as
-[`deploy/compose/clickhouse-init.sql`](deploy/compose/clickhouse-init.sql)
-does: anyone who can open a dashboard can send Grafana SQL.
+ClickHouse data source. Give Grafana a read-only ClickHouse user with bounded
+queries, as [`deploy/compose/clickhouse-init.sql`](deploy/compose/clickhouse-init.sql)
+does: anyone who can open a dashboard can send Grafana SQL, with any
+settings it allows (`max_execution_time = 0` included, unless a settings
+profile constrains it). Set Grafana's `server.domain` and `enforce_domain`
+when it runs on localhost, as the compose stack does, against DNS rebinding.
 
 ## Development
 

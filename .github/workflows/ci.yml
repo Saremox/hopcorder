@@ -113,7 +113,7 @@ jobs:
       - name: dashboards through Grafana
         env:
           HOPCORDER_SERVER_URL: http://127.0.0.1:8080
-          HOPCORDER_GRAFANA_URL: http://127.0.0.1:3000
+          HOPCORDER_GRAFANA_URL: http://localhost:3000
         run: go test -tags grafana -count=1 -v ./dashboards/
       - name: stack logs
         if: always()
