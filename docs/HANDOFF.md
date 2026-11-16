@@ -1391,11 +1391,17 @@ decisions:
   for example, a ping run with a chosen identifier, which our ping socket
   cannot stop when it is a raw-socket ping binary. Counted as a
   mismatched reply.
-- **The agent holds its ICMP echo identifiers.** It holds them for IPv4
-  and IPv6, with an unprivileged ping socket per identifier. The socket is
-  bound to the identifier, has `SO_REUSEADDR` cleared and drops everything
-  it receives. Ping sockets start with `SO_REUSEADDR` set, and the kernel
-  lets two of them share an identifier unless one has it cleared.
+- **The agent holds its ICMP echo identifiers**, with one unprivileged
+  ping socket per identifier. The socket is bound to the identifier, has
+  `SO_REUSEADDR` cleared and drops everything it receives. Ping sockets
+  start with `SO_REUSEADDR` set, and the kernel lets two of them share an
+  identifier unless one has it cleared. IPv4 and IPv6 ping sockets share
+  one table of identifiers (`ping_get_port` compares only the identifier),
+  so the one socket holds it for both families: an IPv4 socket, or an IPv6
+  one where IPv4 ping sockets cannot be opened. A socket per family, as
+  first written, collided with itself on hosts with IPv6 (CI caught it; the
+  development container has no IPv6), and the netns test checks that an
+  IPv6 ping socket cannot take an identifier held over IPv4.
   - The daemon does this first, at every start and reload, and `--once`
     does too (`probe.FlowHolder`, `Raw.HoldFlows`).
   - An identifier held by another process fails the start with

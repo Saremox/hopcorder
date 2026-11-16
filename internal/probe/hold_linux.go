@@ -30,12 +30,16 @@ func (h heldID) String() string {
 }
 
 // HoldFlows implements FlowHolder. It holds the echo identifier of every
-// ICMP flow, for IPv4 and IPv6, with an unprivileged ICMP "ping" socket bound
-// to it. The kernel hands such a socket every echo reply carrying its
-// identifier and refuses the identifier to any other ping socket, so another
-// process can neither watch this agent's echo replies (and learn probe ids)
-// nor send echoes that pass for its probes (an echo reply quotes no IP ID).
-// Where ping sockets are not permitted for this process
+// ICMP flow with an unprivileged ICMP "ping" socket bound to it. The kernel
+// hands such a socket every echo reply carrying its identifier and refuses
+// the identifier to any other ping socket, so another process can neither
+// watch this agent's echo replies (and learn probe ids) nor send echoes that
+// pass for its probes (an echo reply quotes no IP ID). IPv4 and IPv6 ping
+// sockets share one table of identifiers (the kernel's ping_get_port
+// compares the identifier only), so one socket holds an identifier for both
+// families: an IPv4 one, or an IPv6 one where IPv4 ping sockets cannot be
+// opened. (A second socket for the other family would collide with the
+// first.) Where ping sockets are not permitted for this process
 // (net.ipv4.ping_group_range), nothing is held and that is logged once.
 //
 // UDP and TCP source ports are not held: a bound UDP port swallows the
@@ -46,17 +50,12 @@ func (h heldID) String() string {
 // (SYN-ACK, RST) cannot be provoked without choosing the SYN's sequence
 // number.
 func (r *Raw) HoldFlows(flows []Flow) error {
-	want := map[heldID]bool{}
-	var order []heldID
+	want := map[uint16]bool{}
+	var order []uint16
 	for _, f := range flows {
-		if f.Protocol != ICMP {
-			continue
-		}
-		for _, v6 := range []bool{false, true} {
-			if h := (heldID{v6: v6, id: f.ID}); !want[h] {
-				want[h] = true
-				order = append(order, h)
-			}
+		if f.Protocol == ICMP && !want[f.ID] {
+			want[f.ID] = true
+			order = append(order, f.ID)
 		}
 	}
 
@@ -68,30 +67,48 @@ func (r *Raw) HoldFlows(flows []Flow) error {
 	if closed {
 		return errClosed
 	}
+	held := map[uint16]bool{}
+	for h := range r.held {
+		held[h.id] = true
+	}
 	opened := map[heldID]io.Closer{}
-	for _, h := range order {
-		if _, ok := r.held[h]; ok {
+	fail := func(h heldID, err error) error {
+		for _, c := range opened {
+			_ = c.Close()
+		}
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("icmp flow_id %d: %s is %w (another hopcorder, or a ping, with the same identifier?); "+
+				"every hopcorder process on a host needs its own flow_id", h.id, h, ErrFlowInUse)
+		}
+		return fmt.Errorf("icmp flow_id %d: hold %s: %w", h.id, h, err)
+	}
+	for _, id := range order {
+		if held[id] {
 			continue
 		}
-		c, err := holdEchoID(h)
-		switch {
-		case err == nil:
-			opened[h] = c
-		case errors.Is(err, errCannotHold):
-			r.logCannotHold(h, err)
-		default:
-			for _, c := range opened {
-				_ = c.Close()
+		var first heldID
+		var firstErr error
+		for _, v6 := range []bool{false, true} {
+			h := heldID{v6: v6, id: id}
+			c, err := holdEchoID(h)
+			if err == nil {
+				opened[h] = c
+				firstErr = nil
+				break
 			}
-			if errors.Is(err, syscall.EADDRINUSE) {
-				return fmt.Errorf("icmp flow_id %d: %s is %w (another hopcorder, or a ping, with the same identifier?); "+
-					"every hopcorder process on a host needs its own flow_id", h.id, h, ErrFlowInUse)
+			if !errors.Is(err, errCannotHold) {
+				return fail(h, err)
 			}
-			return fmt.Errorf("icmp flow_id %d: hold %s: %w", h.id, h, err)
+			if firstErr == nil {
+				first, firstErr = h, err
+			}
+		}
+		if firstErr != nil { // neither family: report why IPv4 could not
+			r.logCannotHold(first, firstErr)
 		}
 	}
 	for h, c := range r.held {
-		if !want[h] {
+		if !want[h.id] {
 			_ = c.Close()
 			delete(r.held, h)
 		}

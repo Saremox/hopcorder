@@ -110,6 +110,18 @@ func TestUnprivilegedChild(t *testing.T) {
 				}
 			}
 			fmt.Printf("%s %d: %v\n", f[0], id, err)
+		case "bind-ping6": // bind-ping6 <identifier>: an IPv6 ping socket
+			id, _ := strconv.Atoi(f[1])
+			fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMPV6)
+			if errors.Is(err, syscall.EAFNOSUPPORT) {
+				fmt.Printf("%s %d: no IPv6\n", f[0], id)
+				break
+			}
+			if err == nil {
+				err = syscall.Bind(fd, &syscall.SockaddrInet6{Port: id})
+				_ = syscall.Close(fd)
+			}
+			fmt.Printf("%s %d: %v\n", f[0], id, err)
 		case "forge": // forge <src> <dst> <port> <udp checksum> <ttl>
 			src, dst := netip.MustParseAddr(f[1]), netip.MustParseAddr(f[2])
 			port, _ := strconv.Atoi(f[3])
@@ -158,6 +170,15 @@ func TestInnerHoldFlows(t *testing.T) {
 	}
 	if got := u.do("bind-ping 4242"); got != "bind-ping 4242: address already in use" {
 		t.Errorf("unprivileged process on the held echo identifier: %q", got)
+	}
+	// The one (IPv4) socket holds the identifier for IPv6 ping sockets too:
+	// the kernel keeps both families' identifiers in one table.
+	switch got := u.do("bind-ping6 4242"); got {
+	case "bind-ping6 4242: address already in use":
+	case "bind-ping6 4242: no IPv6":
+		t.Log("no IPv6 in this kernel; the IPv6 side is not checked")
+	default:
+		t.Errorf("unprivileged IPv6 ping socket on the held echo identifier: %q", got)
 	}
 	// Probes on the held identifier still get their echo replies (raw
 	// sockets receive a copy before the ping socket does).
