@@ -208,6 +208,9 @@ const (
 	MaxAgentIDLen  = 128
 	MaxTargetLen   = 255
 	maxPathHashLen = 64
+	// MaxZoneLen bounds an IPv6 zone (an interface name or index; Linux
+	// interface names have at most 15 characters).
+	MaxZoneLen = 15
 )
 
 // The time range a record's ts must fall into (ClickHouse DateTime64 covers
@@ -227,12 +230,39 @@ func ValidAgentID(s string) bool {
 }
 
 // ValidTarget reports whether s may be a target: a host name or an IP
-// address (with an IPv6 zone), 1 to MaxTargetLen characters from
-// [A-Za-z0-9._:%-].
+// address (with an IPv6 zone, see ValidZone), 1 to MaxTargetLen characters
+// from [A-Za-z0-9._:%-].
 func ValidTarget(s string) bool {
-	return len(s) > 0 && len(s) <= MaxTargetLen && !strings.ContainsFunc(s, func(c rune) bool {
+	if len(s) == 0 || len(s) > MaxTargetLen || strings.ContainsFunc(s, func(c rune) bool {
 		return !isAlnum(c) && c != '.' && c != '_' && c != ':' && c != '%' && c != '-'
+	}) {
+		return false
+	}
+	if ip, err := netip.ParseAddr(s); err == nil && ip.Zone() != "" {
+		return ValidZone(ip.Zone())
+	}
+	return true
+}
+
+// ValidZone reports whether z may be the zone of a target address: 1 to
+// MaxZoneLen characters from [A-Za-z0-9._-]. netip accepts any text as a
+// zone, so without this an address could carry a megabyte of anything.
+func ValidZone(z string) bool {
+	return len(z) > 0 && len(z) <= MaxZoneLen && !strings.ContainsFunc(z, func(c rune) bool {
+		return !isAlnum(c) && c != '.' && c != '_' && c != '-'
 	})
+}
+
+// addrOf checks that ip, a hop or loop address, belongs to address family
+// af and has no zone (routers' addresses never have one).
+func addrOf(ip netip.Addr, af int) error {
+	switch {
+	case ip.Zone() != "":
+		return errors.New("ip has a zone")
+	case af == 4 && !ip.Is4(), af == 6 && (!ip.Is6() || ip.Is4In6()):
+		return fmt.Errorf("ip is not an IPv%d address", af)
+	}
+	return nil
 }
 
 func isAlnum(c rune) bool {
@@ -254,11 +284,14 @@ func (r *Record) Validate() error {
 	if !ValidTarget(r.Target) {
 		errs = append(errs, fmt.Errorf("target: want a host name or address of 1 to %d characters", MaxTargetLen))
 	}
+	// Error messages never quote a value: they end up in responses and logs.
 	switch {
 	case !r.TargetIP.IsValid():
 		errs = append(errs, errors.New("target_ip is missing"))
+	case r.TargetIP.Zone() != "" && !ValidZone(r.TargetIP.Zone()):
+		errs = append(errs, fmt.Errorf("target_ip: zone must be 1 to %d characters from [A-Za-z0-9._-]", MaxZoneLen))
 	case r.AF == 4 && !r.TargetIP.Is4(), r.AF == 6 && !r.TargetIP.Is6():
-		errs = append(errs, fmt.Errorf("target_ip %s does not match af %d", r.TargetIP, r.AF))
+		errs = append(errs, fmt.Errorf("target_ip does not match af %d", r.AF))
 	case r.AF != 4 && r.AF != 6:
 		errs = append(errs, fmt.Errorf("af %d, want 4 or 6", r.AF))
 	}
@@ -283,11 +316,11 @@ func (r *Record) Validate() error {
 	if r.Loops == nil {
 		errs = append(errs, errors.New("loops is null"))
 	}
-	if err := validateLoops(r.Loops, len(r.Hops)); err != nil {
+	if err := validateLoops(r.Loops, len(r.Hops), r.AF); err != nil {
 		errs = append(errs, err)
 	}
 	for i, h := range r.Hops {
-		if err := h.validate(); err != nil {
+		if err := h.validate(r.AF); err != nil {
 			errs = append(errs, fmt.Errorf("hops[%d]: %w", i, err))
 		}
 		if h.TTL != i+1 {
@@ -297,16 +330,19 @@ func (r *Record) Validate() error {
 	return errors.Join(errs...)
 }
 
-// validateLoops checks that loops could have come from hops hops: at most
-// one entry per hop, each a valid address seen at 2 or more distinct,
-// increasing TTLs within the path.
-func validateLoops(loops []Loop, hops int) error {
+// validateLoops checks that loops could have come from hops hops of address
+// family af: at most one entry per hop, each a valid address seen at 2 or
+// more distinct, increasing TTLs within the path.
+func validateLoops(loops []Loop, hops, af int) error {
 	if len(loops) > hops {
 		return fmt.Errorf("%d loops for %d hops", len(loops), hops)
 	}
 	for i, l := range loops {
 		if !l.IP.IsValid() || len(l.TTLs) < 2 || len(l.TTLs) > hops {
 			return fmt.Errorf("loops[%d]: want an address seen at 2 to %d TTLs", i, hops)
+		}
+		if err := addrOf(l.IP, af); err != nil {
+			return fmt.Errorf("loops[%d]: %w", i, err)
 		}
 		for j, ttl := range l.TTLs {
 			if ttl < 1 || ttl > hops || (j > 0 && ttl <= l.TTLs[j-1]) {
@@ -317,13 +353,16 @@ func validateLoops(loops []Loop, hops int) error {
 	return nil
 }
 
-func (h Hop) validate() error {
+func (h Hop) validate(af int) error {
 	if !h.Status.Valid() {
-		return fmt.Errorf("invalid status %q", h.Status)
+		return errors.New("invalid status")
 	}
 	if h.Status.Responded() {
 		if !h.IP.IsValid() {
 			return fmt.Errorf("status %s without ip", h.Status)
+		}
+		if err := addrOf(h.IP, af); err != nil {
+			return err
 		}
 		if h.RTTMicros <= 0 {
 			return fmt.Errorf("status %s without rtt_us", h.Status)
@@ -348,7 +387,7 @@ func (h Hop) validate() error {
 	}
 	for _, l := range h.MPLS {
 		if l.Label > 0xfffff || l.TC > 7 {
-			return fmt.Errorf("invalid MPLS label %+v", l)
+			return errors.New("invalid MPLS label")
 		}
 	}
 	return nil

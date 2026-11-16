@@ -87,6 +87,7 @@ func TestIngestEndToEndClickHouse(t *testing.T) {
 	c := testClickHouse(t)
 	newSrv := func() *httptest.Server {
 		s := New(Options{Store: c, Pinger: c, Enricher: fakeEnrich{}, Logger: slog.New(slog.DiscardHandler)})
+		s.ingester.now = func() time.Time { return t0.Add(time.Hour) } // the records' ts are fixed
 		s.SetReady()
 		ts := httptest.NewServer(s.Handler())
 		t.Cleanup(ts.Close)

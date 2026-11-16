@@ -32,10 +32,13 @@ clickhouse:                     # the HTTP interface
 
 ingest:
   max_body_bytes: 8MiB          # compressed request body
-  max_decoded_bytes: 32MiB      # after decompression (an agent's batch is 1MiB by default)
+  max_decoded_bytes: 32MiB      # after decompression (an agent's batch is 1MiB by default); a request
+                                # being processed holds about twice this in memory
   max_concurrent: 4             # requests processed at once; more wait, then get 503 (agents retry)
-  max_streams: 100000           # (agent, target, protocol, flow) tracked in memory
+  max_streams: 20000            # (agent, target, protocol, flow) tracked in memory, 1 to 9 KiB each
+  max_agents: 10000             # agents tracked in memory (under 1 KiB each, besides their streams)
   stream_idle_timeout: 1h       # idle streams are dropped and restored from ClickHouse when they return
+  max_record_age: 720h          # older records are refused (keep it above the agents' spool max_age)
 
 query:
   max_concurrent: 8             # read-API requests at once

@@ -21,7 +21,8 @@ func TestServerDefaults(t *testing.T) {
 		!*c.Metrics || !*c.Enrich.RDNS.Enabled || *c.Enrich.ASN.URL != DefaultASNURL ||
 		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes ||
 		*c.ClickHouse.RetentionDays != 90 || !*c.UI || c.Ingest.MaxConcurrent != 4 || c.Query.MaxConcurrent != 8 ||
-		c.Ingest.MaxStreams != DefaultMaxStreams || c.Ingest.StreamIdleTimeout.D() != time.Hour {
+		c.Ingest.MaxStreams != 20000 || c.Ingest.MaxAgents != 10000 || c.Ingest.StreamIdleTimeout.D() != time.Hour ||
+		c.Ingest.MaxRecordAge.D() != 30*24*time.Hour {
 		t.Errorf("defaults %+v", c)
 	}
 }
@@ -41,7 +42,7 @@ func TestServerValidation(t *testing.T) {
 listen: nope
 log: {level: loud}
 clickhouse: {url: "ftp://x", database: "a;b", password: x, password_file: /nonexistent, retention_days: -1}
-ingest: {max_body_bytes: 1KiB}
+ingest: {max_body_bytes: 1KiB, max_agents: -1, max_record_age: 10m}
 enrich:
   rdns: {workers: -1}
   asn: {url: "", refresh: 1s}
@@ -55,7 +56,8 @@ enrich:
 	}
 	for _, want := range []string{"listen", "log.level", "clickhouse.url", "clickhouse.database", "mutually exclusive",
 		"retention_days",
-		"password_file", "ingest:", "enrich.rdns", "enrich.asn: set url or file", "enrich.asn.refresh"} {
+		"password_file", "ingest:", "max_agents", "ingest.max_record_age", "enrich.rdns", "enrich.asn: set url or file",
+		"enrich.asn.refresh"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error lacks %q:\n%v", want, err)
 		}

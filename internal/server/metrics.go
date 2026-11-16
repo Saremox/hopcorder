@@ -18,6 +18,8 @@ type serverMetrics struct {
 	outagesVec  *prometheus.CounterVec
 	queryErrors prometheus.Counter
 	hostRefused prometheus.Counter
+	unrestored  prometheus.Counter
+	evictedVec  *prometheus.CounterVec
 }
 
 // newServerMetrics creates the metrics and registers them with reg (if not
@@ -50,13 +52,25 @@ func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
 			Name: "hopcorder_server_host_refused_total",
 			Help: "Requests refused because their Host header is not in allowed_hosts.",
 		}),
+		unrestored: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hopcorder_server_unrestored_cycles_total",
+			Help: "Stored cycles that derived no events because their stream's state was not restored in time " +
+				"(the stream is restored with its next batch).",
+		}),
+		evictedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hopcorder_server_state_evictions_total",
+			Help: "Agent and stream states dropped beyond ingest.max_agents and ingest.max_streams (not idle ones).",
+		}, []string{"kind"}),
 	}
 	for _, r := range []string{"accepted", "duplicate", "rejected"} {
 		m.recordsVec.WithLabelValues(r)
 	}
+	for _, k := range []string{"agent", "stream"} {
+		m.evictedVec.WithLabelValues(k)
+	}
 	if reg != nil {
 		reg.MustRegister(m.requests, m.recordsVec, m.insertErrs, m.insertSecs, m.changes, m.outagesVec, m.queryErrors,
-			m.hostRefused)
+			m.hostRefused, m.unrestored, m.evictedVec)
 	}
 	return m
 }
@@ -73,3 +87,7 @@ func (m *serverMetrics) insertError(table string) {
 func (m *serverMetrics) insertDuration(d time.Duration) { m.insertSecs.Observe(d.Seconds()) }
 func (m *serverMetrics) pathChanges(n int)              { m.changes.Add(float64(n)) }
 func (m *serverMetrics) outage(event string)            { m.outagesVec.WithLabelValues(event).Inc() }
+func (m *serverMetrics) unrestoredCycles(n int)         { m.unrestored.Add(float64(n)) }
+func (m *serverMetrics) evicted(kind string, n int) {
+	m.evictedVec.WithLabelValues(kind).Add(float64(n))
+}

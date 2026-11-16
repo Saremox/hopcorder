@@ -70,12 +70,7 @@ func (s *stream) observe(rec *record.Record, ev *events) {
 
 	switch {
 	case !rec.Reached && s.outage == nil:
-		ttl, ip := lastResponding(rec.Hops)
-		o := outageRow{
-			AgentID: rec.AgentID, Target: rec.Target, Protocol: rec.Protocol, FlowID: rec.FlowID,
-			StartSeq: rec.Seq, StartTS: clickhouse.Time(rec.TS), Cycles: 1,
-			LastHopTTL: ttl, LastHopIP: ip, Version: rec.Seq,
-		}
+		o := newOutage(rec, 1)
 		s.outage = &o
 		ev.outages = append(ev.outages, o)
 	case !rec.Reached:
@@ -85,6 +80,17 @@ func (s *stream) observe(rec *record.Record, ev *events) {
 		o.EndSeq, o.EndTS, o.Version = rec.Seq, tsPtr(rec.TS), rec.Seq
 		s.outage = nil
 		ev.outages = append(ev.outages, o)
+	}
+}
+
+// newOutage is the open outage starting with rec, cycles long so far.
+// last_hop is where it broke: the last responding hop of its first cycle.
+func newOutage(rec *record.Record, cycles int) outageRow {
+	ttl, ip := lastResponding(rec.Hops)
+	return outageRow{
+		AgentID: rec.AgentID, Target: rec.Target, Protocol: rec.Protocol, FlowID: rec.FlowID,
+		StartSeq: rec.Seq, StartTS: clickhouse.Time(rec.TS), Cycles: cycles,
+		LastHopTTL: ttl, LastHopIP: ip, Version: rec.Seq,
 	}
 }
 
