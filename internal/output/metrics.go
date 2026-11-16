@@ -45,8 +45,8 @@ type Metrics struct {
 	resolveErrors *prometheus.CounterVec
 	outputErrors  *prometheus.CounterVec
 
-	mu       sync.Mutex
-	lastHash map[*agent.Target]string
+	mu    sync.Mutex
+	paths map[*agent.Target]*record.PathTracker
 }
 
 // MetricsOptions wires the metrics output to the rest of the agent.
@@ -78,7 +78,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			Name: "hopcorder_path_length", Help: "Hops in the last cycle's trimmed path.",
 		}, tp),
 		pathChanges: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "hopcorder_path_changes_total", Help: "Cycles whose path_hash differed from the previous cycle's.",
+			Name: "hopcorder_path_changes_total", Help: "Cycles whose route differed from the previous cycle's (silent hops match anything).",
 		}, tp),
 		loops: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_loops_detected_total", Help: "Cycles in which at least one routing loop was detected.",
@@ -95,7 +95,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		outputErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_output_errors_total", Help: "Failed deliveries by output.",
 		}, []string{"output"}),
-		lastHash: map[*agent.Target]string{},
+		paths: map[*agent.Target]*record.PathTracker{},
 	}
 	r.MustRegister(m.cycles, m.rtt, m.pathLen, m.pathChanges, m.loops, m.overruns,
 		m.cycleErrors, m.resolveErrors, m.outputErrors)
@@ -206,10 +206,14 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 		m.loops.WithLabelValues(host, proto).Inc()
 	}
 	m.mu.Lock()
-	prev, seen := m.lastHash[t]
-	m.lastHash[t] = rec.PathHash
+	p := m.paths[t]
+	if p == nil {
+		p = &record.PathTracker{}
+		m.paths[t] = p
+	}
+	changed := p.Observe(rec)
 	m.mu.Unlock()
-	if seen && prev != rec.PathHash {
+	if changed {
 		m.pathChanges.WithLabelValues(host, proto).Inc()
 	}
 }

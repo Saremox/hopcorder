@@ -103,10 +103,13 @@ Derived per cycle:
   the last responding hop and the rest dropped. `path_len` is the number of
   hops kept.
 - **`path_hash`**: first 16 hex chars of SHA-1 over the hop IPs joined with
-  `|`, `*` for silent hops. A different router at any TTL changes it. Note
-  that a hop which answers in some cycles and not in others alternates
-  between two hashes (its address vs `*`); see the open question in
-  `docs/HANDOFF.md` §10.
+  `|`, `*` for silent hops: a fingerprint of the exact snapshot. A hop that
+  answers in some cycles and not others alternates between two hashes, so
+  don't count route changes by comparing hashes. hopcorder decides route
+  changes (for `hopcorder_path_changes_total`) by remembering the last
+  address at each TTL and treating silent hops as wildcards: a change is a
+  TTL answering from a different address, a reached destination at a
+  different distance, or a different target address.
 - **`loops`**: addresses that answered *time exceeded* at more than one TTL.
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
@@ -198,7 +201,7 @@ hop addresses.
 | `hopcorder_cycles_total` | target, protocol, result=`reached`\|`unreached` | Completed cycles |
 | `hopcorder_e2e_rtt_seconds` | target, protocol | Histogram of destination RTT |
 | `hopcorder_path_length` | target, protocol | Hops in the last cycle |
-| `hopcorder_path_changes_total` | target, protocol | Cycles whose `path_hash` changed |
+| `hopcorder_path_changes_total` | target, protocol | Route changes (silent hops match anything; see above) |
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
