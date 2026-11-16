@@ -185,3 +185,35 @@ func TestDrainResumesFromCursorAfterRestart(t *testing.T) {
 		t.Errorf("delivered %s", got)
 	}
 }
+
+func TestDrainFlushNowShipsPartialBatch(t *testing.T) {
+	s := openSpool(t, "m")
+	out := &memOutput{name: "m"}
+	flush := make(chan struct{})
+	startDrain(t, s, out, DrainOptions{MaxRecords: 500, FlushInterval: time.Hour, FlushNow: flush})
+	push(t, s, 3)
+	time.Sleep(50 * time.Millisecond)
+	if n := out.calls.Load(); n != 0 {
+		t.Fatalf("delivered before flush (%d calls)", n)
+	}
+	close(flush)
+	eventually(t, time.Second, func() bool { return len(out.all()) == 3 }, "FlushNow did not ship the partial batch")
+	push(t, s, 1) // after FlushNow, nothing waits any more
+	eventually(t, time.Second, func() bool { return len(out.all()) == 4 }, "record after FlushNow waited")
+}
+
+// A wall-clock step backwards leaves records stamped in the future; the
+// flush wait must still be bounded by FlushInterval.
+func TestDrainFutureTimestampsDoNotStall(t *testing.T) {
+	s := openSpool(t, "m")
+	out := &memOutput{name: "m"}
+	startDrain(t, s, out, DrainOptions{MaxRecords: 500, FlushInterval: 100 * time.Millisecond})
+	for range 3 {
+		if _, err := s.Append(time.Now().Add(time.Hour), func(seq uint64) ([]byte, error) {
+			return fmt.Appendf(nil, `{"seq":%d}`, seq), nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	eventually(t, 2*time.Second, func() bool { return len(out.all()) == 3 }, "future-stamped records stalled")
+}

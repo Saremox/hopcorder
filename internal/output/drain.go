@@ -33,7 +33,11 @@ type DrainOptions struct {
 	RetryMin, RetryMax time.Duration
 	// OnError is called for every failed delivery (for metrics).
 	OnError func(error)
-	Logger  *slog.Logger
+	// FlushNow, once closed, makes partial batches go out immediately
+	// instead of waiting for FlushInterval. Close it at shutdown so the
+	// last records get a chance to ship.
+	FlushNow <-chan struct{}
+	Logger   *slog.Logger
 }
 
 func (o *DrainOptions) defaults() {
@@ -83,12 +87,15 @@ func Drain(ctx context.Context, src Source, out Output, o DrainOptions) {
 			}
 			continue
 		}
-		if o.FlushInterval > 0 && !full(batch, o) {
+		if o.FlushInterval > 0 && !full(batch, o) && !closed(o.FlushNow) {
 			// A partial batch waits until its oldest record is FlushInterval
 			// old or a full batch is pending, then goes out with whatever
-			// has accumulated by then.
-			if wait := time.Until(batch[0].TS.Add(o.FlushInterval)); wait > 0 {
-				waitForBatch(ctx, src, name, notify, wait, o.MaxRecords)
+			// has accumulated by then. The wait is capped at FlushInterval
+			// so a wall-clock step backwards (records stamped "in the
+			// future") cannot stall delivery.
+			wait := min(time.Until(batch[0].TS.Add(o.FlushInterval)), o.FlushInterval)
+			if wait > 0 {
+				waitForBatch(ctx, src, name, notify, o.FlushNow, wait, o.MaxRecords)
 				if ctx.Err() != nil {
 					return
 				}
@@ -140,14 +147,25 @@ func full(batch []spool.Entry, o DrainOptions) bool {
 	return n >= o.MaxBytes
 }
 
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false // also for a nil channel
+	}
+}
+
 // waitForBatch waits until the flush deadline passes, enough records are
-// pending for a full batch, or ctx ends.
-func waitForBatch(ctx context.Context, src Source, name string, notify <-chan struct{}, wait time.Duration, maxRecords int) {
+// pending for a full batch, flushNow is closed, or ctx ends.
+func waitForBatch(ctx context.Context, src Source, name string, notify, flushNow <-chan struct{}, wait time.Duration, maxRecords int) {
 	t := time.NewTimer(wait)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-flushNow:
 			return
 		case <-t.C:
 			return

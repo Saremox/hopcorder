@@ -434,7 +434,14 @@ added in the commit that introduced it.
   dropped only if some output had not delivered them.
 - **Batching** (§5.2): a partial batch waits until its oldest record is
   `flush_interval` old (or a full batch is pending), then ships everything
-  accumulated. Backoff doubles from `retry_min` to `retry_max`, each wait
+  accumulated. The wait is capped at `flush_interval` so a wall-clock step
+  backwards cannot stall delivery, and at shutdown partial batches ship
+  immediately.
+- **JSONL torn writes**: a short write to the file is truncated away; if that
+  is impossible (stdout), or the file ends mid-line at startup (power loss
+  before fsync), the next batch starts on a new line. Readers may therefore
+  see repeated records and, after a power loss, at most one unparseable
+  fragment line — never a record glued to a fragment. Backoff doubles from `retry_min` to `retry_max`, each wait
   jittered to 50–100%.
 - **`--once`** does not open the spool (so it can run next to a running agent)
   and prints records with `seq: 0`; the spool assigns seqs from 1.

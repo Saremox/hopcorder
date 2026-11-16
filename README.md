@@ -168,7 +168,9 @@ arguments), `flow_id` (default 33434), `paris`, `interval`, `timeout`,
 **Outputs** (at least one):
 
 - `jsonl.path` (`--jsonl`): append records to a file, `-` for stdout. Synced to
-  disk per batch. Rotate with `copytruncate`.
+  disk per batch. After a crash records may repeat (dedup on
+  `(agent_id, seq)`); a torn write never runs into the next record. Rotate
+  with `copytruncate`.
 - `http`: POST zstd-compressed NDJSON to `<url>/api/v1/ingest`. Options: `url`,
   `headers`, `bearer_token` or `bearer_token_file`, `basic_auth`
   (`username`, `password` or `password_file`), `tls` (`ca_file`, `cert_file`,
