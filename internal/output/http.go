@@ -94,10 +94,14 @@ func NewHTTP(cfg HTTPConfig) (*HTTP, error) {
 	}
 	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithEncoderConcurrency(1))
 	return &HTTP{
-		cfg:    cfg,
-		url:    u.String(),
-		client: &http.Client{Transport: tr, Timeout: cfg.Timeout},
-		enc:    enc,
+		cfg: cfg,
+		url: u.String(),
+		client: &http.Client{Transport: tr, Timeout: cfg.Timeout,
+			// Never follow a redirect: it would resend the batch, and on the
+			// same host the credentials, possibly over plain http; custom
+			// headers would go to any host. A 3xx is an error to retry.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		enc: enc,
 	}, nil
 }
 
@@ -148,6 +152,10 @@ func (h *HTTP) Deliver(ctx context.Context, lines [][]byte) error {
 	defer resp.Body.Close()
 	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10)) // allow connection reuse
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		return fmt.Errorf("post %s: %s to %q: redirects are not followed; point the url at the ingest endpoint",
+			h.url, resp.Status, resp.Header.Get("Location"))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return fmt.Errorf("post %s: %s: %s", h.url, resp.Status, strings.TrimSpace(string(excerpt)))
 	}

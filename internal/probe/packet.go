@@ -394,7 +394,10 @@ func parseMPLS(msg []byte, v6 bool) []record.MPLSLabel {
 			break
 		}
 		if obj[2] == extClassMPLS && obj[3] == extCTypeLabelStack {
-			for e := obj[4:n]; len(e) >= 4; e = e[4:] {
+			// Only the first label stack, and at most MaxMPLSLabels of it:
+			// the packet comes from any router on the path (or a spoofer),
+			// and real stacks are a few labels deep.
+			for e := obj[4:n]; len(e) >= 4 && len(labels) < record.MaxMPLSLabels; e = e[4:] {
 				v := binary.BigEndian.Uint32(e)
 				labels = append(labels, record.MPLSLabel{
 					Label: v >> 12,
@@ -403,8 +406,20 @@ func parseMPLS(msg []byte, v6 bool) []record.MPLSLabel {
 					TTL:   uint8(v),
 				})
 			}
+			return labels
 		}
 		obj = obj[n:]
 	}
 	return labels
+}
+
+// sourceMatchesSocket reports whether a reply's source address belongs to
+// the family of the socket it arrived on. Some kernels deliver packets with
+// IPv4-mapped sources (::ffff:a.b.c.d) on IPv6 sockets; parsed by their
+// source, such a packet would be taken for an IPv4 reply.
+func sourceMatchesSocket(addr netip.Addr, ipv4Socket bool) bool {
+	if ipv4Socket {
+		return addr.Unmap().Is4()
+	}
+	return addr.Is6() && !addr.Is4In6()
 }
