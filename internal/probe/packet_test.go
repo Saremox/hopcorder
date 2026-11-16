@@ -366,3 +366,44 @@ func TestParseMPLS(t *testing.T) {
 		t.Errorf("quoted probe: %+v %v", r, err)
 	}
 }
+
+// A router (or spoofer) controls the extension: the stack is cut at
+// MaxMPLSLabels and only the first label-stack object counts.
+func TestParseMPLSBounded(t *testing.T) {
+	obj := func(labels int) []byte {
+		b := []byte{0, 0, extClassMPLS, extCTypeLabelStack}
+		binary.BigEndian.PutUint16(b, uint16(4+4*labels))
+		for i := range labels {
+			b = binary.BigEndian.AppendUint32(b, uint32(100+i)<<12|1)
+		}
+		return b
+	}
+	msg := make([]byte, 8+128)
+	msg[0], msg[5] = 11, 32 // time exceeded, 32 words of the original datagram
+	msg = append(msg, extVersion<<4, 0, 0, 0)
+	msg = append(msg, obj(300)...)
+	msg = append(msg, obj(3)...)
+	got := parseMPLS(msg, false)
+	if len(got) != record.MaxMPLSLabels || got[0].Label != 100 || got[len(got)-1].Label != 100+record.MaxMPLSLabels-1 {
+		t.Errorf("%d labels: %+v", len(got), got)
+	}
+}
+
+func TestSourceMatchesSocket(t *testing.T) {
+	for _, c := range []struct {
+		addr   string
+		v4sock bool
+		want   bool
+	}{
+		{"192.0.2.1", true, true},
+		{"::ffff:192.0.2.1", true, true}, // an IPv4 socket's source in 16-byte form
+		{"2001:db8::1", true, false},
+		{"2001:db8::1", false, true},
+		{"::ffff:203.0.113.66", false, false}, // v4-mapped on an IPv6 socket
+		{"192.0.2.1", false, false},
+	} {
+		if got := sourceMatchesSocket(netip.MustParseAddr(c.addr), c.v4sock); got != c.want {
+			t.Errorf("%s on an IPv%s socket: %v", c.addr, map[bool]string{true: "4", false: "6"}[c.v4sock], got)
+		}
+	}
+}

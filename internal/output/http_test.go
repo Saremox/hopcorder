@@ -261,3 +261,39 @@ func TestHTTPMutualTLS(t *testing.T) {
 		t.Error("garbage key accepted")
 	}
 }
+
+// Redirects are never followed: they would resend the batch and its
+// credentials (in clear text after a downgrade to http) and custom headers
+// to wherever the response points.
+func TestHTTPDoesNotFollowRedirects(t *testing.T) {
+	var got []string
+	var mu sync.Mutex
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Header.Get("Authorization")+"|"+r.Header.Get("X-Api-Key"))
+		mu.Unlock()
+	}))
+	defer other.Close()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+r.URL.Path, http.StatusPermanentRedirect)
+	}))
+	defer srv.Close()
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHTTP(HTTPConfig{URL: srv.URL, CAFile: caFile, BearerToken: "s3cr3t", Headers: map[string]string{"X-Api-Key": "k3y"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	err = h.Deliver(t.Context(), [][]byte{[]byte(`{}`)})
+	if err == nil || !strings.Contains(err.Error(), "redirects are not followed") {
+		t.Errorf("Deliver = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 0 {
+		t.Errorf("the redirect target received %v", got)
+	}
+}

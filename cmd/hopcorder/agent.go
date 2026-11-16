@@ -316,6 +316,10 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		drainOpts = append(drainOpts, output.DrainOptions{Logger: logger})
 	}
 	if h := cfg.Outputs.HTTP; h != nil {
+		if h.CleartextCredentials() {
+			logger.Warn("outputs.http.url is plain http: the configured credentials and headers travel unencrypted",
+				"url", h.URL)
+		}
 		hc := output.HTTPConfig{
 			URL: h.URL, Headers: h.Headers, BearerToken: h.BearerToken, BearerTokenFile: h.BearerTokenFile,
 			CAFile: h.TLS.CAFile, CertFile: h.TLS.CertFile, KeyFile: h.TLS.KeyFile, ServerName: h.TLS.ServerName,

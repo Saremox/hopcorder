@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/net/netutil"
 
 	"github.com/saremox/hopcorder/internal/agent"
 	"github.com/saremox/hopcorder/internal/probe"
@@ -159,6 +160,9 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{Registry: m.reg})
 }
 
+// maxMetricsConns caps concurrent connections to the metrics endpoint.
+const maxMetricsConns = 64
+
 // Serve listens on addr and serves the metrics at path. The returned stop
 // function shuts the server down and returns once the listener is closed,
 // so the address can be bound again right away (as a config reload does).
@@ -168,9 +172,14 @@ func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger
 	if err != nil {
 		return nil, fmt.Errorf("metrics listen %s: %w", addr, err)
 	}
+	// Bounded in every phase and in connection count: idle or slow
+	// clients cannot pin goroutines and file descriptors the agent needs
+	// for probing.
+	ln = netutil.LimitListener(ln, maxMetricsConns)
 	mux := http.NewServeMux()
 	mux.Handle(path, m.Handler())
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
+		WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10}
 	log.Info("serving metrics", "addr", ln.Addr().String(), "path", path)
 	done := make(chan struct{})
 	go func() {
