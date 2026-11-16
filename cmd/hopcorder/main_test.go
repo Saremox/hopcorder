@@ -22,8 +22,12 @@ func TestRunCommands(t *testing.T) {
 	if code := run([]string{"bogus"}, io.Discard, io.Discard); code != 2 {
 		t.Errorf("unknown command: code %d", code)
 	}
-	if code := run([]string{"server"}, io.Discard, io.Discard); code != 1 {
-		t.Errorf("server: code %d", code)
+	if code := run([]string{"server", "--listen", "nope"}, io.Discard, io.Discard); code != 2 {
+		t.Errorf("server with bad listen address: code %d", code)
+	}
+	errb.Reset()
+	if code := run([]string{"server", "-h"}, io.Discard, &errb); code != 0 || !strings.Contains(errb.String(), "-clickhouse-url") {
+		t.Errorf("server -h: code %d, usage %q", code, errb.String())
 	}
 	errb.Reset()
 	if code := run([]string{"agent", "-h"}, io.Discard, &errb); code != 0 || !strings.Contains(errb.String(), "-once") {

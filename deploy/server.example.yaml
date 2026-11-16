@@ -1,0 +1,40 @@
+# hopcorder server configuration. Every key is optional; the values shown are
+# the defaults. Unknown keys are rejected at startup.
+
+# hopcorder does no authentication. Put a reverse proxy in front and secure
+# /api/v1/ingest (agents: bearer token, basic auth or mTLS) separately from
+# /api/v1/query/ (readers: e.g. OIDC). Hence the localhost default.
+listen: 127.0.0.1:8080
+
+log:
+  level: info                   # debug, info, warn, error
+  format: text                  # text or json
+
+clickhouse:                     # the HTTP interface
+  url: http://127.0.0.1:8123
+  database: hopcorder           # created on startup if missing; migrations run automatically
+  user: default
+  # password: ""
+  # password_file: /etc/hopcorder/clickhouse-password
+  timeout: 30s
+
+ingest:
+  max_body_bytes: 64MiB         # compressed request body
+  max_decoded_bytes: 512MiB     # after decompression
+
+enrich:
+  rdns:
+    enabled: true               # names are looked up in the background, never blocking ingest
+    workers: 4
+    ttl: 24h
+    negative_ttl: 1h
+    max_entries: 100000
+  asn:
+    enabled: true
+    # Downloaded daily and cached in file; set url: "" to only read file,
+    # e.g. when the server has no internet access and you update it yourself.
+    url: https://iptoasn.com/data/ip2asn-combined.tsv.gz
+    file: /var/lib/hopcorder-server/ip2asn-combined.tsv.gz
+    refresh: 24h
+
+metrics: true                   # serve Prometheus metrics on /metrics
