@@ -39,9 +39,10 @@ outputs:                        # at least one
 
   # http:
   #   url: https://hopcorder.example.net     # POSTs to <url>/api/v1/ingest
-  #   bearer_token_file: /etc/hopcorder/token
-  #   # or: bearer_token: "..."
-  #   # or: basic_auth: {username: agent, password_file: /etc/hopcorder/password}
+  #   # Under systemd: LoadCredential=token:... in the unit, then
+  #   bearer_token_file: /run/credentials/hopcorder.service/token
+  #   # or: bearer_token: "..." (then keep this file unreadable to others)
+  #   # or: basic_auth: {username: agent, password_file: /run/credentials/hopcorder.service/password}
   #   headers: {X-Tenant: lab}
   #   tls:
   #     ca_file: /etc/hopcorder/ca.pem       # replaces the system roots

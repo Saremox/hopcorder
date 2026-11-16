@@ -14,8 +14,9 @@ clickhouse:                     # the HTTP interface
   url: http://127.0.0.1:8123
   database: hopcorder           # created on startup if missing; migrations run automatically
   user: default
-  # password: ""
-  # password_file: /etc/hopcorder/clickhouse-password
+  # password: ""                # then keep this file unreadable to others
+  # Under systemd: LoadCredential=clickhouse-password:... in the unit, then
+  # password_file: /run/credentials/hopcorder-server.service/clickhouse-password
   timeout: 30s
   retention_days: 90            # like the prototype; 0 keeps data forever
 

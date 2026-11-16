@@ -805,8 +805,10 @@ added in the commit that introduced it.
   ambient capabilities, while a file capability on the binary would be
   ignored under `allowPrivilegeEscalation: false`. So the agent runs as uid 0
   with every capability but `NET_RAW` dropped, a read-only root file system
-  and no privilege escalation. That needs Pod Security `baseline`; the server
-  runs as uid 65532 and fits `restricted`.
+  and no privilege escalation. That needs Pod Security `privileged` (baseline
+  does not allow adding `NET_RAW`, nor hostNetwork and hostPath; corrected
+  after the security review): a namespace of its own. The server runs as uid
+  65532 and fits `restricted`.
 - **Publishing** (`images.yml`): pull requests build both images without
   pushing; `main` pushes `:main` and `:sha-<commit>`; `v*` tags push
   `:<version>`, `:<major>.<minor>` and `:latest`, and package the charts with
@@ -946,4 +948,39 @@ fixes. The decisions:
   reached, so the server neither drops the new records as duplicates nor
   refuses them as stale. Other open errors (locked, permissions, a full disk)
   leave the file alone.
+
+**CI and deployment**
+- **Actions are pinned to commits** (with the version in a comment), the Go
+  base image by digest; `.github/dependabot.yml` keeps them, the Go modules
+  and the UI's npm packages current (weekly, minor and patch grouped).
+- **Write tokens only where they are used**: pull requests build images and
+  release assets in jobs without write permissions (`image-check`,
+  `release-check`); `packages: write` is only on the push job for main and
+  tags, `contents: write` only on the tag's release job. No checkout keeps
+  its credentials (`persist-credentials: false`). Release builds use no
+  caches (no Go module or build cache, no Docker layer cache), so nothing
+  another run wrote ends up in a release. The registry token is passed in an
+  environment variable.
+- **Releases**: a `v*` tag is only built if its commit is on main
+  (`verify-tag`), and the chart and release jobs run in the `release`
+  environment, where required reviewers can be added. The release build is
+  `scripts/release-build.sh`, shared with the dry run.
+- **Still to do in the repository settings** (not possible from here):
+  enforce the main ruleset (it is disabled), add a tag ruleset limiting who
+  may create `v*` tags, and add required reviewers to the `release`
+  environment.
+- **Exposure in the docs**: the server's `docker run` example and the
+  development ClickHouse publish on 127.0.0.1 only (the ClickHouse one had
+  host networking with a passwordless default user).
+- **Helm**: the server chart gets an optional NetworkPolicy (off by default:
+  turning it on without listing the ingress controller would cut it off);
+  neither chart mounts a service-account token; the agent chart takes basic
+  auth and TLS material from Secrets and refuses inline credentials (they
+  would land in a ConfigMap, readable with the built-in `view` role); its
+  metrics bind address is configurable (with hostNetwork, `0.0.0.0` is every
+  node address).
+- **systemd**: the units run as a dynamic user, which can only read
+  world-readable files in `/etc/hopcorder`; secrets go in as credentials
+  (`LoadCredential=`, `/run/credentials/<unit>/...`), as the units and
+  example configs now describe.
 

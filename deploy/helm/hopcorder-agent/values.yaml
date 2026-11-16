@@ -1,6 +1,8 @@
 # hopcorder agent. Needs CAP_NET_RAW for raw sockets, so it runs as root with
-# every other capability dropped: the namespace must allow that (Pod Security
-# "baseline", not "restricted").
+# every other capability dropped. Pod Security "baseline" does not allow
+# adding NET_RAW (nor hostNetwork or hostPath for mode: daemonset): install it
+# in a namespace of its own, labelled pod-security.kubernetes.io/enforce:
+# privileged, with nothing else in it.
 
 image:
   repository: ghcr.io/saremox/hopcorder-agent
@@ -24,10 +26,24 @@ hostNetwork: false
 # Where records go: the hopcorder server (outputs.http.url).
 server:
   url: http://hopcorder-server:8080
-  # A bearer token from an existing Secret, if your ingress wants one.
+  # Credentials for your ingress, from existing Secrets (the chart refuses
+  # inline credentials in config: they would land in a ConfigMap).
   bearerTokenSecret:
     name: ""
     key: token
+  basicAuth:
+    username: ""
+    passwordSecret:
+      name: ""
+      key: password
+  # TLS towards an https url: a CA to trust instead of the system roots
+  # and/or a client certificate (mTLS), from one Secret.
+  tls:
+    secretName: ""
+    caKey: ""                 # e.g. ca.crt
+    certKey: ""               # e.g. tls.crt (with keyKey)
+    keyKey: ""                # e.g. tls.key
+    serverName: ""
 
 # The agent's configuration file (see deploy/agent.example.yaml for every
 # key; unknown keys are rejected). The chart sets agent_id, spool.dir,
@@ -46,6 +62,10 @@ config:
 metrics:
   enabled: true
   port: 9469
+  # With hostNetwork, 0.0.0.0 is every address of the node (NetworkPolicy
+  # does not apply to host-network pods). 127.0.0.1 keeps the metrics on the
+  # node, without the Service, ServiceMonitor and liveness probe.
+  listenAddress: 0.0.0.0
   serviceMonitor:
     enabled: false
     interval: 30s

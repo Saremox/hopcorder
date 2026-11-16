@@ -11,8 +11,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: vet
@@ -27,11 +29,13 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8.0.0
         with:
           version: v2.15.0
           args: --build-tags=rawsock,clickhouse,grafana
@@ -41,8 +45,10 @@ jobs:
     # run with CAP_NET_RAW (and CAP_SYS_ADMIN for the netns topology test).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: build test binary
@@ -65,8 +71,10 @@ jobs:
           --health-cmd "clickhouse-client --query 'SELECT 1'"
           --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: test against ClickHouse
@@ -80,8 +88,10 @@ jobs:
     # every dashboard query through Grafana and the provisioned data source.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - name: start the stack
@@ -114,13 +124,15 @@ jobs:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version-file: ui/.nvmrc
           cache: npm
           cache-dependency-path: ui/package-lock.json
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       - run: npm ci
@@ -162,18 +174,31 @@ jobs:
     # check that every agent's records arrive.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.22.1
       - name: lint
         run: |
           helm lint --strict deploy/helm/hopcorder-server
+          helm lint --strict deploy/helm/hopcorder-server --set networkPolicy.enabled=true
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml
+          helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
+            --set server.basicAuth.username=agent --set server.basicAuth.passwordSecret.name=ba \
+            --set server.tls.secretName=mtls --set server.tls.caKey=ca.crt >/dev/null
+          # Inline credentials would land in a ConfigMap: the chart refuses them.
+          if helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
+            --set config.outputs.http.bearer_token=x >/dev/null 2>&1; then
+            echo "inline credentials accepted"; exit 1
+          fi
       - name: build images
         run: |
           docker build --target server -t hopcorder-server:ci .
           docker build --target agent -t hopcorder-agent:ci .
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           cluster_name: hc
       - run: kind load docker-image hopcorder-server:ci hopcorder-agent:ci --name hc
