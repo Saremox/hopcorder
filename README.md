@@ -194,7 +194,7 @@ arguments), `flow_id` (default 33434), `paris`, `adaptive_max_ttl`,
 - `jsonl.path` (`--jsonl`): append records to a file, `-` for stdout. Synced to
   disk per batch. After a crash records may repeat (dedup on
   `(agent_id, seq)`); a torn write never runs into the next record. Rotate
-  with `copytruncate`.
+  by renaming and sending SIGHUP (see Operations) or with `copytruncate`.
 - `http`: POST zstd-compressed NDJSON to `<url>/api/v1/ingest`. Options: `url`,
   `headers`, `bearer_token` or `bearer_token_file`, `basic_auth`
   (`username`, `password` or `password_file`), `tls` (`ca_file`, `cert_file`,
@@ -236,6 +236,26 @@ hop addresses.
 - **Shutdown** (SIGINT/SIGTERM): probing stops at once (in-flight cycles are
   abandoned), outputs get up to 3 seconds to ship what is spooled, and the rest
   stays in the spool for the next start.
+- **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
+  again with the same command-line flags applied on top. If it is invalid, the
+  error is logged and the running configuration stays. Otherwise the agent
+  restarts in-process with it (raw sockets stay open, seq continues); if the
+  new configuration cannot start, for example because its metrics address is
+  taken, the previous one is started again. Every reload reopens the JSONL
+  file, so log rotation can rename it and send SIGHUP instead of using
+  `copytruncate`:
+
+  ```
+  /var/log/hopcorder/records.jsonl {
+      daily
+      rotate 14
+      compress
+      delaycompress
+      postrotate
+          systemctl reload hopcorder
+      endscript
+  }
+  ```
 - **No route to a target** (uplink down) is recorded as a cycle in which
   nothing answered, so outages are visible as data rather than gaps.
 - **DNS**: names are re-resolved in the background every `dns_ttl`; if that

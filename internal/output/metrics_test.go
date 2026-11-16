@@ -110,7 +110,8 @@ func TestMetricsServe(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	if err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler)); err != nil {
+	stop, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler))
+	if err != nil {
 		t.Fatal(err)
 	}
 	resp, err := http.Get("http://" + addr + "/metrics")
@@ -122,7 +123,14 @@ func TestMetricsServe(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "hopcorder_build_info") {
 		t.Errorf("status %d body %.200s", resp.StatusCode, body)
 	}
-	if err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler)); err == nil {
+	if _, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler)); err == nil {
 		t.Error("second listener on the same address succeeded")
 	}
+	stop()
+	// After stop the address is free again immediately.
+	stop2, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("rebind after stop: %v", err)
+	}
+	stop2()
 }

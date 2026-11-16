@@ -279,7 +279,8 @@ for HTTP, logging, and everything else. Ask before adding anything else.
 - [x] `internal/spool`: durable, bounded, crash-safe; tests incl. simulated
       crash
 - [x] `internal/output`: jsonl, http (with auth options + backoff), metrics
-- [x] `internal/config`: YAML + flags + validation (SIGHUP reload not done)
+- [x] `internal/config`: YAML + flags + validation; SIGHUP reload (added
+      after review, see §10)
 - [x] `hopcorder agent` and `hopcorder agent --once`
 - [x] README: install, `setcap`, config reference, the rate-limiting/ECMP
       caveats
@@ -468,6 +469,17 @@ added in the commit that introduced it.
   jittered to 50–100%.
 - **`--once`** does not open the spool (so it can run next to a running agent)
   and prints records with `seq: 0`; the spool assigns seqs from 1.
+- **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
+  and the original command-line flags and positional targets are re-applied.
+  Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
+  metrics server, schedulers) shuts down as on SIGTERM and starts again with
+  the new config; only the prober and its raw sockets survive. A full
+  in-process restart was chosen over diffing configs because it applies every
+  setting the same way and has one code path; the cost is a pause of about
+  one shutdown (≤3s) and Prometheus counters restarting from zero, which
+  `rate()` handles. If the new config fails to start, the previous one is
+  started again. Every reload reopens the JSONL file, which makes
+  rename-and-HUP log rotation work.
 - **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
   outputs get up to 3s to drain what is spooled; whatever is left stays in the
   spool for the next start.
