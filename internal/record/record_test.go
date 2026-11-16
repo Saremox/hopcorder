@@ -408,3 +408,35 @@ func TestPathTracker(t *testing.T) {
 		})
 	}
 }
+
+func TestPathTrackerChangeDetail(t *testing.T) {
+	const dst = "192.0.2.9"
+	rec := func(target string, hs []Hop) *Record {
+		r := &Record{Schema: 1, AgentID: "a", TS: time.Unix(1, 0), Target: "t", TargetIP: ip(target), AF: 4,
+			Protocol: "icmp", Hops: hs}
+		r.Finalize(2)
+		return r
+	}
+	var p PathTracker
+	p.Observe(rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "r:"+dst)))
+	ch, ok := p.ObserveChange(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "x:10.8.8.8", "r:"+dst)))
+	want := PathChange{Reason: ReasonRouter, TTLs: []int{2, 3},
+		From: []netip.Addr{ip("10.0.0.2"), ip("10.0.0.3")}, To: []netip.Addr{ip("10.7.7.7"), ip("10.8.8.8")}}
+	if !ok || !reflect.DeepEqual(ch, want) {
+		t.Errorf("router change = %+v %v", ch, ok)
+	}
+	// Destination one hop further, behind silent hops: only the distance
+	// can tell. (Had TTL 3 answered as the destination, that would be a
+	// router change at TTL 3, which takes precedence.)
+	ch, ok = p.ObserveChange(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "*", "*", "r:"+dst)))
+	if !ok || ch.Reason != ReasonDistance || ch.PrevDistance != 4 || ch.Distance != 5 {
+		t.Errorf("distance change = %+v %v", ch, ok)
+	}
+	ch, ok = p.ObserveChange(rec("192.0.2.10", hops("x:10.0.0.1", "r:192.0.2.10")))
+	if !ok || ch.Reason != ReasonTarget {
+		t.Errorf("target change = %+v %v", ch, ok)
+	}
+	if ch, ok := p.ObserveChange(rec("192.0.2.10", hops("x:10.0.0.1", "r:192.0.2.10"))); ok {
+		t.Errorf("no change reported as %+v", ch)
+	}
+}
