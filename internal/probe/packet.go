@@ -9,8 +9,16 @@ import (
 // IP protocol numbers.
 const (
 	protoICMP   = 1
+	protoTCP    = 6
 	protoUDP    = 17
 	protoICMPv6 = 58
+)
+
+// TCP flags.
+const (
+	tcpSYN = 0x02
+	tcpRST = 0x04
+	tcpACK = 0x10
 )
 
 // ICMP types and codes used by the prober.
@@ -42,6 +50,7 @@ const (
 //
 //	icmp: a = identifier, b = 0,     c = sequence
 //	udp:  a = src port,   b = dst port, c = UDP checksum
+//	tcp:  a = src port,   b = dst port, c = top 16 bits of the SYN's sequence number
 type probeKey struct {
 	dst     netip.Addr
 	proto   uint8
@@ -55,6 +64,7 @@ const (
 	kindEchoReply replyKind = iota + 1
 	kindTimeExceeded
 	kindUnreachable
+	kindTCPReply // SYN-ACK or RST from the destination
 )
 
 // icmpReply is a parsed ICMP message that may answer one of our probes.
@@ -161,6 +171,49 @@ func buildUDP(src, dst netip.Addr, sport, dport, want uint16) []byte {
 	binary.BigEndian.PutUint16(b[8:], comp)
 	binary.BigEndian.PutUint16(b[6:], want)
 	return b
+}
+
+// buildTCPSyn returns a TCP SYN with an MSS option, like a real connection
+// attempt, so middleboxes treat it as one. The probe id travels in the
+// sequence number (seq = id<<16), which ECMP does not hash on; a SYN-ACK or
+// RST acknowledges seq+1, and ICMP errors quote the sequence number in their
+// first 8 bytes.
+func buildTCPSyn(src, dst netip.Addr, sport, dport uint16, seq uint32) []byte {
+	b := make([]byte, 24)
+	binary.BigEndian.PutUint16(b[0:], sport)
+	binary.BigEndian.PutUint16(b[2:], dport)
+	binary.BigEndian.PutUint32(b[4:], seq)
+	b[12] = 6 << 4 // data offset: 6 words
+	b[13] = tcpSYN
+	binary.BigEndian.PutUint16(b[14:], 64240) // window
+	copy(b[20:], []byte{2, 4, 0x05, 0xb4})    // MSS 1460
+	binary.BigEndian.PutUint16(b[16:], checksum(pseudoHeaderSum(src, dst, protoTCP, len(b)), b))
+	return b
+}
+
+// tcpSeq is the sequence number that carries probe id.
+func tcpSeq(id uint16) uint32 { return uint32(id) << 16 }
+
+// parseTCP parses a TCP segment (no IP header) received from from. Only a
+// SYN-ACK or an RST with ACK — the two answers to a SYN — is a reply.
+func parseTCP(from netip.Addr, seg []byte) (icmpReply, error) {
+	if len(seg) < 20 {
+		return icmpReply{}, errTruncated
+	}
+	if off := int(seg[12]>>4) * 4; off < 20 || off > len(seg) {
+		return icmpReply{}, errMalformed
+	}
+	flags := seg[13]
+	if flags&tcpACK == 0 || flags&(tcpSYN|tcpRST) == 0 {
+		return icmpReply{}, errIgnored
+	}
+	ack := binary.BigEndian.Uint32(seg[8:])
+	return icmpReply{kind: kindTCPReply, key: probeKey{
+		dst: from.Unmap().WithZone(""), proto: protoTCP,
+		a: binary.BigEndian.Uint16(seg[2:]), // their destination port is our source port
+		b: binary.BigEndian.Uint16(seg[0:]),
+		c: uint16((ack - 1) >> 16),
+	}}, nil
 }
 
 // buildIPv4 returns an IPv4 header for an IP_HDRINCL raw socket. Linux
@@ -284,6 +337,10 @@ func quotedL4Key(dst netip.Addr, proto uint8, l4 []byte) (probeKey, error) {
 		return probeKey{dst: dst, proto: proto,
 			a: binary.BigEndian.Uint16(l4[0:]), b: binary.BigEndian.Uint16(l4[2:]),
 			c: binary.BigEndian.Uint16(l4[6:])}, nil
+	case protoTCP:
+		return probeKey{dst: dst, proto: proto,
+			a: binary.BigEndian.Uint16(l4[0:]), b: binary.BigEndian.Uint16(l4[2:]),
+			c: uint16(binary.BigEndian.Uint32(l4[4:]) >> 16)}, nil
 	default:
 		return probeKey{}, errIgnored
 	}

@@ -94,6 +94,10 @@ func (s *simNet) send(p *outPacket) error {
 	if msg == nil {
 		return nil
 	}
+	deliver := s.eng.handle
+	if isTCPSegment(msg) {
+		deliver, msg = s.eng.handleTCP, msg[1:]
+	}
 	delay := path.delay
 	if d, ok := path.slow[ttl]; ok {
 		delay = d
@@ -107,7 +111,7 @@ func (s *simNet) send(p *outPacket) error {
 		go func() {
 			defer s.wg.Done()
 			time.Sleep(delay)
-			s.eng.handle(from, msg, time.Now())
+			deliver(from, msg, time.Now())
 		}()
 	}
 	return nil
@@ -134,6 +138,8 @@ func (s *simNet) reply(path *simPath, p *outPacket, ttl int) (netip.Addr, []byte
 		return r, icmpError(typ, 0, p)
 	case path.blackhole:
 		return netip.Addr{}, nil
+	case p.proto == protoTCP:
+		return p.dst, synAck(p)
 	case p.proto == protoUDP:
 		if v4 {
 			return p.dst, icmpError(icmp4Unreachable, icmp4PortUnreach, p)
@@ -148,6 +154,26 @@ func (s *simNet) reply(path *simPath, p *outPacket, ttl int) (netip.Addr, []byte
 		}
 		return p.dst, msg
 	}
+}
+
+// tcpMarker prefixes simulated TCP segments so send knows to deliver them
+// through handleTCP rather than handle.
+const tcpMarker = 0xff
+
+func isTCPSegment(msg []byte) bool { return len(msg) > 0 && msg[0] == tcpMarker }
+
+// synAck is the destination's answer to a SYN probe (prefixed by tcpMarker).
+func synAck(p *outPacket) []byte {
+	seg := make([]byte, 21)
+	seg[0] = tcpMarker
+	b := seg[1:]
+	copy(b[0:2], p.l4[2:4]) // their source port is our destination port
+	copy(b[2:4], p.l4[0:2])
+	binary.BigEndian.PutUint32(b[4:], 0x5eed)
+	binary.BigEndian.PutUint32(b[8:], binary.BigEndian.Uint32(p.l4[4:8])+1)
+	b[12] = 5 << 4
+	b[13] = tcpSYN | tcpACK
+	return seg
 }
 
 // icmpError builds an ICMP error quoting p as it left the host.
@@ -223,6 +249,8 @@ func TestEngineTrace(t *testing.T) {
 		{"udp4", "198.51.100.7", UDP, []string{"10.0.0.1", "10.0.0.2", "*", "10.0.0.4"}},
 		{"icmp6", "2001:db8:1::7", ICMP, []string{"2001:db8:a::1", "2001:db8:a::2", "*", "2001:db8:a::4"}},
 		{"udp6", "2001:db8:1::7", UDP, []string{"2001:db8:a::1", "2001:db8:a::2", "*", "2001:db8:a::4"}},
+		{"tcp4", "198.51.100.7", TCP, []string{"10.0.0.1", "10.0.0.2", "*", "10.0.0.4"}},
+		{"tcp6", "2001:db8:1::7", TCP, []string{"2001:db8:a::1", "2001:db8:a::2", "*", "2001:db8:a::4"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -257,14 +285,23 @@ func TestEngineTrace(t *testing.T) {
 // flowFields returns the header bytes ECMP routers hash on (beyond addresses
 // and protocol): ICMP type, code, checksum and identifier; UDP ports.
 func flowFields(p outPacket) string {
-	if p.proto == protoUDP {
+	if p.proto == protoUDP || p.proto == protoTCP {
 		return fmt.Sprintf("%x", p.l4[0:4])
 	}
 	return fmt.Sprintf("%x", p.l4[0:6])
 }
 
+// probeID returns the bytes that carry the probe id: ICMP sequence, UDP
+// checksum, or the top of the TCP sequence number.
+func probeID(p outPacket) uint16 {
+	if p.proto == protoTCP {
+		return binary.BigEndian.Uint16(p.l4[4:6])
+	}
+	return binary.BigEndian.Uint16(p.l4[6:8])
+}
+
 func TestParisKeepsFlowConstant(t *testing.T) {
-	for _, proto := range []Protocol{ICMP, UDP} {
+	for _, proto := range []Protocol{ICMP, UDP, TCP} {
 		for _, target := range []string{"198.51.100.7", "2001:db8:1::7"} {
 			for _, paris := range []bool{true, false} {
 				t.Run(fmt.Sprintf("%s/%s/paris=%v", proto, target, paris), func(t *testing.T) {
@@ -284,7 +321,7 @@ func TestParisKeepsFlowConstant(t *testing.T) {
 					ids := map[uint16]bool{}
 					for _, p := range s.sent {
 						flows[flowFields(p)] = true
-						ids[binary.BigEndian.Uint16(p.l4[6:8])] = true
+						ids[probeID(p)] = true
 					}
 					if paris && len(flows) != 1 {
 						t.Errorf("paris probes span %d flows: %v", len(flows), flows)
@@ -589,4 +626,21 @@ func TestEngineMinTTL(t *testing.T) {
 	if _, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: ICMP, MinTTL: 7, MaxTTL: 6, Timeout: time.Second}); err == nil {
 		t.Error("MinTTL > MaxTTL accepted")
 	}
+}
+
+// A TCP probe rejected by the destination's own firewall with ICMP port
+// unreachable still reached the destination.
+func TestEngineTCPRejectedByDestination(t *testing.T) {
+	s := newSim()
+	dst := netip.MustParseAddr("198.51.100.7")
+	s.setPath(dst, &simPath{routers: addrs("10.0.0.1", "198.51.100.7"), unreachTTL: 2, unreachCode: icmp4PortUnreach})
+	res, err := s.eng.trace(t.Context(), TraceRequest{Target: dst, Protocol: TCP, Port: 443, FlowID: 1, Paris: true,
+		MaxTTL: 2, Timeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkResults(t, res, []wantHop{
+		{record.StatusTTLExpired, "10.0.0.1", 0},
+		{record.StatusReply, "198.51.100.7", 0},
+	})
 }

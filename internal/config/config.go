@@ -25,7 +25,8 @@ const (
 	DefaultMaxTTL       = 30
 	DefaultProbePast    = 2
 	DefaultProtocol     = "icmp"
-	DefaultPort         = 33434
+	DefaultPort         = 33434 // UDP destination port
+	DefaultTCPPort      = 443
 	DefaultFlowID       = 33434
 	DefaultDNSTTL       = 5 * time.Minute
 	DefaultSpoolMaxAge  = 7 * 24 * time.Hour
@@ -298,8 +299,13 @@ func (c *Config) defaultTarget(t *Target) {
 	if t.Protocol == "" {
 		t.Protocol = c.Protocol
 	}
-	if t.Protocol == "udp" && t.Port == 0 {
-		t.Port = DefaultPort
+	if t.Port == 0 {
+		switch t.Protocol {
+		case "udp":
+			t.Port = DefaultPort
+		case "tcp":
+			t.Port = DefaultTCPPort
+		}
 	}
 	if t.FlowID == 0 {
 		t.FlowID = DefaultFlowID
@@ -335,16 +341,14 @@ func validateTarget(t *Target) []error {
 	switch t.Protocol {
 	case "icmp":
 		if t.Port != 0 {
-			fail("port: only valid for udp")
+			fail("port: only valid for udp and tcp")
 		}
-	case "udp":
+	case "udp", "tcp":
 		if t.Port < 1 || t.Port > 65535 {
 			fail("port %d: out of range 1..65535", t.Port)
 		}
-	case "tcp":
-		fail("protocol tcp: not implemented yet (planned for milestone 2)")
 	default:
-		fail("protocol %q: want icmp or udp", t.Protocol)
+		fail("protocol %q: want icmp, udp or tcp", t.Protocol)
 	}
 	switch t.AF {
 	case 0, 4, 6:

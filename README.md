@@ -78,8 +78,14 @@ sudo systemctl enable --now hopcorder
   load-balanced path is traced as one consistent path instead of flapping
   between members. ICMP keeps identifier and checksum constant (the payload
   compensates for the sequence number); UDP keeps both ports fixed and makes
-  the UDP checksum the probe id. `flow_id` (ICMP id / UDP source port) is on
-  every record. `paris: false` gives classic traceroute behaviour.
+  the UDP checksum the probe id; TCP keeps both ports fixed and carries the
+  probe id in the SYN's sequence number. `flow_id` (ICMP id / UDP or TCP
+  source port) is on every record. `paris: false` gives classic traceroute
+  behaviour.
+- **TCP SYN probes** reach destinations behind firewalls that drop ICMP and
+  UDP. The destination's SYN-ACK or RST counts as `reply` (so does an ICMP
+  port unreachable from the destination itself, i.e. a REJECT rule). The
+  kernel resets the half-open connection; no connection is ever established.
 - **One shared listener per address family**, replies matched to probes by
   parsing the original packet quoted inside ICMP errors. No goroutine per
   probe.
@@ -135,6 +141,11 @@ next to a running agent.
 - **NAT** in front of the agent usually rewrites and restores the probe
   headers transparently; a NAT that does not restore the quoted header breaks
   reply matching (every hop beyond it shows `no-reply`).
+- **TCP "reply" may come from a middlebox.** Transparent proxies, SYN proxies
+  and some load balancers answer the SYN with the destination's address, so a
+  TCP trace can "reach" the target hops early (seen on the first test: port
+  443 answered at TTL 2 behind a proxy). Compare with an ICMP or UDP trace to
+  the same target when TCP distances look short.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
   probing the same target with the same `flow_id` can occasionally pick up
   each other's replies. Use a different `flow_id` for side-by-side runs.
@@ -161,7 +172,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `timeout` | `1s` | `--timeout` | Per-probe timeout; must be shorter than the interval |
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
-| `protocol` | `icmp` | `--protocol` | Default protocol: `icmp` or `udp` (`tcp` is planned) |
+| `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
 | `paris` | `true` | `--paris` | Flow-stable probing |
 | `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
@@ -172,7 +183,8 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `spool.max_bytes` | `1GiB` | | Stored (compressed) record bytes kept |
 
 **Targets** (`targets:` list): `host` (name or address, required), and
-overrides `protocol`, `port` (UDP destination, default 33434), `af` (`4` or
+overrides `protocol`, `port` (destination port: default 33434 for UDP, 443
+for TCP), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
 arguments), `flow_id` (default 33434), `paris`, `adaptive_max_ttl`,
 `interval`, `timeout`, `max_ttl`, `probe_past`.

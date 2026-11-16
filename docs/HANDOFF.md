@@ -272,7 +272,7 @@ for HTTP, logging, and everything else. Ask before adding anything else.
 - [x] `internal/record`: types, `path_hash`, loop detection, trimming;
       table-driven tests
 - [x] `internal/probe`: interface + fake; ICMP v4/v6 raw implementation with
-      reply demux; UDP; paris mode (TCP SYN deferred to M2; IPv6 raw sockets run
+      reply demux; UDP; paris mode (TCP SYN added after review, see §10; IPv6 raw sockets run
       in the CI `rawsock` job only, as the development container had no IPv6)
 - [x] `internal/agent`: per-target scheduler, stagger, DNS refresh, overrun
       handling
@@ -399,6 +399,17 @@ added in the commit that introduced it.
 - **Destination answering for UDP** = ICMP port unreachable from the target
   address. Unreachable from any other address, or with another code, is
   `unreachable`.
+- **TCP SYN probing** (§4.3, done after M1 review): a SYN with an MSS option
+  to `port` (default 443), source port `flow_id`. The probe id is the top 16
+  bits of the sequence number (ECMP does not hash it; ICMP errors quote it;
+  SYN-ACK/RST acknowledge seq+1). Paris keeps both ports fixed; classic mode
+  walks the source port, since the destination port is the service being
+  reached. The destination's SYN-ACK or RST is `reply`, as is an ICMP port
+  unreachable from the destination itself (an iptables REJECT). Replies arrive
+  as TCP, so each family gets a raw TCP socket on first use, with a kernel BPF
+  filter passing only ACK+SYN or ACK+RST segments; on IPv6 that socket also
+  sends the SYNs. The kernel answers the SYN-ACK with an RST, so no
+  connection is ever established.
 - **Probe ids are counted per flow** (dst, protocol, flow id) from a random
   start, so a busy agent never reuses an id within the 30s tombstone window.
   Two hopcorder *processes* on one host (e.g. `--once` next to the daemon)
