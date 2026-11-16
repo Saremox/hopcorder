@@ -32,11 +32,18 @@ DynamicUser=yes
 StateDirectory=hopcorder
 LogsDirectory=hopcorder
 ConfigurationDirectory=hopcorder
-# Secrets (an ingest token or password): the dynamic user can only read
-# world-readable files in /etc/hopcorder, so do not put them there. Keep each
-# in a root-only file and pass it as a credential, then point the config at
-# it, e.g. bearer_token_file: /run/credentials/hopcorder.service/token
+# Secrets (an ingest token or password, a client certificate's key): the
+# dynamic user can only read world-readable files, agent.yaml included, so
+# keep them out of it. Keep each in a root-only file (e.g. in a 0700
+# /etc/hopcorder/secrets), pass it as a credential and point the config at
+# /run/credentials/hopcorder.service/<name>:
+#   bearer_token_file: /run/credentials/hopcorder.service/token
+#   basic_auth: {username: ..., password_file: /run/credentials/hopcorder.service/password}
+#   tls: {cert_file: ..., key_file: /run/credentials/hopcorder.service/client.key}
+# systemd reads credentials when the unit starts: restart it after a change.
 #LoadCredential=token:/etc/hopcorder/secrets/token
+#LoadCredential=password:/etc/hopcorder/secrets/password
+#LoadCredential=client.key:/etc/hopcorder/secrets/client.key
 
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW

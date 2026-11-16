@@ -2,8 +2,8 @@ apiVersion: v2
 name: hopcorder-agent
 description: hopcorder agent - traces the routes to a set of targets every few seconds and ships every hop of every cycle to a hopcorder server
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.1.1
+appVersion: "0.1.1"
 home: https://github.com/Saremox/hopcorder
 sources:
   - https://github.com/Saremox/hopcorder

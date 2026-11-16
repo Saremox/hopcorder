@@ -44,7 +44,7 @@ changes in [`CHANGELOG.md`](CHANGELOG.md)) have static Linux binaries for
 amd64 and arm64, with the example configs and systemd units:
 
 ```bash
-curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.0/hopcorder_0.1.0_linux_amd64.tar.gz | tar -xz
+curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.1/hopcorder_0.1.1_linux_amd64.tar.gz | tar -xz
 ```
 
 Or build it; requires Linux and Go 1.27+:
@@ -69,18 +69,19 @@ the [`Dockerfile`](Dockerfile), static binaries on an empty base:
 | `ghcr.io/saremox/hopcorder-agent` | root, needs `CAP_NET_RAW` only | `--config /etc/hopcorder/agent.yaml` |
 | `ghcr.io/saremox/hopcorder-server` | uid 65532 | `--listen :8080` |
 
-Tags: `main` and `sha-<commit>`; releases (`v*` tags) also `<version>` and
-`latest`.
+Tags: releases (`v*` tags) are `<version>` (e.g. `0.1.1`), `<major>.<minor>`
+and `latest`, built without caches; `main` and `sha-<commit>` follow the
+`main` branch.
 
 ```bash
 docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET_RAW \
   -v "$PWD/agent.yaml:/etc/hopcorder/agent.yaml:ro" -v hopcorder-spool:/var/lib/hopcorder \
-  ghcr.io/saremox/hopcorder-agent:main
+  ghcr.io/saremox/hopcorder-agent:0.1.1
 ```
 
 ```bash
 docker run -d --name hopcorder-server -p 127.0.0.1:8080:8080 \
-  ghcr.io/saremox/hopcorder-server:main --listen :8080 --clickhouse-url http://clickhouse:8123 \
+  ghcr.io/saremox/hopcorder-server:0.1.1 --listen :8080 --clickhouse-url http://clickhouse:8123 \
   --allowed-hosts localhost,127.0.0.1
 ```
 
@@ -98,13 +99,13 @@ publishes them to `oci://ghcr.io/saremox/charts` (and attaches them to the
 GitHub release):
 
 ```bash
-helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.0 \
+helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
   --set config.clickhouse.url=http://clickhouse.db:8123 \
   --set clickhouse.passwordSecret.name=clickhouse-password
 ```
 
 ```bash
-helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --version 0.1.0 \
+helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --version 0.1.1 \
   --set server.url=http://hopcorder-server:8080 \
   --set 'config.targets[0].host=example.net' \
   --set 'config.targets[1].host=192.0.2.10' --set 'config.targets[1].protocol=tcp'
@@ -121,10 +122,17 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   with `NET_RAW`, which Pod Security `baseline` does not allow: give the
   agent a namespace of its own at the `privileged` level. Credentials for the
   ingress come from Secrets (`server.bearerTokenSecret`, `server.basicAuth`,
-  `server.tls` for a CA and client certificate); inline ones are refused.
+  `server.tls` for a CA and client certificate). Inline ones would land in a
+  ConfigMap, which the built-in `view` role can read, so the charts refuse
+  them: in the agent's `config`, headers such as `Authorization`, `Cookie` or
+  `X-Api-Key` included; in the server's, `clickhouse.password`
+  (`clickhouse.passwordSecret` instead).
 - **Inside the cluster** the server's Service is reachable around the
-  ingress's authentication: `networkPolicy.enabled=true` limits it to the
-  agents and whatever you list.
+  ingress's authentication: `networkPolicy.enabled=true` with
+  `networkPolicy.from` (required then) limits it to the peers you list.
+  Select them by namespace (`kubernetes.io/metadata.name`; the server's
+  `values.yaml` has an example), not by pod labels alone: anyone who may
+  create a pod anywhere can give it any label.
 
 Every value is documented in the charts' `values.yaml`. A chart runs the
 image of its own version; `--set image.tag=main` follows `main` instead (or
@@ -173,9 +181,10 @@ sudo systemctl enable --now hopcorder
 ```
 
 The unit runs as a dynamic user, which can only read world-readable files in
-`/etc/hopcorder`: keep secrets (an ingest token or password) out of the
-config and pass them as systemd credentials instead, as the comments in the
-unit and in `agent.example.yaml` show.
+`/etc/hopcorder`: keep secrets (an ingest token or password, a client
+certificate's key) out of the config and its directory, and pass them as
+systemd credentials (`LoadCredential=`) instead, as the comments in the unit
+and in `agent.example.yaml` show.
 
 ## How it works
 
@@ -563,14 +572,19 @@ Run as root (or with `CAP_SYS_ADMIN`) and with iproute2 installed, they also
 build a four-namespace routed topology to check real TTL expiry and a real
 routing loop.
 
-Server tests against a real ClickHouse live behind the `clickhouse` build tag:
+Server tests against a real ClickHouse live behind the `clickhouse` build tag.
+Give the test ClickHouse a password even on localhost: any web page open in
+your browser can send SQL to `127.0.0.1:8123`, and ClickHouse lets it read the
+answer.
 
 ```bash
-docker run -d -p 127.0.0.1:8123:8123 -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
+export HOPCORDER_CLICKHOUSE_PASSWORD=$(openssl rand -hex 16)
+docker run -d --name hopcorder-clickhouse -p 127.0.0.1:8123:8123 \
+  -e CLICKHOUSE_PASSWORD="$HOPCORDER_CLICKHOUSE_PASSWORD" clickhouse/clickhouse-server:25.8
 ```
 
 ```bash
-HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123 go test -tags clickhouse ./internal/server/... ./cmd/hopcorder/...
+make clickhouse   # HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123, _USER=default, _PASSWORD from the environment
 ```
 
 They include every dashboard query, expanded the way Grafana and the plugin
@@ -605,10 +619,17 @@ release notes), merge it, then tag `main` and push the tag:
 git tag -a vX.Y.Z -m "hopcorder vX.Y.Z" && git push origin vX.Y.Z
 ```
 
-The `images` workflow then pushes the images `:X.Y.Z`, `:X.Y` and `:latest`,
-pushes the charts with version X.Y.Z, and creates the GitHub release with
-the Linux binaries, the chart packages and checksums. Pull requests run all
-of it but the publishing.
+The `images` workflow first checks the tag
+([`scripts/release-verify.sh`](scripts/release-verify.sh)): `v<semver>` on a
+commit of `main` whose `ci` run succeeded (it waits for one still running),
+above the latest release, and not released before. It then builds the images
+(pushed only as `:sha-<commit>`), the Linux binaries, chart packages and
+checksums, all without caches and without write tokens. The `publish` job,
+in the `release` environment (where required reviewers approve it), checks
+again, tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as
+`vX.Y.Z-rc.1` only `:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and
+creates the GitHub release. A version is released once; to fix a release,
+release the next version. Pull requests run all of it but the publishing.
 
 ## License
 

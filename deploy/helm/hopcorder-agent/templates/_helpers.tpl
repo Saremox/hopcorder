@@ -38,9 +38,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if not .Values.server.url }}
 {{- fail "server.url: set the hopcorder server's URL" }}
 {{- end }}
+{{- if regexMatch "^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*@" .Values.server.url }}
+{{- fail "server.url: no credentials in the URL (it would land in a ConfigMap); use server.basicAuth" }}
+{{- end }}
 {{- $http := default dict (default dict .Values.config.outputs).http }}
-{{- if or $http.bearer_token $http.bearer_token_file $http.basic_auth $http.tls (hasKey (default dict $http.headers) "Authorization") }}
+{{- if or $http.bearer_token $http.bearer_token_file $http.basic_auth $http.tls }}
 {{- fail "config.outputs.http: set credentials and TLS with server.bearerTokenSecret, server.basicAuth and server.tls (from Secrets), not in config" }}
+{{- end }}
+{{- /* Headers that carry credentials, matched by name in any case: they would
+  land in the ConfigMap. Authorization, Proxy-Authorization, Cookie, and any
+  name with a part such as key, token, secret, auth or session (X-Api-Key,
+  X-Auth-Token, Private-Token, ...). */}}
+{{- range $name, $_ := (default dict $http.headers) }}
+{{- if regexMatch "(^|[-_])(authorization|cookie|api[-_]?key|key|token|secret|password|passwd|pass|auth|credentials?|session|signature)([-_]|$)" (lower $name) }}
+{{- fail (printf "config.outputs.http.headers.%s: looks like a credential; in config it would land in a ConfigMap. Use server.bearerTokenSecret, server.basicAuth or server.tls" $name) }}
+{{- end }}
 {{- end }}
 {{- $cfg := deepCopy .Values.config }}
 {{- $spool := default dict $cfg.spool }}

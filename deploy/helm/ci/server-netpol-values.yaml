@@ -1,0 +1,14 @@
+# Lint only (ci.yml, helm job): the NetworkPolicy with its peers selected by
+# namespace name, as the chart's values.yaml suggests.
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: hopcorder-agent
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: hopcorder-agent
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx

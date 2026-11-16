@@ -1,9 +1,13 @@
-# syntax=docker/dockerfile:1
 # Two images from one build: `--target agent` and `--target server` (the
 # default). Static binaries on scratch, cross-compiled for the target platform
 # (docker buildx build --platform linux/amd64,linux/arm64 ...).
-# Pinned by digest (Dependabot updates it); the tag says which Go it is.
-FROM --platform=$BUILDPLATFORM golang:1.27@sha256:fe517acaa580cc7915457080f850c37e618b3c1e750f98b58fc6429b605147a1 AS build
+#
+# No `# syntax=` line: the builder's own Dockerfile frontend is used, not an
+# image pulled by a moving tag at every build (CI pins the BuildKit image).
+# The Go image is pinned by digest (Dependabot updates it). Its tag names the
+# Go release, which must equal go.mod's toolchain line (CI checks): release
+# binaries are built with that toolchain, the images with this one.
+FROM --platform=$BUILDPLATFORM golang:1.27.4@sha256:fe517acaa580cc7915457080f850c37e618b3c1e750f98b58fc6429b605147a1 AS build
 WORKDIR /src
 COPY . .
 ARG TARGETOS TARGETARCH

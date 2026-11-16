@@ -6,15 +6,22 @@ name: images
 # - Pull requests build both images and the release assets without
 #   publishing, and without any write token.
 # - main pushes ghcr.io/saremox/hopcorder-{agent,server}:main and :sha-<commit>.
-# - A v* tag on a commit of main also pushes :<version>, :<major>.<minor> and
-#   :latest, the charts to oci://ghcr.io/saremox/charts, and creates the
-#   GitHub release with Linux binaries, the chart packages and the notes for
-#   that version from CHANGELOG.md. The chart and release jobs run in the
+# - A v* tag is checked first (scripts/release-verify.sh: v<semver>, a commit
+#   of main on which ci succeeded, above the latest release, not released
+#   before). Its images are then built without caches and pushed only as
+#   :sha-<full commit>, and the binaries and chart packages are built in a
+#   job without write tokens. Only then does the "publish" job, in the
 #   "release" environment (add required reviewers to it in the repository
-#   settings to gate releases).
+#   settings to gate releases), check again and publish: it tags those image
+#   digests :<version>, :<major>.<minor> and :latest (a pre-release only
+#   :<version>), pushes the charts to oci://ghcr.io/saremox/charts and creates
+#   the GitHub release with the notes for that version from CHANGELOG.md. It
+#   builds nothing itself.
 #
-# Third-party actions are pinned to commits (Dependabot keeps them current);
-# no job persists the checkout's credentials, and release builds use no caches.
+# Third-party actions are pinned to commits (Dependabot keeps them current),
+# and so is the BuildKit image the builds run in (by hand: Dependabot does
+# not read driver-opts); no job persists the checkout's credentials, and
+# release builds use no caches.
 
 on:
   push:
@@ -47,6 +54,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -55,18 +64,25 @@ jobs:
           push: false
           cache-from: type=gha,scope=${{ matrix.target }}
 
-  # A tag must point at a commit of main: nothing unreviewed is released.
+  # Nothing of a tag is built before this passes: see scripts/release-verify.sh.
+  # A tag pushed right after its merge waits here for ci on main to finish.
   verify-tag:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: the tag is on main
-        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: the tag may be released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/release-verify.sh --wait-for-ci "$GITHUB_REF_NAME"
 
   image:
     needs: verify-tag
@@ -81,29 +97,44 @@ jobs:
       fail-fast: false
       matrix:
         target: [agent, server]
+    # The pushed digests, for publish (one output per matrix leg).
+    outputs:
+      agent: ${{ steps.digest.outputs.agent }}
+      server: ${{ steps.digest.outputs.server }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # What `hopcorder version` prints: the tag (verify-tag checked its
+      # form), like the release binaries, or the branch.
+      - id: version
+        run: echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/saremox/hopcorder-${{ matrix.target }}
+          # main: :main and :sha-<short commit>. A tag: :sha-<full commit>
+          # only, which publish tags with the version once it has passed
+          # the release environment.
           tags: |
             type=ref,event=branch
-            type=sha
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=sha,enable=${{ github.ref_type == 'branch' }}
+            type=sha,format=long,enable=${{ github.ref_type == 'tag' }}
+          flavor: latest=false
           labels: |
             org.opencontainers.image.title=hopcorder-${{ matrix.target }}
             org.opencontainers.image.description=hopcorder ${{ matrix.target }}: a flight recorder for network paths
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: ${{ matrix.target }}
@@ -112,42 +143,22 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ steps.version.outputs.version }}
           # Releases are built from scratch, not from a cache that other runs wrote.
           cache-from: ${{ !startsWith(github.ref, 'refs/tags/') && format('type=gha,scope={0}', matrix.target) || '' }}
           cache-to: ${{ !startsWith(github.ref, 'refs/tags/') && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}
-
-  charts:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: image
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
-        with:
-          version: v3.22.1
-      - name: package and push
+      - id: digest
         env:
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REGISTRY_USER: ${{ github.actor }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
-          for chart in hopcorder-server hopcorder-agent; do
-            helm package "deploy/helm/$chart" --version "$version" --app-version "$version" -d dist
-            helm push "dist/$chart-$version.tgz" oci://ghcr.io/saremox/charts
-          done
+          TARGET: ${{ matrix.target }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "$TARGET=$DIGEST" >> "$GITHUB_OUTPUT"
 
-  # Pull requests and main: the release assets are built, nothing is published.
-  release-check:
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # The binaries, chart packages, SHA256SUMS and notes. Pull requests and
+  # main: a dry run, nothing is published. A tag: handed to publish as an
+  # artifact. No write token, no caches either way.
+  release-assets:
+    needs: verify-tag
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -156,41 +167,107 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
-        with:
-          version: v3.22.1
-      - run: scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}"
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [image, charts]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: release
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
+          go-version-file: go.mod # its toolchain line
           cache: false
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v3.22.1
       - name: build
         run: |
-          scripts/release-build.sh "${GITHUB_REF_NAME#v}"
-          if [ ! -s notes.md ]; then
-            echo "CHANGELOG.md has no section '## ${GITHUB_REF_NAME}'" >&2
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            scripts/release-build.sh "${GITHUB_REF_NAME#v}"
+            if [ ! -s notes.md ]; then
+              echo "CHANGELOG.md has no section '## ${GITHUB_REF_NAME}'" >&2
+              exit 1
+            fi
+          else
+            scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}"
           fi
-      - name: release
+      - if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: |
+            dist/
+            notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-tag, image, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    # One release at a time, so two approved tags cannot both pass the
+    # checks below before either is released.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # Again: a release of this or a higher version may have been published
+      # while this run waited for approval.
+      - name: the tag may still be released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: scripts/release-verify.sh "$GITHUB_REF_NAME"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.22.1
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: tag the images
+        env:
+          AGENT_DIGEST: ${{ needs.image.outputs.agent }}
+          SERVER_DIGEST: ${{ needs.image.outputs.server }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          tags=("$version")
+          case $version in
+          *-*) ;; # a pre-release: :<version> only
+          *) tags+=("${version%.*}" latest) ;;
+          esac
+          for target in agent server; do
+            digest=$AGENT_DIGEST
+            if [ "$target" = server ]; then digest=$SERVER_DIGEST; fi
+            if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "no image digest for $target: '$digest'" >&2
+              exit 1
+            fi
+            image=ghcr.io/saremox/hopcorder-$target
+            args=()
+            for t in "${tags[@]}"; do args+=(-t "$image:$t"); done
+            docker buildx imagetools create "${args[@]}" "$image@$digest"
+          done
+      - name: push the charts
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "$REGISTRY_TOKEN" | helm registry login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          for chart in hopcorder-server hopcorder-agent; do
+            helm push "dist/$chart-$version.tgz" oci://ghcr.io/saremox/charts
+          done
+      - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+          pre=()
+          case $GITHUB_REF_NAME in *-*) pre=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag "${pre[@]}" \
             --title "hopcorder $GITHUB_REF_NAME" --notes-file notes.md

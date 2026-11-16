@@ -24,6 +24,9 @@ import (
 // and HTTP output) against the real server code and a real ClickHouse:
 //
 //	HOPCORDER_CLICKHOUSE_URL=http://127.0.0.1:8123 go test -tags clickhouse ./cmd/hopcorder/
+//
+// HOPCORDER_CLICKHOUSE_USER and HOPCORDER_CLICKHOUSE_PASSWORD, if set, are the
+// ClickHouse credentials (see the Makefile's clickhouse target).
 func TestAgentServerClickHouse(t *testing.T) {
 	url := os.Getenv("HOPCORDER_CLICKHOUSE_URL")
 	if url == "" {
@@ -32,7 +35,8 @@ func TestAgentServerClickHouse(t *testing.T) {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
 	db := "hopcorder_e2e_" + hex.EncodeToString(b)
-	ch, err := clickhouse.New(clickhouse.Config{URL: url, Database: db})
+	user, password := os.Getenv("HOPCORDER_CLICKHOUSE_USER"), os.Getenv("HOPCORDER_CLICKHOUSE_PASSWORD")
+	ch, err := clickhouse.New(clickhouse.Config{URL: url, Database: db, User: user, Password: password})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,11 +44,11 @@ func TestAgentServerClickHouse(t *testing.T) {
 
 	scfg, err := config.ParseServer([]byte(fmt.Sprintf(`
 listen: 127.0.0.1:0
-clickhouse: {url: %q, database: %q}
+clickhouse: {url: %q, database: %q, user: %q, password: %q}
 enrich:
   rdns: {enabled: false}
   asn: {enabled: false}
-`, url, db)))
+`, url, db, user, password)))
 	if err != nil {
 		t.Fatal(err)
 	}

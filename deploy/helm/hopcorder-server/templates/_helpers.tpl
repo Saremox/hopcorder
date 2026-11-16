@@ -29,6 +29,9 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 
 {{/* The configuration file: the user's config plus what the chart owns. */}}
 {{- define "hopcorder-server.config" -}}
+{{- if (default dict .Values.config.clickhouse).password }}
+{{- fail "config.clickhouse.password: put the password in a Secret and set clickhouse.passwordSecret.name (in config it would land in a ConfigMap)" }}
+{{- end }}
 {{- $cfg := deepCopy .Values.config }}
 {{- $_ := set $cfg "listen" (printf "0.0.0.0:%d" (int .Values.service.port)) }}
 {{- $ch := default dict $cfg.clickhouse }}

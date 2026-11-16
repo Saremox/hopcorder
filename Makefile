@@ -28,12 +28,18 @@ lint:
 rawsock:
 	$(GO) test -tags rawsock -count=1 ./internal/probe/...
 
-# Server tests against a real ClickHouse, e.g.
-#   docker run -d -p 127.0.0.1:8123:8123 -e CLICKHOUSE_SKIP_USER_SETUP=1 clickhouse/clickhouse-server:25.8
-# (passwordless: keep it on 127.0.0.1)
-HOPCORDER_CLICKHOUSE_URL ?= http://127.0.0.1:8123
+# Server tests against a real ClickHouse, with a password even on 127.0.0.1:
+# any web page open in your browser can send SQL there, and ClickHouse lets
+# it read the answer (Access-Control-Allow-Origin: *). E.g.
+#   export HOPCORDER_CLICKHOUSE_PASSWORD=$(openssl rand -hex 16)
+#   docker run -d --name hopcorder-clickhouse -p 127.0.0.1:8123:8123 \
+#     -e CLICKHOUSE_PASSWORD="$HOPCORDER_CLICKHOUSE_PASSWORD" clickhouse/clickhouse-server:25.8
+#   make clickhouse
+# The tests read HOPCORDER_CLICKHOUSE_URL, _USER and _PASSWORD.
+clickhouse: export HOPCORDER_CLICKHOUSE_URL ?= http://127.0.0.1:8123
+clickhouse: export HOPCORDER_CLICKHOUSE_USER ?= default
 clickhouse:
-	HOPCORDER_CLICKHOUSE_URL=$(HOPCORDER_CLICKHOUSE_URL) $(GO) test -tags clickhouse -count=1 ./internal/server/... ./cmd/hopcorder/...
+	$(GO) test -tags clickhouse -count=1 ./internal/server/... ./cmd/hopcorder/...
 
 # The web UI (ui/). `make ui` rebuilds internal/ui/dist, which is committed
 # so that the Go build needs no Node.js; commit it with the source change.
