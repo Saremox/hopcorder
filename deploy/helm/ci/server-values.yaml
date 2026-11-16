@@ -1,0 +1,14 @@
+# Chart smoke test: images built from this commit and loaded into kind.
+image:
+  repository: hopcorder-server
+  tag: ci
+  pullPolicy: Never
+config:
+  enrich:
+    rdns:
+      enabled: false
+    asn:
+      enabled: false
+persistence:
+  enabled: true
+  size: 100Mi

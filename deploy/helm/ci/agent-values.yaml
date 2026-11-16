@@ -1,0 +1,16 @@
+image:
+  repository: hopcorder-agent
+  tag: ci
+  pullPolicy: Never
+replicas: 2
+server:
+  url: http://hopcorder-server:8080
+config:
+  interval: 2s
+  targets:
+    # A TCP SYN to the server's service: reachable from inside the cluster.
+    - host: hopcorder-server
+      protocol: tcp
+      port: 8080
+    - host: clickhouse
+      protocol: udp

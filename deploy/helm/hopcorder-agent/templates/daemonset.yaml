@@ -1,0 +1,14 @@
+{{- if eq .Values.mode "daemonset" }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hopcorder-agent.fullname" . }}
+  labels:
+    {{- include "hopcorder-agent.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hopcorder-agent.selectorLabels" . | nindent 6 }}
+  template:
+    {{- include "hopcorder-agent.podTemplate" . | nindent 4 }}
+{{- end }}
