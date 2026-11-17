@@ -119,7 +119,13 @@ The section for a version is the text of its GitHub release.
   resume by themselves once the identifier is free. Every other target is
   probed. `--once` prints the other targets' records and exits 1.
 
-<!-- round four: agent -->
+- A metrics `path` the endpoint could not serve (`/metrics x`, `/{x`,
+  `/a{b}` and the like) passed validation and then panicked the agent at
+  start, or on the reload that brought it: exit 2, and again on every
+  restart until the file was fixed. `metrics.path` now takes `/` and then
+  only `[A-Za-z0-9/._~-]` (at most 256 characters), so a reload to another
+  one keeps the running configuration, and the endpoint serves exactly that
+  path (a path ending in `/` no longer serves the paths below it).
 
 **Security: CI, release and deployment**
 

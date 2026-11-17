@@ -414,7 +414,8 @@ arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
   accepted. hopcorder does no user authentication itself: secure the server
   behind your reverse proxy (basic auth, OIDC, mTLS).
 - `metrics.listen` (`--metrics-listen`), `metrics.path` (`/metrics`):
-  Prometheus endpoint.
+  Prometheus endpoint, served at exactly that path (`/` and then
+  `[A-Za-z0-9/._~-]`, at most 256 characters; any other path answers 404).
 
 ### Metrics
 

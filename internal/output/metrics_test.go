@@ -148,6 +148,17 @@ func TestMetricsServer(t *testing.T) {
 	if code, _ := get("/metrics"); code != http.StatusNotFound {
 		t.Errorf("old path after the swap: status %d", code)
 	}
+	// The path is matched exactly, never parsed as a ServeMux pattern: this
+	// one panicked in Serve (round four), killing the agent on a reload.
+	s.Serve("/{x...}/y", NewMetrics(MetricsOptions{AgentID: "three"}))
+	if code, body := get("/%7Bx...%7D/y"); code != http.StatusOK || !strings.Contains(body, `agent_id="three"`) {
+		t.Errorf("exact path: status %d body %.200s", code, body)
+	}
+	for _, p := range []string{"/a/y", "/{x...}/y/", "/"} {
+		if code, _ := get(p); code != http.StatusNotFound {
+			t.Errorf("%s: status %d, want 404", p, code)
+		}
+	}
 	if s.Addr() != addr {
 		t.Errorf("Addr() = %s", s.Addr())
 	}

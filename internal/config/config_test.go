@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -323,5 +324,28 @@ func TestHTTPOutputSafety(t *testing.T) {
 	h.URL = "https://ingest.example"
 	if h.CleartextCredentials() {
 		t.Error("https flagged")
+	}
+}
+
+// The metrics endpoint serves exactly the configured path. One that
+// http.ServeMux could not parse as a pattern used to pass and panicked the
+// agent at start and on reload (round four), so only unreserved URL
+// characters and slashes are accepted.
+func TestMetricsPath(t *testing.T) {
+	base := "targets: [{host: example.net}]\nspool: {dir: /tmp/x}\noutputs:\n  metrics:\n    listen: 127.0.0.1:9469\n"
+	for _, p := range []string{
+		"/metrics x", "/{bad", "/a{b}", "/ ", "/x/{a}/{a}", "/{x...}/y", // the review's, each a ServeMux panic
+		"metrics", "/metrics?x=1", "/metrics#x", "/m%41", "/m\x00", "/" + strings.Repeat("m", 256),
+	} {
+		if _, err := finalize(t, base+"    path: "+strconv.Quote(p)+"\n", FinalizeOptions{}); err == nil ||
+			!strings.Contains(err.Error(), "outputs.metrics.path") {
+			t.Errorf("path %q: err = %v", p, err)
+		}
+	}
+	for _, p := range []string{"/metrics", "/", "/a/b-c_d.e~f/", "/" + strings.Repeat("m", 255)} {
+		c, err := finalize(t, base+"    path: "+strconv.Quote(p)+"\n", FinalizeOptions{})
+		if err != nil || c.Outputs.Metrics.Path != p {
+			t.Errorf("path %q: err = %v", p, err)
+		}
 	}
 }

@@ -180,10 +180,16 @@ const maxMetricsConns = 64
 // (which would make the new configuration, and going back to the old one,
 // fail to bind it, and could serve made-up metrics).
 type MetricsServer struct {
-	addr string
-	srv  *http.Server
-	done chan struct{}
-	mux  atomic.Pointer[http.ServeMux] // nil: no configuration is running
+	addr   string
+	srv    *http.Server
+	done   chan struct{}
+	served atomic.Pointer[served] // nil: no configuration is running
+}
+
+// served is what a MetricsServer serves: h at exactly path.
+type served struct {
+	path string
+	h    http.Handler
 }
 
 // ListenMetrics binds addr and serves on it. Until Serve installs metrics
@@ -214,26 +220,31 @@ func ListenMetrics(ctx context.Context, addr string, log *slog.Logger) (*Metrics
 // Addr returns the address the server was asked to listen on.
 func (s *MetricsServer) Addr() string { return s.addr }
 
-// Serve makes the server serve m's metrics at path. With m nil it answers
-// 503 instead, while no configuration is running.
+// Serve makes the server serve m's metrics at path, and 404 at any other.
+// With m nil it answers 503 instead, while no configuration is running.
+//
+// The path is compared with the request's (decoded) path as it is, never
+// parsed: as an http.ServeMux pattern, a path ServeMux could not parse
+// panicked here and killed the agent at start or on a reload.
 func (s *MetricsServer) Serve(path string, m *Metrics) {
 	if m == nil {
-		s.mux.Store(nil)
+		s.served.Store(nil)
 		return
 	}
-	mux := http.NewServeMux()
-	mux.Handle(path, m.Handler())
-	s.mux.Store(mux)
+	s.served.Store(&served{path: path, h: m.Handler()})
 }
 
 // ServeHTTP implements http.Handler.
 func (s *MetricsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mux := s.mux.Load()
-	if mux == nil {
+	cur := s.served.Load()
+	switch {
+	case cur == nil:
 		http.Error(w, "the agent is (re)starting", http.StatusServiceUnavailable)
-		return
+	case r.URL.Path != cur.path:
+		http.NotFound(w, r)
+	default:
+		cur.h.ServeHTTP(w, r)
 	}
-	mux.ServeHTTP(w, r)
 }
 
 // Close shuts the server down and returns once the listener is closed.

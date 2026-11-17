@@ -477,6 +477,84 @@ outputs: {jsonl: {path: %q}}
 	}
 }
 
+// A metrics path the endpoint cannot serve is a configuration error, so a
+// reload to one keeps the running configuration. Each of these passed
+// validation and made the reload panic in http.ServeMux.Handle (round
+// four): the agent exited with status 2, and again on every restart.
+func TestReloadRefusesBadMetricsPath(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath, out, addr := dir+"/agent.yaml", dir+"/out.jsonl", freeAddr(t)
+	write := func(path string) {
+		writeTestFile(t, cfgPath, fmt.Sprintf("agent_id: r\ninterval: 100ms\ntimeout: 50ms\nspool: {dir: %q}\n"+
+			"targets: [{host: 192.0.2.1}]\noutputs:\n  jsonl: {path: %q}\n  metrics: {listen: %q, path: %q}\n",
+			dir+"/spool", out, addr, path))
+	}
+	loaded := make(chan error, 1)
+	load := func() (*config.Config, error) {
+		c, err := config.Load(cfgPath)
+		if err == nil {
+			err = c.Finalize(config.FinalizeOptions{})
+		}
+		select {
+		case loaded <- err:
+		default:
+		}
+		return c, err
+	}
+	write("/metrics")
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() { done <- superviseDaemon(ctx, cfg, fakeNetwork(), reload, load, quiet) }()
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) >= 2 }, "records")
+
+	for _, p := range []string{"/metrics x", "/{bad", "/a{b}", "/ ", "/x/{a}/{a}", "/{x...}/y"} {
+		write(p)
+		reload <- syscall.SIGHUP
+		select {
+		case err := <-loaded:
+			if err == nil || !strings.Contains(err.Error(), "outputs.metrics.path") {
+				t.Errorf("reload to %q: %v", p, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("reload to %q: not loaded", p)
+		}
+		n := len(readRecords(t, out))
+		waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) > n }, "records after the reload to "+p)
+		running(t, done)
+	}
+	write("/m2") // a valid one is taken
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool {
+		resp, err := http.Get("http://" + addr + "/m2")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "metrics at the valid path")
+	running(t, done)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("supervisor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+}
+
 func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
 	dir := t.TempDir()
 	good := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")

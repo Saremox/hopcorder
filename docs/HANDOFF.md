@@ -2309,7 +2309,24 @@ decisions:
 
 **Agent**
 
-<!-- round four: agent -->
+- **The metrics path is compared, not parsed.** `outputs.metrics.path` was
+  only checked for its leading `/` and then registered with
+  `http.ServeMux`, which panics on a pattern it cannot parse (`/metrics x`
+  reads as a method, `/{x`, `/a{b}`, `/ `, `/x/{a}/{a}`, `/{x...}/y`). The
+  panic hit `runDaemon`'s goroutine, so a reload to such a path ended the
+  agent with status 2, and systemd's restarts failed the same way until the
+  file was fixed. Now `Finalize` accepts only `/` and then unreserved URL
+  characters and slashes (`[A-Za-z0-9/._~-]`, 256 characters in all), so
+  such a path is an ordinary configuration error (a reload keeps the
+  running configuration, a start fails with the message), and
+  `MetricsServer` compares the request's path with it instead of using a
+  ServeMux, so no value can panic it whatever reaches `Serve`.
+  - Cost: a path ending in `/` serves only itself, not the subtree ServeMux
+    gave it; `//metrics` and other unclean forms get 404, not a redirect.
+  - Tests: TestMetricsPath (the review's six paths and others refused),
+    TestMetricsServer (a path ServeMux panicked on is served exactly),
+    TestReloadRefusesBadMetricsPath (six reloads to the review's paths keep
+    the agent running; before, the first panicked the test binary).
 
 **CI, release and deployment**
 
