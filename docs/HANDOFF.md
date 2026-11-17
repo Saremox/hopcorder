@@ -3163,3 +3163,48 @@ decisions:
     whether an immutable release can be deleted and its tag name reused
     (`publish` deletes a release on a confirmed difference; if the name
     cannot be reused, that version is skipped, and the next one released).
+
+
+### Security and correctness review, round five
+
+A fifth review (the same four areas, for correctness as well as security,
+with the code added in round four first) found three high findings, all on
+the read side: Grafana's read-only ClickHouse user could still exhaust
+ClickHouse's memory through the hyperscan cache, every time window was
+shifted with a ClickHouse whose time zone is not UTC, and two targets of
+one host (dual-stack, or two ports) made one stream. Medium and lower
+findings are listed at the end, for the owner to decide on. The decisions:
+
+**Time zones**
+
+- **Every time parameter names UTC.** The columns are `DateTime64(3, 'UTC')`
+  and `clickhouse.Time` sends UTC wall-clock text, but the queries typed
+  their parameters `{from:DateTime64(3)}`, which ClickHouse parses in its
+  own server time zone. The official image runs in UTC, so compose, the
+  chart's bundled ClickHouse and CI never showed it; a ClickHouse installed
+  from packages takes the host's zone. 17 parameters were affected: the
+  read API's `from`/`to`/`last`/`oldest` (cycles, loops, path changes,
+  outages, streams, topology) and the restore's `since` and `start_ts` (the
+  round-four lookup of stored seqs already named UTC). In Europe/Berlin a
+  stream with 720 cycles in the last hour listed 1 and its 719 route
+  changes of the day 0 (review, round five); in America/New_York a
+  restored outage counted 4 of its 10 cycles. All now read
+  `DateTime64(3, 'UTC')`. Functions on the columns (`toStartOfInterval(ts,
+  …)`) use the column's zone and were right.
+  - The rule: a date or time parameter always names its zone.
+    `TestTimeParametersNameTheirZone` checks the server's query text for a
+    parameter without one (it found 17 before the fix).
+  - CI's `clickhouse` job runs its ClickHouse in America/New_York (`TZ`), so
+    the integration tests see a zone other than UTC: before the fix,
+    `TestIngestEndToEndClickHouse`, `TestTopologyClickHouse`,
+    `TestTopologyLongPathsClickHouse`, `TestReadViewsOfPlantedDataClickHouse`
+    and `TestReadBudgetClickHouse` failed there; all pass now. The `ui` and
+    `grafana` jobs keep UTC, as deployed by compose and the chart.
+
+**Grafana's ClickHouse user**
+
+<!-- round five: grafana user -->
+
+**One stream per target**
+
+<!-- round five: streams -->

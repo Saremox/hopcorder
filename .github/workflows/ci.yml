@@ -105,6 +105,9 @@ jobs:
         image: clickhouse/clickhouse-server:25.8
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
+          # Not UTC, as on a host installed from packages: the server sends
+          # times as UTC and must say so in every query (review round five).
+          TZ: America/New_York
         ports:
           - 8123:8123
         options: >-

@@ -76,7 +76,7 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 	qp.params["nodes"] = strconv.Itoa(topologyMaxNodes + 1)
 	qp.params["edges"] = strconv.Itoa(topologyMaxEdges + 1)
 
-	const window = `ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND ` + streamFilter
+	const window = `ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND ` + streamFilter
 	queries := []struct {
 		name, sql string
 		max       int

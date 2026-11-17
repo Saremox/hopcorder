@@ -747,7 +747,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 		countIf(reached) / count() AS reach_ratio, argMax(reached, ts) AS last_reached,
 		argMax(path_len, ts) AS last_path_len, argMax(target_ip, ts) AS last_target_ip,
 		argMax(path_hash, ts) AS last_path_hash
-		FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
+		FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND `+streamFilter+`
 		GROUP BY agent_id, target, protocol, flow_id ORDER BY agent_id, target, protocol, flow_id
 		LIMIT {limit:UInt32}
 		SETTINGS max_rows_to_group_by = `+strconv.Itoa(groups)+`, group_by_overflow_mode = 'any'`, qp, nil)
@@ -829,7 +829,7 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	// sort: a first query finds the times of the cycles to return, so that
 	// the sort gets only those. 1000 of 10,000 maximal cycles took 765 MiB
 	// (round four); now 52 MiB, 82 MiB without a protocol.
-	const window = `FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)}
+	const window = `FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')}
 		AND agent_id = {agent:String} AND target = {target:String}`
 	stream, cut := ` AND protocol = {protocol:String}`, ""
 	if qp.params["protocol"] == "" {
@@ -840,9 +840,9 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		qp.params["limit"], qp.params["last"] = strconv.Itoa(n), last
-		stream, cut = "", ` AND ts >= {last:DateTime64(3)}`
+		stream, cut = "", ` AND ts >= {last:DateTime64(3, 'UTC')}`
 		if order == "ASC" {
-			cut = ` AND ts <= {last:DateTime64(3)}`
+			cut = ` AND ts <= {last:DateTime64(3, 'UTC')}`
 		}
 	}
 	s.runQuery(w, r, `SELECT agent_id, seq, ts, target, target_ip, af, protocol, flow_id, reached, path_len,
@@ -895,7 +895,7 @@ func (s *Server) handlePathChanges(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
 		return
 	}
-	const from = `FROM path_changes FINAL WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND ` + streamFilter
+	const from = `FROM path_changes FINAL WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND ` + streamFilter
 	n, oldest, err := s.rowsThatFit(r.Context(), `SELECT ts, `+pathChangeBytes+` AS bytes `+from+`
 		ORDER BY ts DESC LIMIT {limit:UInt32}
 		SETTINGS query_plan_execute_functions_after_sorting = 0`, qp.params)
@@ -906,7 +906,7 @@ func (s *Server) handlePathChanges(w http.ResponseWriter, r *http.Request) {
 	qp.params["limit"], qp.params["oldest"] = strconv.Itoa(n), oldest
 	s.runQuery(w, r, `SELECT ts, agent_id, target, protocol, flow_id, seq, reason, ttls, from_ips, to_ips,
 		prev_seq, prev_path_hash, path_hash, prev_path_len, path_len
-		`+from+` AND ts >= {oldest:DateTime64(3)}
+		`+from+` AND ts >= {oldest:DateTime64(3, 'UTC')}
 		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, nil)
 }
 
@@ -950,7 +950,7 @@ func (s *Server) handleLoops(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.runQuery(w, r, `SELECT ts, agent_id, target, protocol, flow_id, seq, loop_ip, ttls
-		FROM loop_events WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
+		FROM loop_events WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND `+streamFilter+`
 		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, nil)
 }
 
@@ -965,7 +965,7 @@ func (s *Server) handleOutages(w http.ResponseWriter, r *http.Request) {
 	s.runQuery(w, r, `SELECT agent_id, target, protocol, flow_id, start_seq, start_ts, end_seq, end_ts,
 		if(end_ts IS NULL, NULL, dateDiff('millisecond', start_ts, assumeNotNull(end_ts))) AS duration_ms,
 		cycles, last_hop_ttl, last_hop_ip
-		FROM outages FINAL WHERE start_ts < {to:DateTime64(3)}
-		AND (end_ts IS NULL OR end_ts >= {from:DateTime64(3)}) AND `+streamFilter+`
+		FROM outages FINAL WHERE start_ts < {to:DateTime64(3, 'UTC')}
+		AND (end_ts IS NULL OR end_ts >= {from:DateTime64(3, 'UTC')}) AND `+streamFilter+`
 		ORDER BY start_ts DESC LIMIT {limit:UInt32}`, qp, nil)
 }

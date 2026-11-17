@@ -15,6 +15,22 @@ The section for a version is the text of its GitHub release.
 
 - UI: a click on the timeline while it reloads no longer throws.
 
+**Fixed (review round five)**
+
+- With a ClickHouse whose time zone is not UTC (a host installed from
+  packages takes the host's zone), every read-API and UI time window was
+  shifted by the zone's offset: the server sends times as UTC, but
+  ClickHouse read the queries' time parameters in its own zone. In
+  Europe/Berlin a stream with 720 cycles in the last hour listed 1, and the
+  day's 719 route changes showed as 0; west of UTC, restored outages
+  counted too few cycles. Every time parameter now names UTC. The official
+  ClickHouse image (compose, the chart's bundled ClickHouse) runs in UTC
+  and was not affected.
+
+<!-- round five: grafana user -->
+
+<!-- round five: streams -->
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent
