@@ -36,7 +36,7 @@ var ne = binary.NativeEndian
 
 // boltMeta is the part of a meta page the check uses.
 type boltMeta struct {
-	root, freelist, hwm, txid uint64
+	pageSize, root, freelist, hwm, txid uint64
 }
 
 // checkPages verifies the page structure of the bbolt file at path, with
@@ -49,8 +49,9 @@ type boltMeta struct {
 // check returns an error for any of these and costs one read of each page's
 // header and element array:
 //
-//   - the meta page bbolt uses (the valid one with the higher txid): the
-//     high water mark within the file, root and freelist below it;
+//   - the meta page bbolt uses, chosen as bbolt chooses it (see meta): the
+//     page size ps, the high water mark within the file, root and freelist
+//     below it;
 //   - every page reachable from the root, and the freelist page: its id,
 //     type and overflow within the high water mark, and no page reached
 //     twice (which also rules out cycles), counted, or freed;
@@ -128,8 +129,15 @@ func (c *pageCheck) run() error {
 	return nil
 }
 
-// meta returns the meta page bbolt uses: the one with the higher txid if it
-// is valid, else the other.
+// meta returns the meta page bbolt uses, chosen exactly as bbolt's DB.meta
+// chooses it: the one with the higher txid (page 0 on a tie) if it is
+// valid, else the other, where valid means only magic, version and
+// checksum (common.Meta.Validate). What else the check needs of that page,
+// its page size, is required of it afterwards, and the file refused if it
+// differs. Passing it over for the other meta page instead, as this did
+// until round four, checked a tree bbolt does not use: a crafted meta with
+// the higher txid and another page size took bbolt to a tree nothing had
+// checked.
 func (c *pageCheck) meta() (boltMeta, error) {
 	var ms [2]boltMeta
 	var errs [2]error
@@ -140,34 +148,41 @@ func (c *pageCheck) meta() (boltMeta, error) {
 	if ms[1].txid > ms[0].txid {
 		a, b = 1, 0
 	}
-	switch {
-	case errs[a] == nil:
-		return ms[a], nil
-	case errs[b] == nil:
-		return ms[b], nil
+	if errs[a] != nil {
+		a = b
 	}
-	return boltMeta{}, fmt.Errorf("no valid meta page: %w", errors.Join(errs[0], errs[1]))
+	if errs[a] != nil {
+		return boltMeta{}, fmt.Errorf("no valid meta page: %w", errors.Join(errs[0], errs[1]))
+	}
+	if m := ms[a]; m.pageSize != c.ps {
+		return boltMeta{}, fmt.Errorf("meta page %d, the one bbolt uses: page size %d, not the file's %d", a, m.pageSize, c.ps)
+	}
+	return ms[a], nil
 }
 
+// readMeta reads meta page id and checks it as bbolt does. The fields are
+// returned even if it is invalid: bbolt orders the pages by txid first.
 func (c *pageCheck) readMeta(id uint64) (boltMeta, error) {
 	b, err := c.read(id*c.ps, pageHeaderSize+64)
 	if err != nil {
 		return boltMeta{}, err
 	}
 	m := b[pageHeaderSize:]
+	meta := boltMeta{
+		pageSize: uint64(ne.Uint32(m[8:])), root: ne.Uint64(m[16:]), freelist: ne.Uint64(m[32:]),
+		hwm: ne.Uint64(m[40:]), txid: ne.Uint64(m[48:]),
+	}
 	h := fnv.New64a()
 	_, _ = h.Write(m[:56])
 	switch {
 	case ne.Uint32(m[0:]) != boltMagic:
-		return boltMeta{}, fmt.Errorf("meta page %d: bad magic", id)
+		return meta, fmt.Errorf("meta page %d: bad magic", id)
 	case ne.Uint32(m[4:]) != boltVersion:
-		return boltMeta{}, fmt.Errorf("meta page %d: version %d", id, ne.Uint32(m[4:]))
+		return meta, fmt.Errorf("meta page %d: version %d", id, ne.Uint32(m[4:]))
 	case ne.Uint64(m[56:]) != h.Sum64():
-		return boltMeta{}, fmt.Errorf("meta page %d: bad checksum", id)
-	case uint64(ne.Uint32(m[8:])) != c.ps:
-		return boltMeta{}, fmt.Errorf("meta page %d: page size %d, not %d", id, ne.Uint32(m[8:]), c.ps)
+		return meta, fmt.Errorf("meta page %d: bad checksum", id)
 	}
-	return boltMeta{root: ne.Uint64(m[16:]), freelist: ne.Uint64(m[32:]), hwm: ne.Uint64(m[40:]), txid: ne.Uint64(m[48:])}, nil
+	return meta, nil
 }
 
 // span reads the header of page id, checks its id, type and extent (marking

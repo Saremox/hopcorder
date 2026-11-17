@@ -2026,7 +2026,10 @@ high-severity issue. Four fixes followed. The decisions:
   - `checkPages` reads the file (`ReadAt`, not the mapping) under a shared
     lock (a read-only bbolt open, which reads only the meta pages and still
     gives `ErrLocked` while an agent has the file) and checks: the meta page
-    bbolt will use (the valid one with the higher txid, as bbolt picks it)
+    bbolt will use (the valid one with the higher txid, as bbolt picks it;
+    corrected in round four: "valid" meant more here than to bbolt, which
+    checks only magic, version and checksum, so a crafted meta took bbolt
+    to a tree nothing had checked)
     with the high water mark within the file; every page reachable from the
     root and the freelist page for id, type, overflow within the high water
     mark, and no page reached twice (so no cycles) or reachable and free;
@@ -2409,6 +2412,29 @@ decisions:
     four daemon tests hang (the reload never completes, the supervisor
     does not stop), and the two JSONL tests fail (the write ignores its
     context; "sync: invalid argument").
+- **`checkPages` picks the meta page exactly as bbolt does.** It refused a
+  meta page whose page size differed from the file's and fell back to the
+  other one, while bbolt (`DB.meta`, v1.5.0) validates only magic, version
+  and checksum and uses the one with the higher txid. A crafted file (the
+  older meta rewritten with txid + 1, twice the page size and a valid
+  checksum, rooted at a free page) passed: `checkPages` checked the honest
+  tree, bbolt used the crafted one, and `tx.Check` ran on it unguarded in
+  its own goroutine. The review's three files faulted ("fatal error:
+  fault") or descended for ever (the heap past 512 MiB, the real binary at
+  1.66 GB in 6 s) on every start, and were never quarantined. Random damage
+  cannot do this (the checksum covers the page size); it takes write access
+  to the spool file (the agent's user, root, a pod sharing the hostPath).
+  Now `meta` orders the pages by txid and validates them as bbolt does,
+  then requires the page size of the one it chose to be the file's: a file
+  whose meta bbolt would use fails the check, and is quarantined, instead
+  of being checked by the other meta. The page size the check is given is
+  bbolt's (`Info().PageSize` of the read-only open, which takes it from
+  page 0 when that meta is valid), so the two now read the same pages.
+  - Tests: TestCraftedMetaIsQuarantined (the review's three files, built
+    from `buildSpool` with meta page 0 the newer: `checkPages` refuses
+    each, and two starts in the child process quarantine it; before,
+    `checkPages` accepted all three, and two of them crashed the child, by
+    a fault and by the heap bound).
 
 **CI, release and deployment**
 

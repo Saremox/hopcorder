@@ -145,6 +145,12 @@ The section for a version is the text of its GitHub release.
   The metrics endpoint answers 503 from the moment probing stops. JSONL to
   a FIFO or pipe also works now: every batch failed at its fsync after it
   was written, and was written again on every retry.
+- A spool file crafted to get past the page check (a meta page with a
+  higher txid and another page size, which the check passed over for the
+  other one, while bbolt used it) crashed or hung the agent on every start.
+  The check now picks the meta page as bbolt does and quarantines such a
+  file. It takes write access to the spool file; random damage cannot do
+  this.
 
 **Security: CI, release and deployment**
 
