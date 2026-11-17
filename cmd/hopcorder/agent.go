@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -209,10 +210,11 @@ func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Probe
 }
 
 // supervisor owns what superviseDaemon keeps across configurations besides
-// the prober: the metrics listener.
+// the prober: the metrics listener, and the flows the prober holds.
 type supervisor struct {
 	prober  probe.Prober
 	metrics *output.MetricsServer // bound for the running configuration; nil: it has no metrics
+	flows   []probe.Flow          // held for the configuration that started last
 }
 
 // daemonRun is a started runDaemon.
@@ -231,8 +233,14 @@ func (r *daemonRun) stop() error {
 // it cannot start. cfg's metrics address is bound unless the running
 // configuration's listener has it; a new one is bound before the old one is
 // released, which happens only once cfg runs, so the port is never free
-// and going back to the previous configuration finds its listener.
+// and going back to the previous configuration finds its listener. The
+// flows are handled the same way: cfg's are held besides those of the
+// configuration that started last, which are released once cfg runs, so a
+// local process never finds the identifiers the agent may go back to free.
 func (s *supervisor) start(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*daemonRun, error) {
+	flows := flowsOf(agentTargets(cfg))
+	held := unionFlows(s.flows, flows)
+	holdFlows(s.prober, held, logger)
 	var ms *output.MetricsServer
 	if mc := cfg.Outputs.Metrics; mc != nil {
 		if s.metrics != nil && s.metrics.Addr() == mc.Listen {
@@ -248,7 +256,8 @@ func (s *supervisor) start(ctx context.Context, cfg *config.Config, logger *slog
 	r := &daemonRun{cancel: cancel, done: make(chan error, 1)}
 	started := make(chan struct{})
 	go func() {
-		r.done <- runDaemon(runCtx, cfg, s.prober, logger, daemonEnv{metrics: ms, started: func() { close(started) }})
+		r.done <- runDaemon(runCtx, cfg, s.prober, logger,
+			daemonEnv{metrics: ms, flowsHeld: true, started: func() { close(started) }})
 	}()
 	select {
 	case <-started:
@@ -266,6 +275,12 @@ func (s *supervisor) start(ctx context.Context, cfg *config.Config, logger *slog
 		s.metrics.Close()
 	}
 	s.metrics = ms
+	if len(held) != len(flows) {
+		// Release the previous configuration's own flows. Those still
+		// in use by another process are logged, again, by the targets.
+		holdFlows(s.prober, flows, nil)
+	}
+	s.flows = flows
 	return r, nil
 }
 
@@ -378,23 +393,40 @@ func agentTargets(cfg *config.Config) []agent.Target {
 	return out
 }
 
-// holdFlows makes the prober hold the local identifiers of the targets'
-// flows (see probe.FlowHolder), releasing those of earlier configurations.
-// An identifier it cannot hold (another process has it) stops only the
-// targets of that flow: the prober refuses their cycles, and retries the
-// identifier on each, while every other target is probed. That is logged
-// here, and then per target by the agent (and counted in
-// hopcorder_flow_in_use).
-func holdFlows(prober probe.Prober, targets []agent.Target, logger *slog.Logger) {
+// flowsOf returns the distinct flows of targets, in order.
+func flowsOf(targets []agent.Target) []probe.Flow {
+	var flows []probe.Flow
+	for _, t := range targets {
+		if f := (probe.Flow{Protocol: t.Protocol, ID: t.FlowID}); !slices.Contains(flows, f) {
+			flows = append(flows, f)
+		}
+	}
+	return flows
+}
+
+// unionFlows returns a's flows and then those of b that a lacks.
+func unionFlows(a, b []probe.Flow) []probe.Flow {
+	out := slices.Clone(a)
+	for _, f := range b {
+		if !slices.Contains(out, f) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// holdFlows makes the prober hold the local identifiers of flows (see
+// probe.FlowHolder), releasing every other. An identifier it cannot hold
+// (another process has it) stops only the targets of that flow: the prober
+// refuses their cycles, and retries the identifier on each, while every
+// other target is probed. That is logged here unless logger is nil, and
+// then per target by the agent (and counted in hopcorder_flow_in_use).
+func holdFlows(prober probe.Prober, flows []probe.Flow, logger *slog.Logger) {
 	h, ok := prober.(probe.FlowHolder)
 	if !ok {
 		return
 	}
-	flows := make([]probe.Flow, len(targets))
-	for i, t := range targets {
-		flows[i] = probe.Flow{Protocol: t.Protocol, ID: t.FlowID}
-	}
-	if err := h.HoldFlows(flows); err != nil {
+	if err := h.HoldFlows(flows); err != nil && logger != nil {
 		logger.Error("cannot hold the identifier of some flows: their targets are not probed until it is free "+
 			"(retried every cycle; set another with --flow-id or flow_id in the config)", "err", err)
 	}
@@ -405,7 +437,7 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 	// cannot be probed: the others' records are printed, and the exit
 	// status is 1.
 	targets := agentTargets(cfg)
-	holdFlows(prober, targets, logger)
+	holdFlows(prober, flowsOf(targets), logger)
 	a, err := agent.New(agent.Options{
 		AgentID: cfg.AgentID, Targets: targets, DNSTTL: cfg.DNSTTL.D(),
 		Prober: prober, Logger: logger,
@@ -440,6 +472,9 @@ type daemonEnv struct {
 	// serves its metrics on (and 503 once it stops) but never closes. If
 	// nil, runDaemon binds the address itself, for as long as it runs.
 	metrics *output.MetricsServer
+	// flowsHeld says the supervisor holds cfg's flows (see
+	// supervisor.start); if false, runDaemon holds them itself.
+	flowsHeld bool
 	// started, if set, is called once the daemon runs.
 	started func()
 }
@@ -449,7 +484,9 @@ type daemonEnv struct {
 func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger, env daemonEnv) error {
 	// A flow another process holds stops only its own targets.
 	targets := agentTargets(cfg)
-	holdFlows(prober, targets, logger)
+	if !env.flowsHeld {
+		holdFlows(prober, flowsOf(targets), logger)
+	}
 	var outs []output.Output
 	var drainOpts []output.DrainOptions
 	defer func() {

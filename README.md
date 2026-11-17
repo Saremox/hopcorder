@@ -453,9 +453,10 @@ hop addresses.
   error is logged and the running configuration stays. Otherwise the agent
   restarts in-process with it (raw sockets stay open, seq continues, and so
   does the metrics listener while its address is unchanged; a new address is
-  bound before the old one is released). If the new configuration cannot
-  start, for example because its new metrics address is taken, the previous
-  one is started again; if that fails too, it is retried (from 1 s, doubling
+  bound before the old one is released, and the ICMP echo identifiers of
+  both configurations are held until the new one runs). If the new
+  configuration cannot start, for example because its new metrics address
+  is taken, the previous one is started again; if that fails too, it is retried (from 1 s, doubling
   to a minute) until it starts or another reload brings one that does, with
   errors in the log and the metrics endpoint answering 503 meanwhile. A
   reload never stops the agent. Moving the endpoint to another address with

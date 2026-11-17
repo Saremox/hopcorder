@@ -126,6 +126,14 @@ The section for a version is the text of its GitHub release.
   only `[A-Za-z0-9/._~-]` (at most 256 characters), so a reload to another
   one keeps the running configuration, and the endpoint serves exactly that
   path (a path ending in `/` no longer serves the paths below it).
+- A reload that fails and is reverted no longer frees the ICMP echo
+  identifier to a local user. The new configuration released the running
+  one's identifiers before it had started, so when it then failed (a JSONL
+  directory missing, a TLS file unreadable, the spool locked), a process
+  polling `bind()` took the old identifier, and the reverted
+  configuration's ICMP targets were not probed until it let go. Both
+  configurations' identifiers are now held while the new one starts, and
+  the old ones released once it runs.
 
 **Security: CI, release and deployment**
 

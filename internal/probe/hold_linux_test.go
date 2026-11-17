@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -258,6 +259,26 @@ func TestInnerHoldFlows(t *testing.T) {
 		t.Errorf("UDP port of a held flow: %v", err)
 	} else {
 		_ = c.Close()
+	}
+	// A reload holds the new configuration's flows besides the running
+	// one's (the daemon's supervisor), so the running one's stay held
+	// throughout the start, and only the next HoldFlows releases them.
+	if err := r.HoldFlows(append(slices.Clone(flows), Flow{Protocol: ICMP, ID: 4246})); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{4242, 4246} {
+		if got := u.do("bind-ping %d", id); got != fmt.Sprintf("bind-ping %d: address already in use", id) {
+			t.Errorf("identifier %d while both configurations' flows are held: %q", id, got)
+		}
+	}
+	if err := r.HoldFlows([]Flow{{Protocol: ICMP, ID: 4246}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := u.do("bind-ping 4242"); got != "bind-ping 4242: <nil>" {
+		t.Errorf("the previous configuration's identifier once the new one runs: %q", got)
+	}
+	if got := u.do("bind-ping 4246"); got != "bind-ping 4246: address already in use" {
+		t.Errorf("the new configuration's identifier: %q", got)
 	}
 	// Releasing a flow frees its identifier; Close frees the rest.
 	if err := r.HoldFlows(nil); err != nil {

@@ -1482,7 +1482,9 @@ decisions:
   development container has no IPv6), and the netns test checks that an
   IPv6 ping socket cannot take an identifier held over IPv4.
   - The daemon does this first, at every start and reload, and `--once`
-    does too (`probe.FlowHolder`, `Raw.HoldFlows`).
+    does too (`probe.FlowHolder`, `Raw.HoldFlows`). (Round four: during a
+    reload the supervisor holds both configurations' flows, and releases
+    the old ones once the new configuration runs.)
   - An identifier held by another process fails the start with
     `ErrFlowInUse` and a hint to use `--flow-id`. A failed reload reverts
     as before. This replaces the "two hopcorder processes" caveat for
@@ -1994,6 +1996,10 @@ high-severity issue. Four fixes followed. The decisions:
     identifier, its ping socket sees our echo replies and errors (with
     their nonces) and can send echoes with our identifier, and a second
     hopcorder on the flow is a misconfiguration to show, not to hide.
+  - (Round four: a reload that failed and was reverted had freed the
+    running configuration's identifier while the new one started, so a
+    local process could take it then too; both configurations' flows are
+    now held until the new one runs.)
   - Tests: TestDaemonFlowInUseStopsOnlyItsTargets (fake prober,
     `Fake.SetHoldErr` per flow: the TCP and UDP targets are recorded, the
     ICMP one not, the gauge is 1, and after the identifier frees the ICMP
@@ -2327,6 +2333,31 @@ decisions:
     TestMetricsServer (a path ServeMux panicked on is served exactly),
     TestReloadRefusesBadMetricsPath (six reloads to the review's paths keep
     the agent running; before, the first panicked the test binary).
+- **A reload holds both configurations' flows until the new one runs.**
+  `runDaemon` called `HoldFlows` with the new configuration's flows first,
+  which released the running one's echo identifiers before anything else
+  of the new configuration had started. When the start then failed (the
+  JSONL file, TLS or secret files, the spool lock with its 1 s timeout,
+  `agent.New`), the supervisor reverted, but the old identifier had been
+  free meanwhile: the review's three uid 65534 squatters won it at the
+  first try, and the reverted configuration's ICMP targets were refused
+  (`hopcorder_flow_in_use` 1) until they let go. That is the denial round
+  three accepted only before the first start. Now the supervisor owns the
+  holds, as it owns the metrics listener: `supervisor.start` holds the
+  flows of the configuration that started last together with the new
+  one's, and releases the old ones (`HoldFlows` with the new flows alone)
+  only once the new configuration runs. A failed start leaves both held;
+  the revert's start holds the old flows alone again, which releases the
+  failed configuration's. `runDaemon` holds flows itself only without a
+  supervisor (`daemonEnv.flowsHeld`), and `--once` as before.
+  - Tests: TestFailedReloadKeepsTheFlowsHeld (fake prober recording every
+    `HoldFlows`: a reload to another ICMP `flow_id` with a missing JSONL
+    directory never leaves the running flow out, the revert ends with it
+    alone, and a reload that starts holds both until it runs, then the new
+    one alone; before, the failing start held only its own flow).
+    TestInnerHoldFlows (rawsock) checks what this rests on: a uid 65534
+    process can bind neither identifier while both are held, and gets the
+    old one once only the new one is.
 
 **CI, release and deployment**
 
