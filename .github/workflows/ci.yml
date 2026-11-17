@@ -227,6 +227,10 @@ jobs:
         run: |
           helm lint --strict deploy/helm/hopcorder-server
           helm lint --strict deploy/helm/hopcorder-server -f deploy/helm/ci/server-netpol-values.yaml
+          helm lint --strict deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml
+          helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml \
+            --set clickhouse.passwordSecret.name=ch \
+            --set clickhouse.deploy.readOnlyUser.passwordSecret.name=ro >/dev/null
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml
           helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
@@ -249,6 +253,10 @@ jobs:
           done
           refused deploy/helm/hopcorder-server --set config.clickhouse.password=x
           refused deploy/helm/hopcorder-server --set networkPolicy.enabled=true
+          # Names that go into the bundled ClickHouse's XML configuration.
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.user=a-b
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'clickhouse.deploy.readOnlyUser.name=x</y'
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'config.clickhouse.database=x;y'
       - name: build images
         run: |
           docker build --target server -t hopcorder-server:ci .
@@ -264,4 +272,5 @@ jobs:
           kubectl get pods -A -o wide
           kubectl describe pods
           kubectl logs -l app.kubernetes.io/instance=hopcorder-server --tail=100
+          kubectl logs -l app.kubernetes.io/component=hopcorder-clickhouse --tail=50
           kubectl logs -l app.kubernetes.io/name=hopcorder-agent --tail=50 --prefix

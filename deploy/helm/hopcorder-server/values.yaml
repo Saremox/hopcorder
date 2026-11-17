@@ -1,4 +1,5 @@
-# hopcorder server. Needs a ClickHouse reachable over its HTTP interface;
+# hopcorder server. Needs a ClickHouse reachable over its HTTP interface
+# (or set clickhouse.deploy.enabled for a single ClickHouse pod next to it);
 # the server creates its database and applies migrations on startup.
 
 image:
@@ -10,8 +11,9 @@ nameOverride: ""
 fullnameOverride: ""
 
 # The server's configuration file (see deploy/server.example.yaml for every
-# key; unknown keys are rejected). The chart sets listen, the ASN cache file
-# and, with clickhouse.passwordSecret, clickhouse.password_file; it refuses
+# key; unknown keys are rejected). The chart sets listen, the ASN cache file,
+# with clickhouse.passwordSecret or clickhouse.deploy clickhouse.password_file,
+# and with clickhouse.deploy clickhouse.url and clickhouse.user; it refuses
 # clickhouse.password (it would land in a ConfigMap, readable with the
 # built-in view role).
 config:
@@ -41,10 +43,79 @@ config:
   ui: true
 
 clickhouse:
-  # The ClickHouse password from an existing Secret.
+  # The ClickHouse password from an existing Secret: for an external
+  # ClickHouse, or to choose the password of the one deployed below.
   passwordSecret:
     name: ""
     key: password
+
+  # A single ClickHouse pod for this server (opt-in), for when hopcorder is a
+  # monitoring aid rather than a production service: a StatefulSet of the
+  # official clickhouse/clickhouse-server image with a persistent volume, no
+  # operator, no replication and no backups (snapshot the volume if you want
+  # them; retention_days bounds the data). When enabled, the chart points
+  # config.clickhouse.url and user at it, and the server reads the password
+  # from clickhouse.passwordSecret or, without one, from a Secret the chart
+  # generates once (<release>-hopcorder-server-clickhouse, key password) and
+  # keeps across upgrades. For high availability use an operator or a
+  # managed ClickHouse instead and leave this off.
+  deploy:
+    enabled: false
+    image:
+      repository: clickhouse/clickhouse-server
+      tag: "25.8"             # the LTS line every test of hopcorder uses
+      pullPolicy: IfNotPresent
+    # The server's ClickHouse user; the image's passwordless "default" user
+    # is removed.
+    user: hopcorder
+    persistence:
+      size: 20Gi
+      storageClass: ""
+      accessModes: [ReadWriteOnce]
+    # Caches are sized for a small instance, and the server may use 80% of
+    # the memory limit.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        memory: 2Gi
+    # Days ClickHouse keeps its own query, metric and trace logs.
+    systemLogRetentionDays: 7
+    # A read-only user for Grafana's ClickHouse data source: SELECT on the
+    # hopcorder database only, with bounded query time, memory and
+    # concurrency (like deploy/compose/clickhouse-init.sql). Its password
+    # comes from passwordSecret or a generated Secret
+    # (<release>-hopcorder-server-clickhouse-readonly, key password).
+    readOnlyUser:
+      enabled: false
+      name: grafana
+      passwordSecret:
+        name: ""
+        key: password
+    # Only the hopcorder server may reach ClickHouse (with a CNI that
+    # enforces NetworkPolicy); add other peers here, e.g. Grafana's namespace
+    # by kubernetes.io/metadata.name.
+    networkPolicy:
+      enabled: true
+      from: []
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 101          # the image's clickhouse user
+      runAsGroup: 101
+      fsGroup: 101
+      seccompProfile:
+        type: RuntimeDefault
+    # The image writes its user file under /etc/clickhouse-server at start,
+    # so the root file system stays writable.
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
 
 # The ASN database cache. Without a volume it lives in an emptyDir and is
 # downloaded again whenever the pod is replaced (about 10 MB).

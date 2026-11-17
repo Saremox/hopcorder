@@ -12,3 +12,17 @@ config:
 persistence:
   enabled: true
   size: 100Mi
+# The chart's own single ClickHouse pod, with the read-only user.
+clickhouse:
+  deploy:
+    enabled: true
+    persistence:
+      size: 1Gi
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        memory: 1Gi
+    readOnlyUser:
+      enabled: true
