@@ -2435,6 +2435,30 @@ decisions:
     each, and two starts in the child process quarantine it; before,
     `checkPages` accepted all three, and two of them crashed the child, by
     a fault and by the heap bound).
+- **A stored record decodes to at most 8 MiB.** The spool's zstd decoder
+  had the library's default bound, 64 GiB, and `Read` decoded every record
+  whole (`DecodeAll`). A 48 KiB stored value (RLE blocks, no content size)
+  decodes to 1.5 GiB: every start went past the child's 512 MiB heap bound,
+  and the real binary was OOM-killed in a 256 MiB cgroup (the chart's
+  limit) on 3 of 3 starts. Neither bbolt nor `checkPages` can see this, so
+  the file was never quarantined, and the records after it never shipped.
+  Now `WithDecoderMaxMemory(maxRecordSize)`, 8 MiB: the largest record the
+  agent can write is about 220 KB of JSON (255 hops, each with an IPv6
+  address with zone and 16 MPLS labels, plus loops; measured), so the
+  format has room to grow more than 35 times over, and 8 MiB is also the
+  largest window any zstd encoder level declares (the spool writes
+  SpeedFastest, at most 4 MiB), which the decoder caps at the same bound,
+  so no record a spool wrote is refused. A bomb costs at most 8 MiB per
+  read of it. `ErrDecoderSizeExceeded` takes the path of every
+  undecodable record: `Read` skips it, logs its seq at error level, and
+  moves the cursor past it (it is not counted in a metric, as before).
+  - Accepted: the zstd library prints one line to stderr ("runDecoder:
+    maxDecodedSize exceeded") for each such record it refuses.
+  - Tests: TestDecompressionBombIsSkipped (the review's bomb, opened in
+    the child process twice: skipped, the other records delivered; before,
+    the heap bound on both starts) and TestRecordSizeIsBounded (a value
+    just over the bound is skipped, a 2 MiB record still decodes; before,
+    the value was delivered).
 
 **CI, release and deployment**
 

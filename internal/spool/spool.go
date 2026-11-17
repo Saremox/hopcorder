@@ -105,6 +105,18 @@ type Spool struct {
 	lastSeq atomic.Uint64
 }
 
+// maxRecordSize bounds what one stored record may decode to; a record that
+// would decode to more is undecodable, and skipped. The largest record the
+// agent can write is about 220 KB of JSON (255 hops, each with an IPv6
+// address with zone and 16 MPLS labels, and their loops), so this leaves
+// room more than 35 times over for the format to grow. It is also the
+// largest window any zstd encoder level declares (the spool's SpeedFastest
+// declares at most 4 MiB), so the decoder refuses no frame a spool wrote
+// for its window, which it may not exceed either. Without a bound the
+// decoder's default of 64 GiB applied: a 48 KiB value decoding to 1.5 GiB
+// took every start out of memory, and was no damage the checks could see.
+const maxRecordSize = 8 << 20
+
 // ErrLocked is returned by Open when another process holds the spool.
 var ErrLocked = errors.New("spool is in use by another hopcorder process")
 
@@ -123,7 +135,7 @@ func Open(o Options) (*Spool, error) {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
 	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-	dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(maxRecordSize))
 	s := &Spool{
 		opts: o, path: filepath.Join(o.Dir, fileName), enc: enc, dec: dec,
 		notify:  map[string]chan struct{}{},
@@ -623,9 +635,9 @@ func (s *Spool) read(db *bolt.DB, consumer string, maxRecords, maxBytes int) (ou
 					corrupt = append(corrupt, seq)
 					continue
 				}
-				data, err := s.dec.DecodeAll(v[8:], nil)
+				data, err := s.dec.DecodeAll(v[8:], nil) // at most maxRecordSize
 				if err != nil {
-					corrupt = append(corrupt, seq)
+					corrupt = append(corrupt, seq) // ErrDecoderSizeExceeded included
 					continue
 				}
 				if len(out) > 0 && size+len(data) > maxBytes {

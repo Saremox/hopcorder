@@ -276,6 +276,36 @@ func TestCorruptRecordIsSkipped(t *testing.T) {
 	_ = s.Close()
 }
 
+// A record decodes to at most maxRecordSize; one that would decode to more
+// (a stored value cannot get there honestly) is skipped like any
+// undecodable record. Records far larger than the agent writes still
+// decode.
+func TestRecordSizeIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, "c")
+	base := s.Stats().LastSeq
+	appendN(t, s, 3)
+	big := bytes.Repeat([]byte("x"), 2<<20) // about ten times the largest record
+	if _, err := s.Append(time.Now(), func(uint64) ([]byte, error) { return big, nil }); err != nil {
+		t.Fatal(err)
+	}
+	// Just over the bound: 65 RLE blocks of 128 KiB.
+	val := binary.BigEndian.AppendUint64(nil, uint64(time.Now().UnixNano())) //nolint:gosec // now
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketRecords).Put(seqKey(base+2), append(val, rleBomb(maxRecordSize/(128<<10)+1)...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	es, err := s.Read("c", 10, 16<<20)
+	if err != nil || fmt.Sprint(rel(base, seqsOf(es))) != "[1 3 4]" {
+		t.Fatalf("read %v, %v", rel(base, seqsOf(es)), err)
+	}
+	if !bytes.Equal(es[2].Data, big) {
+		t.Errorf("the 2 MiB record came back as %d bytes", len(es[2].Data))
+	}
+	_ = s.Close()
+}
+
 func TestNotify(t *testing.T) {
 	s := open(t, t.TempDir(), "c")
 	defer s.Close()

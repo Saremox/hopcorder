@@ -474,6 +474,69 @@ func TestCraftedMetaIsQuarantined(t *testing.T) {
 	}
 }
 
+// rleBomb is a zstd frame of n RLE blocks of 128 KiB of '{' each: 4 bytes
+// of input per 128 KiB of output, and no content size in its header.
+func rleBomb(n int) []byte {
+	b := []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38} // magic; no checksum or size; window 128 KiB
+	for i := range n {
+		h := uint32(128<<10)<<3 | 1<<1 // block size, type RLE
+		if i == n-1 {
+			h |= 1 // last block
+		}
+		b = append(b, byte(h), byte(h>>8), byte(h>>16), '{')
+	}
+	return b
+}
+
+// replaceRecord stores val as the record seq of the closed spool in dir.
+func replaceRecord(t *testing.T, dir string, seq uint64, val []byte) {
+	t.Helper()
+	db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketRecords).Put(seqKey(seq), append(binary.BigEndian.AppendUint64(nil, uint64(time.Now().UnixNano())), val...)) //nolint:gosec // now
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The review's decompression bomb (round four): a 48 KiB stored value that
+// decodes to 1.5 GiB. With the decoder's default bound (64 GiB) every start
+// took the heap past 512 MiB here, and the agent was OOM-killed in the
+// chart's 256 MiB on every start; it is not damage bbolt or the page check
+// can see, so it was never quarantined. Now it decodes to at most
+// maxRecordSize, fails, and is skipped like any undecodable record.
+func TestDecompressionBombIsSkipped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	dir := t.TempDir()
+	s := open(t, dir, "a", "b")
+	seqs := appendN(t, s, 3)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replaceRecord(t, dir, seqs[1], rleBomb(12<<10)) // 12,288 blocks: 1.5 GiB
+	b, err := os.ReadFile(filepath.Join(dir, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for start := 1; start <= 2; start++ {
+		out, _, err := runChild(t.Context(), t, b, "use")
+		if err != nil {
+			t.Fatalf("start %d: %v\n%.600s", start, err, out)
+		}
+		if !strings.Contains(out, "skipping undecodable record") {
+			t.Errorf("start %d: the bomb was not skipped\n%.600s", start, out)
+		}
+	}
+}
+
 // Damage found while the spool is in use (bbolt faults, or panics) used to
 // kill the agent. Now the operation fails, the file is moved aside at once,
 // and the spool goes on empty.

@@ -151,6 +151,10 @@ The section for a version is the text of its GitHub release.
   The check now picks the meta page as bbolt does and quarantines such a
   file. It takes write access to the spool file; random damage cannot do
   this.
+- A spooled record decodes to at most 8 MiB (the largest the agent writes
+  is about 220 KB). A 48 KiB stored value that decoded to 1.5 GiB got the
+  agent OOM-killed on every start, and was never quarantined; such a record
+  is now skipped like any undecodable one.
 
 **Security: CI, release and deployment**
 
