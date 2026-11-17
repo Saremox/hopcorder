@@ -21,8 +21,10 @@ listen: 127.0.0.1:8080
 # and ingress names (the Helm chart sets its own). List them to get the
 # check, also on a socket behind a proxy that admits clients by address
 # rather than by credentials. "*.example.net" allows the names one label
-# below example.net. "*" turns the check off. /healthz, /readyz and
-# /metrics answer every host.
+# below example.net: only for a domain whose names you alone can create, not
+# a shared one (*.github.io, a hosting or dynamic-DNS domain); "*.com" is
+# refused. "*" turns the check off. /healthz, /readyz and /metrics answer
+# every host.
 # allowed_hosts: [localhost, 127.0.0.1, "::1"]
 
 log:

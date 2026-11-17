@@ -1809,7 +1809,11 @@ high-severity issue. Four fixes followed. The decisions:
     label below the domain, as Kubernetes routes them (not `example.net`
     itself, not `a.b.example.net`). Safe for the same reason as a listed
     name: a rebinding page sends its own name, which an attacker cannot put
-    under the operator's domain.
+    under the operator's domain. (Round four: that holds only for a domain
+    whose names the operator alone can create. `*.com` allowed
+    `attacker.com`, and on a shared domain such as `github.io` anyone gets
+    names; a single label after `*.` is refused now, and the docs warn about
+    shared domains.)
   - NOTES print the list (or warn when it is `*`). Entries are checked at
     template time (host name, `*.domain` or address, no port), so a bad one
     fails the install instead of crash-looping the server.
@@ -2592,6 +2596,13 @@ decisions:
     the first row and an error; before, the cut row was passed on),
     `TestTimeouts` (queries, inserts and statements without an answer in
     time still fail).
+- **Wildcards on a top-level domain are refused.** `*.com` allowed
+  `attacker.com`: round three's argument holds only for a domain whose names
+  the operator alone can create. A single label after `*.` is refused, in
+  the config and the chart. Accepted: shared domains (`*.github.io`, hosting
+  or dynamic-DNS domains, `*.co.uk`) cannot be told apart without a public
+  suffix list; the docs warn about them. Tests: `TestHostAllowlist`, the
+  `helm` job.
 
 **Ingest and storage**
 

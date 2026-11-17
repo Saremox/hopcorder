@@ -63,9 +63,11 @@ type ServerConfig struct {
 	// Host header (any port), against DNS rebinding: a web page whose own
 	// name resolves to the server's address still sends that name.
 	// "*.example.net" allows the names one label below example.net (like an
-	// Ingress host). Empty: localhost, 127.0.0.1, ::1 and the listen host
-	// when listening on a loopback address, else no check (see
-	// HostAllowlist). "*" turns the check off.
+	// Ingress host); the domain needs two labels at least ("*.com" is
+	// refused), and must be one whose names only the operator can create
+	// (not a shared one such as github.io). Empty: localhost, 127.0.0.1,
+	// ::1 and the listen host when listening on a loopback address, else no
+	// check (see HostAllowlist). "*" turns the check off.
 	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
@@ -240,7 +242,7 @@ func (c *ServerConfig) Finalize() error {
 	}
 	for _, h := range c.AllowedHosts {
 		if !validAllowedHost(h) {
-			fail("allowed_hosts %q: want a host name (or *.domain) or IP address without port, or \"*\"", h)
+			fail("allowed_hosts %q: want a host name, *.domain (a domain of at least two labels) or IP address without port, or \"*\"", h)
 		}
 	}
 	switch c.Log.Level {
@@ -340,7 +342,14 @@ func (c *ServerConfig) HostAllowlist() []string {
 }
 
 // validAllowedHost accepts "*", an IP address (IPv6 with or without
-// brackets), a host name or "*." and a host name.
+// brackets), a host name, or "*." and a host name of at least two labels.
+// A host name has at most 253 characters (and a trailing dot), in labels
+// of 1 to 63 letters, digits, '-' and '_' that neither start nor end with
+// '-', and its last label is not all digits (that would be a malformed
+// IPv4 address). "*.com" is refused: it would allow every name under a
+// top-level domain, attackers' included. The chart's template-time check
+// (deploy/helm/hopcorder-server/templates/_helpers.tpl) must not accept
+// anything this refuses, or the server would crash-loop on its config.
 func validAllowedHost(h string) bool {
 	if h == "*" {
 		return true
@@ -348,10 +357,33 @@ func validAllowedHost(h string) bool {
 	if _, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")); err == nil {
 		return true
 	}
-	h = strings.TrimPrefix(h, "*.")
-	return h != "" && len(h) <= 253 && !strings.ContainsFunc(h, func(c rune) bool {
+	name, wildcard := strings.CutPrefix(h, "*.")
+	name = strings.TrimSuffix(name, ".")
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	labels := strings.Split(name, ".")
+	if wildcard && len(labels) < 2 {
+		return false
+	}
+	for _, l := range labels {
+		if !validLabel(l) {
+			return false
+		}
+	}
+	last := labels[len(labels)-1]
+	return strings.ContainsFunc(last, func(c rune) bool { return c < '0' || c > '9' })
+}
+
+// validLabel reports whether l is a host name label: 1 to 63 letters,
+// digits, '-' and '_', not starting or ending with '-'.
+func validLabel(l string) bool {
+	if l == "" || len(l) > 63 || l[0] == '-' || l[len(l)-1] == '-' {
+		return false
+	}
+	return !strings.ContainsFunc(l, func(c rune) bool {
 		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
-		return !alnum && c != '.' && c != '-' && c != '_'
+		return !alnum && c != '-' && c != '_'
 	})
 }
 

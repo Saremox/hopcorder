@@ -639,7 +639,11 @@ loopback address answers `localhost`, `127.0.0.1`, `::1` and its listen host;
 on any other address it checks nothing, since it is reached under service
 names, pod IPs and ingress hosts it cannot know: list them to get the check
 (the Helm chart lists its own). `*.example.net` allows the names one label
-below `example.net`, as an Ingress host of that form routes them.
+below `example.net`, as an Ingress host of that form routes them; use it only
+for a domain whose names you alone can create: not one where others get names
+too (`*.github.io`, a hosting provider's or a dynamic-DNS domain), whose
+names a rebinding page could have. A wildcard on a top-level domain
+(`*.com`) is refused.
 A reverse proxy on the same host that passes the client's `Host` on (Caddy,
 Traefik; nginx sends the upstream's by default) needs its public names in
 the list. `"*"` turns the check off; `/healthz`, `/readyz` and `/metrics`

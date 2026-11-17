@@ -160,6 +160,9 @@ The section for a version is the text of its GitHub release.
   started (the ClickHouse timeout also covered reading the result): slow
   clients get them whole. A result cut off inside a row is an error, not a
   row.
+- `allowed_hosts` refuses a wildcard on a top-level domain (`*.com` allowed
+  every `.com` name, an attacker's too). Use `*.domain` only for a domain
+  whose names only you can create, not a shared one such as `*.github.io`.
 
 **Security: agent**
 
