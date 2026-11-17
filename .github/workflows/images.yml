@@ -11,8 +11,8 @@ name: images
 #   before). Its images are then built without caches and pushed only as
 #   :sha-<full commit> (the image job may write packages, nothing else), and
 #   the binaries and chart packages are built in a job without write tokens.
-#   Only then does the "publish" job, in the "release" environment (add
-#   required reviewers to it in the repository settings), check again and
+#   Only then does the "publish" job, in the "release" environment (its
+#   required reviewers approve it), check again and
 #   publish: it attests the release files and both image digests (signed
 #   build provenance), tags those digests :<version>, :<major>.<minor> and
 #   :latest (a pre-release only :<version>), pushes the charts to
