@@ -215,18 +215,30 @@ replies must echo a random nonce in its data, ICMP errors that quote the
 probe's payload must quote that nonce (on IPv6 they must quote it), and TCP
 replies must acknowledge the SYN's exact sequence number (32 random bits).
 Mismatches are dropped and counted in
-`hopcorder_probe_mismatched_replies_total`.
+`hopcorder_probe_mismatched_replies_total`. A forgery is then a guess of at
+least 32 random bits: an ICMPv4 error that quotes 8 bytes needs the IP ID
+and the probe id, a TCP SYN-ACK or RST the sequence number (echo replies
+need 48). That is a rate, not a wall. Against a target that does not answer
+(its probes stay in flight until the timeout), a spoofer sending at 1 GbE
+line rate, about 1.4 million packets a second, plants a fake hop or a fake
+TCP `reached` about every 2 to 3 minutes if probes are always in flight,
+and about every 12 minutes at the default `timeout` (1s) and `interval`
+(5s); at 10 GbE about every 1 to 2 minutes. Each forgery that lands costs
+about 65,000 near misses first, all counted: alert on
+`hopcorder_probe_mismatched_replies_total` (see [Metrics](#metrics) for a
+rule).
 
 The agent also holds its ICMP echo identifier (`flow_id`) with an
 unprivileged "ping" socket, so no other local process can claim it. That
 needs ping sockets for the agent's group (`net.ipv4.ping_group_range`,
 which systemd opens to every group); where other groups have them but the
-agent's does not, it logs so at startup. If another process (a second hopcorder, a `ping`, any
-local user) holds the echo identifier first, the agent's ICMP targets of
-that flow are not probed: it logs an error, `hopcorder_flow_in_use` is 1 and
-their cycles count as errors. Every other target is probed, and the ICMP
-targets resume by themselves once the identifier is free (tried every
-cycle). Give every hopcorder process its own `flow_id` (`--flow-id`).
+agent's does not, it logs so at startup. If another process (a second
+hopcorder, a `ping`, any local user) holds the echo identifier first, the
+agent's ICMP targets of that flow are not probed: it logs an error,
+`hopcorder_flow_in_use` is 1 and their cycles count as errors. Every other
+target is probed, and the ICMP targets resume by themselves once the
+identifier is free (tried every cycle). Give every hopcorder process its
+own `flow_id` (`--flow-id`).
 
 ## Quick start
 
@@ -452,6 +464,31 @@ counters count both, the RTT histogram mixes them, `hopcorder_path_length`
 is the last cycle's, and `hopcorder_flow_in_use` counts those not probed.
 The agent warns at start. To tell them apart, give one an address or
 another name of the host.
+
+Forged replies (see [Privileges](#privileges-cap_net_raw-not-root)) show
+as mismatched replies long before one gets through: each takes about
+65,000 tries that match a probe's id but not the rest. This rule fires once
+600 have come within 10 minutes. A slow spoofer then has about a 1% chance
+of having planted one hop; one at line rate is caught within a scrape or
+two, about when its first one lands. Without an attack the counter grows
+only for the other reasons above (a middlebox that rewrites IP IDs, an IPv6
+router that quotes too little, another prober on the same `flow_id`), each
+of which silences hops and is worth knowing; where one is known and steady,
+set the threshold above its rate.
+
+```yaml
+groups:
+  - name: hopcorder
+    rules:
+      - alert: HopcorderMismatchedReplies
+        expr: increase(hopcorder_probe_mismatched_replies_total[10m]) > 600
+        annotations:
+          summary: >-
+            {{ $labels.agent_id }} drops replies that match a probe's id but
+            not the rest of it: forged replies, a second prober on the same
+            flow_id, or a middlebox that rewrites IP IDs (hops beyond it
+            then stay silent)
+```
 
 ## Operations
 

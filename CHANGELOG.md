@@ -160,6 +160,11 @@ The section for a version is the text of its GitHub release.
   `af`) share every per-target series, and the gauge flapped between 0 and
   1 when only one of them was refused; the agent now also warns at start
   about targets that share series.
+- Documented: the 32 random bits a forged reply must guess are a rate at
+  line rate (a fake hop about every 2 to 3 minutes at 1 GbE while probes
+  are in flight, about every 12 minutes with the defaults). README has an
+  alert rule on `hopcorder_probe_mismatched_replies_total`, which counts
+  the many near misses that come before.
 
 **Security: CI, release and deployment**
 

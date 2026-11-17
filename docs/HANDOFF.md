@@ -2459,6 +2459,27 @@ decisions:
     the heap bound on both starts) and TestRecordSizeIsBounded (a value
     just over the bound is skipped, a 2 MiB record still decodes; before,
     the value was delivered).
+- **The spoofing floor is stated, and alerting on it recommended.** Round
+  three's 32 random bits hold (the review re-ran TestRawNetns/spoof: no
+  fake hop), but at line rate they are a rate, not a wall. An ICMPv4 error
+  for an IPv4 probe that quotes 8 bytes needs the probe id and the IP ID,
+  a TCP SYN-ACK or RST the 32-bit sequence number. Measured in the review,
+  3.4·10^-4 of forgeries hit a key in flight (2.7·10^-4 for TCP), so about
+  5·10^-9 per packet get through. Against a target whose probes stay in
+  flight (one that does not answer), a spoofer at 1 GbE line rate (about
+  1.4 Mpps) plants a fake hop or a fake TCP `reached` about every 2 to 3
+  minutes with probes always in flight, about every 12 minutes at the
+  default 1 s timeout and 5 s interval, and about every 1 to 2 minutes at
+  10 GbE (the review's estimates). Echo replies need 48 bits, ICMPv4
+  errors that quote the payload 64.
+  - Not changed: the TCP timestamp option would give SYN-ACKs 32 more bits,
+    but only for TCP, and only where the destination and every middlebox
+    keep the option.
+  - Every accepted forgery is preceded by about 65,536 near misses, which
+    `hopcorder_probe_mismatched_replies_total` counts. README gives a rule
+    (`increase(...[10m]) > 600`): a slow spoofer has about a 1% chance of
+    one forged hop when it fires, one at line rate is caught within a
+    scrape or two, about when its first hop lands.
 - **Targets with the same host and protocol share their series, and the
   flow-in-use gauge counts them.** Configs may list one host twice with
   another `port` or `af` (dual-stack, or two TCP ports), and the dedup key
