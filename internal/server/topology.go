@@ -45,6 +45,12 @@ func timelineBucket(from, to time.Time) time.Duration {
 // (MaxResponseBytes; parts after the one that filled it stay empty);
 // truncated: true says so. The bucket size keeps the timeline to at most
 // topologyMaxBuckets points.
+//
+// The edges pair each answering hop with the next by zipping the hop
+// arrays with themselves shifted by one, not with a lambda over the
+// indexes: ClickHouse copies the arrays a lambda captures for every
+// element, which made a cycle cost the square of its hops (255 answering
+// hops: about 160 KB a cycle, 3.1 GiB for 20,000).
 func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 	qp, err := parseQuery(r, true)
 	if err != nil {
@@ -81,7 +87,7 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 					arrayFilter((i, st) -> st != 'no-reply', hops.ip, hops.status) AS ri
 				FROM cycles WHERE ` + window + `
 			)
-			ARRAY JOIN arrayMap(k -> (rt[k], ri[k], rt[k + 1], ri[k + 1]), arrayEnumerate(arrayPopBack(rt))) AS e
+			ARRAY JOIN arrayZip(arrayPopBack(rt), arrayPopBack(ri), arrayPopFront(rt), arrayPopFront(ri)) AS e
 			GROUP BY from_ttl, from_ip, to_ttl, to_ip ORDER BY cycles DESC, from_ttl, from_ip, to_ip
 			LIMIT {edges:UInt32}`, topologyMaxEdges},
 	}

@@ -513,3 +513,58 @@ func TestApplyRetention(t *testing.T) {
 		t.Errorf("%d tables still have a TTL after retention 0", n)
 	}
 }
+
+// The edges of long paths cost ClickHouse memory in proportion to their
+// hops, not to the square of them. The query paired consecutive hops with
+// a lambda over the hop indexes that captured both hop arrays, and
+// ClickHouse copies captured arrays for every element: 20,000 cycles of
+// 255 answering hops took 3.1 GiB and 29 s (now 49 MiB and 0.4 s), so an
+// agent's long paths, real or sent to that end, broke the topology view at
+// query.max_memory_bytes and held that much memory per request.
+func TestTopologyLongPathsClickHouse(t *testing.T) {
+	c := testClickHouse(t)
+	spec := make([]string, 255)
+	for i := range 254 {
+		spec[i] = fmt.Sprintf("10.1.%d.%d", i/200, i%200+1)
+	}
+	spec[254] = "=192.0.2.9"
+	recs := make([]*record.Record, 2000)
+	for i := range recs {
+		recs[i] = mk("lab", uint64(i+1), spec...)
+	}
+	if _, err := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil).Ingest(t.Context(), recs); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Options{Store: c, Pinger: c, Enricher: fakeEnrich{}, Logger: slog.New(slog.DiscardHandler),
+		MaxQueryMemory: 128 << 20})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/api/v1/query/topology?agent=lab&protocol=icmp&target=dc1.example" +
+		"&from=2026-11-16T22:00:00Z&to=2026-11-17T03:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var v struct {
+		Edges []struct {
+			FromTTL int `json:"from_ttl"`
+			ToTTL   int `json:"to_ttl"`
+			Cycles  int `json:"cycles"`
+		} `json:"edges"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("topology of long paths with 128 MiB per query: %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Edges) != 254 {
+		t.Fatalf("%d edges, want 254", len(v.Edges))
+	}
+	for _, e := range v.Edges {
+		if e.ToTTL != e.FromTTL+1 || e.Cycles != len(recs) {
+			t.Errorf("edge %d > %d in %d cycles, want consecutive TTLs in %d", e.FromTTL, e.ToTTL, e.Cycles, len(recs))
+		}
+	}
+}

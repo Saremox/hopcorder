@@ -1830,8 +1830,23 @@ high-severity issue. Four fixes followed. The decisions:
   - Tests: `TestParseMemoryBounds` (each bound, lowered) and
     `TestASNDatabaseIsCompact` (200,000 ranges keep 31 bytes each; with the
     old storage 73, over the test's limit of about 54) both failed before.
-
-**Agent**
+- **The topology edges zip the hop arrays instead of capturing them.** The
+  edges query paired consecutive answering hops with
+  `arrayMap(k -> (rt[k], ri[k], rt[k + 1], ri[k + 1]), …)`. ClickHouse
+  copies the arrays a lambda captures for every element it runs on, so a
+  cycle cost the square of its hops: about 160 KB for 255 answering hops.
+  20,000 such cycles took 3.1 GiB and 29 s (ClickHouse 25.8), past
+  `query.max_memory_bytes`, so an agent's long paths broke its topology
+  view, and every such request held that memory while it lasted. Now
+  `arrayZip(arrayPopBack(rt), arrayPopBack(ri), arrayPopFront(rt),
+  arrayPopFront(ri))`: the same edges, 49 MiB and 0.4 s. Found by the
+  ingest fix's review of `hops_mv`, whose view had the same pattern (fixed
+  there). No other query captures arrays in a lambda: the remaining ones
+  (topology's timeline, `arrayFilter` on the hops, the dashboards'
+  `arrayMap`s) take their arrays as arguments.
+  - Test: `TestTopologyLongPathsClickHouse` (2,000 cycles of 255 answering
+    hops with 128 MiB per query; before: 502). `TestTopologyClickHouse`
+    still checks the edges themselves.
 
 <!-- round three: agent -->
 
