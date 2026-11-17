@@ -481,7 +481,8 @@ hop addresses.
   record carries `target_ip`.
 - **Spool disk use** tracks the high-water mark of `max_bytes` plus database
   overhead; the file reuses free space but does not shrink.
-- **A corrupt spool file** (failed consistency check at start) is renamed to
+- **A corrupt spool file** (its page structure or consistency check fails at
+  start, or bbolt faults or panics on it while the agent runs) is renamed to
   `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from
   the clock like any new spool's; the error is logged. The records
   in the old file are not delivered.

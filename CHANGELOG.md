@@ -100,6 +100,13 @@ The section for a version is the text of its GitHub release.
   exit and serve their own metrics. A reload never stops the agent: if the
   previous configuration cannot start again either, it is retried until it
   does, while the endpoint answers 503.
+- Spool files with damage that still crashed or hung the agent (a fault
+  inside bbolt's check, an overflow count that made it loop for minutes and
+  take gigabytes, a self-referencing bucket, a page freed twice) are now
+  quarantined at start: the page structure is checked before bbolt reads
+  it. Damage bbolt only finds while running fails that operation, and the
+  file is moved aside and an empty spool started at once, instead of the
+  agent crashing.
 - A local user holding the agent's ICMP echo identifier (one ping socket)
   no longer stops the agent: only the ICMP targets of that `flow_id` wait,
   with an error in the log and `hopcorder_flow_in_use` at 1, and they

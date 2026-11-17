@@ -1441,7 +1441,10 @@ decisions:
   checking key order and reading every value, before `tx.Check`. Such
   damage then faults where it is recovered, and the file is quarantined.
   Values are read too because the check never reads them, and a drain that
-  reads one later is not protected.
+  reads one later is not protected. (Round three found this incomplete:
+  `tx.Check` also reads branch keys, which a cursor never touches, and
+  trusts overflow counts and child pointers; the page structure is now
+  checked first, see there.)
 - **Probe ids are random.** Each probe id is drawn from ChaCha8, seeded from
   `crypto/rand`. An id whose key is in flight is never chosen, and a
   tombstoned one only when the flow has no other free id. This replaces
@@ -1983,6 +1986,71 @@ high-severity issue. Four fixes followed. The decisions:
     start). TestInnerHoldFlows (rawsock) checks the second prober's UDP
     flow traces while its ICMP flow is refused, and that an identifier a
     uid 65534 process held and let go is taken back by the next trace.
+- **The spool's page structure is checked before bbolt reads it, and
+  damage found while running is quarantined at once.** Round two's walk
+  did not cover everything bbolt trusts. In the review's 3000 random
+  corruptions, opened in child processes: one faulted inside `tx.Check`
+  (it reads branch keys, which a cursor never touches) on every start; 54
+  hung or grew to 1.5 GB in 16 s, all from a damaged page header
+  `overflow` field (`verifyPageReachable` loops up to 2^32 times); one
+  passed the check and panicked on the first Ack ("page already freed": an
+  overflow span covering a free page, which `tx.Check` compares with the
+  freelist only at its first page). A leaf element flagged as a nested
+  bucket rooted at its own page made `walkBucket` recurse until the stack
+  overflowed, on every start. Now:
+  - `checkPages` reads the file (`ReadAt`, not the mapping) under a shared
+    lock (a read-only bbolt open, which reads only the meta pages and still
+    gives `ErrLocked` while an agent has the file) and checks: the meta page
+    bbolt will use (the valid one with the higher txid, as bbolt picks it)
+    with the high water mark within the file; every page reachable from the
+    root and the freelist page for id, type, overflow within the high water
+    mark, and no page reached twice (so no cycles) or reachable and free;
+    every element within its page's span, no empty branch, depth at most
+    64; buckets only in the root and none in them, inline ones included;
+    freelist ids within the file and unique, read in 64 KiB chunks; every
+    page reachable or free. bbolt's on-disk format has not changed since
+    boltdb (version 2), and the check reads it in the host's byte order,
+    as bbolt does. Then bbolt opens the file read-write, the cursor walk
+    (which now also refuses nested buckets) and `tx.Check` run as before,
+    on a structure in which they cannot fault, loop or recurse.
+  - Chosen over running the check in a child process with a timeout and
+    memory cap: a re-exec would depend on `/proc/self/exe` and on the
+    systemd unit's and the container's sandboxing allowing it, a child's
+    memory counts against the same cgroup limit (the chart's 256 MiB), and
+    it would still leave damage that passes the check to crash the agent
+    later. The check is cheap: opening a 48 MB spool (12,000 records, page
+    cache warm) took 16 ms instead of 12.
+  - Every transaction runs under `guard`: `debug.SetPanicOnFault` for its
+    goroutine (drains and schedulers read and write in goroutines of their
+    own) and a recover. A panic or fault there fails that operation with an
+    error wrapping `errCorrupt`, and `Spool.replace` closes the database
+    (giving up after 5 s, in case bbolt's locks stayed held), moves the
+    file aside as `spool.db.corrupt-<time>` and opens an empty spool in its
+    place at once, seqs from the clock. Operations hold a read lock on the
+    database (`dbMu`), the replacement the write lock. If the replacement
+    fails (say the rename does), every operation tries again. Accepted: a
+    panic from a bug of our own inside a transaction is taken for damage
+    too; the file is kept for inspection.
+  - Not covered: a file cut below two pages still fails `bolt.Open` with a
+    plain error and is not quarantined, as before. (A freelist count that
+    claims more ids than its pages hold is refused before the writable
+    open, which would otherwise allocate them.)
+  - Tests, each opening the file in a child process (`TestDamagedChild`,
+    which bounds its run to 20 s and its heap to 512 MiB, uses both
+    consumers like the drains and appends like the schedulers):
+    TestDirectedDamageIsQuarantined (a nested bucket rooted at its own
+    page, a leaf's and the freelist's overflow count, a branch key outside
+    the mapping, a branch element pointing at its own page, an overflow
+    over a free page), TestDamageInUseIsQuarantined (a key moved outside
+    the mapping under the open database, and a panicking write
+    transaction), TestRandomDamageCorpus (cases 0..63 of the review's
+    generator and six cases that grew without bound before). Against the
+    previous spool every directed and in-use case fails (stack overflow,
+    the heap bound, "fatal error: fault", a kept file) and the corpus
+    sample with six failures; with the fix the full 3000-case campaign
+    (`HOPCORDER_SPOOL_CORPUS=3000`) keeps 2273 files and quarantines 727,
+    none failing, and the review's three kept files are quarantined at
+    open.
 - **Accepted:** forgeries still count in
   `hopcorder_probe_mismatched_replies_total` (it measures attempts), and a
   forgery for a timed-out probe's key counts as a late reply without the
