@@ -112,7 +112,10 @@ The section for a version is the text of its GitHub release.
   of `persistence.size` (at most 1GiB): 768MiB for the default 1Gi volume.
   It refuses a `max_bytes` above 90% of the volume, so a release that set
   `max_bytes: 1GiB` with the 1Gi volume fails to upgrade until it lowers
-  or removes it (`persistence.size` applies only to new volumes).
+  or removes it (`persistence.size` applies only to new volumes). That
+  includes `helm upgrade --reuse-values` and values files copied from an
+  earlier chart, which carry its default `max_bytes: 1GiB`: add `--set
+  config.spool.max_bytes=null` (or use `--reset-then-reuse-values`).
 
 **Security: server ingest**
 

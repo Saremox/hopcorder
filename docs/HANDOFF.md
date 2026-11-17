@@ -3640,7 +3640,14 @@ decisions:
     less than 1MiB, and sizes it cannot read. Upgrading: a release that kept
     the default gets 768MiB instead of 1GiB (a spool file already larger
     keeps its size, at most 768 MiB of it in use); one that set
-    `max_bytes: 1GiB` with the 1Gi volume is refused with that message. The
+    `max_bytes: 1GiB` with the 1Gi volume is refused with that message. So
+    is an upgrade that carries the earlier chart's values, whose default
+    was `max_bytes: 1GiB` (`helm upgrade --reuse-values`, which replaces the
+    new chart's defaults with the old ones, or a copied values file): the
+    message names `--set config.spool.max_bytes=null` and
+    `--reset-then-reuse-values`, and the helm job checks both. Refusing is
+    kept over taking the value: the spool now survives a full disk, but a
+    bound the volume cannot hold is a configuration error to see. The
     DaemonSet's spool is on the node's disk: no check, the agent's default.
   - Tests: TestSizeBoundIsTheFile (a 1 MiB bound, 2 MB appended, nothing
     acknowledged: every append succeeds, the newest kept, the rest counted,

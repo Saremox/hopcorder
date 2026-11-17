@@ -105,7 +105,7 @@ a whole number, with B, KB, MB, GB, TB, KiB, MiB, GiB or TiB after it.
 {{- fail (printf "config.spool.max_bytes %v: at least 1MiB (the agent refuses less)" $spool.max_bytes) }}
 {{- end }}
 {{- if gt (mul $mb 10) (mul $vol 9) }}
-{{- fail (printf "config.spool.max_bytes %v is more than 90%% of persistence.size %v: the spool file grows to max_bytes, and the file system needs the rest. Lower max_bytes (or leave it unset: 75%% of the volume), or give new volumes more (persistence.size)" $spool.max_bytes .Values.persistence.size) }}
+{{- fail (printf "config.spool.max_bytes %v is more than 90%% of persistence.size %v: the spool file grows to max_bytes, and the file system needs the rest. Lower max_bytes (or leave it unset: 75%% of the volume), or give new volumes more (persistence.size). Upgrading with --reuse-values or a values file from an earlier chart, whose default was 1GiB: add --set config.spool.max_bytes=null, or use --reset-then-reuse-values" $spool.max_bytes .Values.persistence.size) }}
 {{- end }}
 {{- else }}
 {{- $mib := min 1024 (div (mul $vol 3) (mul 4 1048576)) }}

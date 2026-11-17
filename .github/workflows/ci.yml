@@ -333,6 +333,17 @@ jobs:
           test "$(spool "${agent[@]}" --set persistence.size=2Gi --set config.spool.max_bytes=1GiB)" = 1GiB
           test "$(spool "${agent[@]}" --set config.spool.max_bytes=900MiB)" = 900MiB
           test -z "$(spool deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml)"
+          # Values carried from the earlier chart (helm upgrade
+          # --reuse-values, a copied values file) hold its default
+          # max_bytes: 1GiB: refused, with a message that says how to drop
+          # it, which works.
+          old="${RUNNER_TEMP:-/tmp}/old-spool-values.yaml"
+          printf 'config:\n  spool:\n    max_bytes: 1GiB\n' > "$old"
+          if out=$(helm template a "${agent[@]}" -f "$old" 2>&1); then
+            echo "carried max_bytes: 1GiB was accepted"; exit 1
+          fi
+          grep -q -- '--set config.spool.max_bytes=null' <<<"$out"
+          test "$(spool "${agent[@]}" -f "$old" --set config.spool.max_bytes=null)" = 768MiB
           for v in config.spool.max_bytes=1GiB config.spool.max_bytes=1073741824 config.spool.max_bytes=1000MiB \
             config.spool.max_bytes=512KiB config.spool.max_bytes=lots persistence.size=1Gb persistence.size=1Mi; do
             refused "${agent[@]}" --set "$v"
