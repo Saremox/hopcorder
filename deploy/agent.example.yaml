@@ -19,7 +19,7 @@ log:
 spool:
   dir: /var/lib/hopcorder       # required (except with --once)
   max_age: 168h
-  max_bytes: 1GiB
+  max_bytes: 1GiB               # the spool file on disk, records and overhead
 
 targets:                        # required: at least one
   - host: example.net

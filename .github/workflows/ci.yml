@@ -94,6 +94,13 @@ jobs:
         run: go test -c -tags rawsock -race -o probe.test ./internal/probe
       - name: run with capabilities
         run: sudo ./probe.test -test.v -test.count=1
+      # The spool on a real full file system (a tmpfs it mounts), which the
+      # unprivileged test job skips.
+      - name: spool on a full tmpfs
+        run: |
+          go test -c -race -o spool.test ./internal/spool
+          sudo ./spool.test -test.run '^TestFullTmpfs$' -test.v -test.count=1 | tee spool.out
+          grep -q -- '--- PASS: TestFullTmpfs ' spool.out
 
   clickhouse:
     # Server tests against a real ClickHouse: migrations, every query, and

@@ -3,10 +3,12 @@
 // fails in exactly the windows it is measuring. See docs/HANDOFF.md §5.2.
 //
 // The spool is a bbolt database. Appending a record, advancing the sequence
-// number and enforcing the bounds happen in one transaction, as does
+// number and enforcing the age bound happen in one transaction, as does
 // advancing a consumer's cursor and deleting what every consumer has
 // delivered. bbolt commits are atomic and fsynced, so a crash at any point
 // leaves either the old or the new state and no recovery code is needed.
+// The size bound is on the database file; the records dropped to keep
+// within it go in transactions of their own (see room.go).
 package spool
 
 import (
@@ -49,8 +51,12 @@ var (
 
 // Options configures a spool.
 type Options struct {
-	Dir      string
-	MaxAge   time.Duration
+	Dir    string
+	MaxAge time.Duration
+	// MaxBytes bounds the database file, every page of it (the records, the
+	// B+tree around them, bbolt's freelist), not only the stored records.
+	// At least MinMaxBytes. A file already larger keeps its size, and the
+	// spool keeps no more than MaxBytes of it in use.
 	MaxBytes int64
 	// Consumers are the names of the outputs reading from the spool, each
 	// with its own delivery cursor. A record is deleted once every consumer
@@ -71,9 +77,9 @@ type Entry struct {
 
 // Stats describe the spool's contents.
 type Stats struct {
-	Bytes   int64  // stored (compressed) record bytes, the quantity bounded by MaxBytes
+	Bytes   int64  // stored (compressed) record bytes; the file holding them and their B+tree is bounded by MaxBytes
 	Records int64  // records stored
-	Dropped uint64 // undelivered records dropped by the age or size bound since Open
+	Dropped uint64 // undelivered records dropped by the age or size bound (or a full disk) since Open
 	LastSeq uint64 // highest seq assigned so far
 }
 
@@ -92,6 +98,9 @@ type Spool struct {
 	db      *bolt.DB // nil once closed, or while a damaged file could not be replaced
 	damaged error    // why the file at path is to be moved aside; nil: it is not
 	closed  bool
+
+	roomMu sync.Mutex
+	room   room // the space for the file; see room.go
 
 	mu         sync.Mutex
 	notify     map[string]chan struct{}
@@ -122,8 +131,8 @@ var ErrLocked = errors.New("spool is in use by another hopcorder process")
 
 // Open opens or creates the spool in o.Dir.
 func Open(o Options) (*Spool, error) {
-	if o.MaxAge <= 0 || o.MaxBytes <= 0 {
-		return nil, errors.New("spool: max age and max bytes must be positive")
+	if o.MaxAge <= 0 || o.MaxBytes < MinMaxBytes {
+		return nil, errors.New("spool: max age must be positive, max bytes at least 1MiB")
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -348,6 +357,7 @@ func walkBucket(name []byte, b *bolt.Bucket) error {
 // published once it has committed.
 type txState struct {
 	dropped uint64
+	force   bool // there was nothing to drop for the size bound: try anyway (see change)
 }
 
 // errClosed is returned for operations on a closed spool.
@@ -404,7 +414,7 @@ func (s *Spool) replace(db *bolt.DB, err error) {
 // concurrent appends can return in any order, so mirrors are only replaced
 // by a newer transaction's values. A panic (or fault) inside replaces the
 // damaged file; see replace.
-func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
+func (s *Spool) update(fn txFunc) error {
 	db, err := s.acquire()
 	if err != nil {
 		return err
@@ -418,7 +428,7 @@ func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
 }
 
 // updateDB is update on db, without dbMu (which the caller holds).
-func (s *Spool) updateDB(db *bolt.DB, fn func(tx *bolt.Tx, st *txState) error) error {
+func (s *Spool) updateDB(db *bolt.DB, fn txFunc) error {
 	var (
 		st             txState
 		bytes, n, last uint64
@@ -426,6 +436,7 @@ func (s *Spool) updateDB(db *bolt.DB, fn func(tx *bolt.Tx, st *txState) error) e
 	)
 	err := guard(func() error {
 		return db.Update(func(tx *bolt.Tx) error {
+			s.prepare(tx)
 			if err := fn(tx, &st); err != nil {
 				return err
 			}
@@ -456,10 +467,15 @@ func (s *Spool) updateDB(db *bolt.DB, fn func(tx *bolt.Tx, st *txState) error) e
 }
 
 // initDB creates the buckets of a new spool in db and loads the state of
-// an existing one.
+// an existing one, then settles the bounds.
 func (s *Spool) initDB(db *bolt.DB) error {
+	if err := s.setRoom(db); err != nil {
+		return err
+	}
+	run := func(fn txFunc) error { return s.updateDB(db, fn) }
 	cursors := map[string]uint64{}
-	err := s.updateDB(db, func(tx *bolt.Tx, st *txState) error {
+	var more bool
+	err := s.change(run, func(tx *bolt.Tx, st *txState) error {
 		for _, b := range [][]byte{bucketMeta, bucketRecords, bucketCursors} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
@@ -500,10 +516,9 @@ func (s *Spool) initDB(db *bolt.DB) error {
 			}
 			cursors[c] = binary.BigEndian.Uint64(v)
 		}
-		if err := s.collectLocked(tx); err != nil {
-			return err
-		}
-		return s.enforceBoundsLocked(tx, st, 0)
+		var err error
+		more, err = s.trimLocked(tx, st)
+		return err
 	})
 	if err != nil {
 		return err
@@ -511,7 +526,43 @@ func (s *Spool) initDB(db *bolt.DB) error {
 	s.mu.Lock()
 	s.cursors = cursors
 	s.mu.Unlock()
-	return nil
+	return s.settle(run, more)
+}
+
+// trimLocked deletes, in tx, records every consumer has delivered and those
+// older than the age bound, at most txDeletes of each, and reports whether
+// more remain.
+func (s *Spool) trimLocked(tx *bolt.Tx, st *txState) (bool, error) {
+	more, err := s.collectLocked(tx)
+	if err != nil {
+		return false, err
+	}
+	old, err := s.enforceBoundsLocked(tx, st, 0)
+	return more || old, err
+}
+
+// settle does at open what initDB's transaction left, in transactions of
+// their own: delivered and expired records beyond its share, then the size
+// bound (a file from an earlier version, or a lower MaxBytes, may have more
+// pages in use). It fails only for damage; anything else is logged and left
+// to later operations.
+func (s *Spool) settle(run func(txFunc) error, more bool) error {
+	var err error
+	for err == nil && more {
+		err = s.change(run, func(tx *bolt.Tx, st *txState) error {
+			var err error
+			more, err = s.trimLocked(tx, st)
+			return err
+		})
+	}
+	for n := 1; err == nil && n > 0; {
+		n, err = s.dropOldest(run, false)
+	}
+	if err != nil && !errors.Is(err, errCorrupt) {
+		s.opts.Logger.Warn("spool: cannot apply the bounds at open; later operations will", "err", err)
+		return nil
+	}
+	return err
 }
 
 // Close closes the database.
@@ -534,10 +585,15 @@ func (s *Spool) Close() error {
 
 // Append assigns the next seq, calls encode with it and stores the result.
 // The record is durable when Append returns. If encode fails nothing is
-// stored and the seq is not consumed.
+// stored and the seq is not consumed. At the size bound, or on a full file
+// system, the oldest records are dropped to make room (see change); encode
+// may then be called more than once, with the same seq.
 func (s *Spool) Append(ts time.Time, encode func(seq uint64) ([]byte, error)) (uint64, error) {
 	var seq uint64
-	err := s.update(func(tx *bolt.Tx, st *txState) error {
+	err := s.change(s.update, func(tx *bolt.Tx, st *txState) error {
+		if len(s.opts.Consumers) > 0 && !st.force && s.overBound(tx) {
+			return errNoRoom
+		}
 		meta, recs := tx.Bucket(bucketMeta), tx.Bucket(bucketRecords)
 		recs.FillPercent = 0.95 // keys only ever increase
 		seq = getU64(meta, keyNextSeq)
@@ -560,7 +616,8 @@ func (s *Spool) Append(ts time.Time, encode func(seq uint64) ([]byte, error)) (u
 		if err := s.adjustLocked(meta, int64(len(val)), 1); err != nil {
 			return err
 		}
-		return s.enforceBoundsLocked(tx, st, seq)
+		_, err = s.enforceBoundsLocked(tx, st, seq)
+		return err
 	})
 	if err != nil {
 		return 0, fmt.Errorf("spool append: %w", err)
@@ -654,12 +711,16 @@ func (s *Spool) read(db *bolt.DB, consumer string, maxRecords, maxBytes int) (ou
 }
 
 // Ack records that consumer has delivered every record up to and including
-// seq, and deletes records that all consumers have delivered.
+// seq, and deletes records that all consumers have delivered: up to
+// txDeletes with the cursor, the rest in transactions of their own, so that
+// an Ack frees room even on a full disk.
 func (s *Spool) Ack(consumer string, seq uint64) error {
 	if _, ok := s.notify[consumer]; !ok {
 		return fmt.Errorf("spool: unknown consumer %q", consumer)
 	}
-	err := s.update(func(tx *bolt.Tx, _ *txState) error {
+	var more bool
+	err := s.change(s.update, func(tx *bolt.Tx, _ *txState) error {
+		more = false
 		curs := tx.Bucket(bucketCursors)
 		if getU64(curs, []byte(consumer)) >= seq {
 			return nil
@@ -667,7 +728,9 @@ func (s *Spool) Ack(consumer string, seq uint64) error {
 		if err := putU64(curs, []byte(consumer), seq); err != nil {
 			return err
 		}
-		return s.collectLocked(tx)
+		var err error
+		more, err = s.collectLocked(tx)
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("spool ack: %w", err)
@@ -675,6 +738,17 @@ func (s *Spool) Ack(consumer string, seq uint64) error {
 	s.mu.Lock()
 	s.cursors[consumer] = max(s.cursors[consumer], seq)
 	s.mu.Unlock()
+	for more {
+		if err := s.change(s.update, func(tx *bolt.Tx, _ *txState) error {
+			var err error
+			more, err = s.collectLocked(tx)
+			return err
+		}); err != nil {
+			// The cursor moved; the next Ack, or the next start, deletes them.
+			s.opts.Logger.Warn("spool: cannot delete delivered records", "err", err)
+			break
+		}
+	}
 	return nil
 }
 
@@ -717,40 +791,47 @@ func (s *Spool) minCursorLocked(tx *bolt.Tx) uint64 {
 	return m
 }
 
-// collectLocked deletes records every consumer has delivered.
-func (s *Spool) collectLocked(tx *bolt.Tx) error {
+// collectLocked deletes records every consumer has delivered, at most
+// txDeletes, and reports whether more remain.
+func (s *Spool) collectLocked(tx *bolt.Tx) (bool, error) {
 	upto := s.minCursorLocked(tx)
 	meta, c := tx.Bucket(bucketMeta), tx.Bucket(bucketRecords).Cursor()
 	var bytes, n int64
-	for k, v := c.First(); k != nil && binary.BigEndian.Uint64(k) <= upto; k, v = c.First() {
+	k, v := c.First()
+	for ; k != nil && binary.BigEndian.Uint64(k) <= upto && n < txDeletes; k, v = c.First() {
 		bytes += int64(len(v))
 		n++
 		if err := c.Delete(); err != nil {
-			return err
+			return false, err
 		}
 	}
+	more := k != nil && binary.BigEndian.Uint64(k) <= upto
 	if n == 0 {
-		return nil
+		return more, nil
 	}
-	return s.adjustLocked(meta, -bytes, -n)
+	return more, s.adjustLocked(meta, -bytes, -n)
 }
 
-// enforceBoundsLocked drops the oldest records while the spool is over its
-// size bound or they are older than the age bound. keep is the seq just
-// appended, which is never dropped.
-func (s *Spool) enforceBoundsLocked(tx *bolt.Tx, st *txState, keep uint64) error {
+// enforceBoundsLocked drops the oldest records while they are older than
+// the age bound, at most txDeletes, and reports whether more remain. keep
+// is the seq just appended, which is never dropped. The size bound is kept
+// by dropOldest, in transactions of their own.
+func (s *Spool) enforceBoundsLocked(tx *bolt.Tx, st *txState, keep uint64) (bool, error) {
 	meta := tx.Bucket(bucketMeta)
-	total := int64(getU64(meta, keyBytes)) //nolint:gosec // non-negative
 	cutoff := s.opts.Now().Add(-s.opts.MaxAge).UnixNano()
 	delivered := s.minCursorLocked(tx)
 	c := tx.Bucket(bucketRecords).Cursor()
 	var bytes, n int64
 	var dropped uint64
+	more := false
 	for k, v := c.First(); k != nil; k, v = c.First() {
 		seq := binary.BigEndian.Uint64(k)
-		tooBig := total-bytes > s.opts.MaxBytes
 		tooOld := len(v) >= 8 && int64(binary.BigEndian.Uint64(v[:8])) < cutoff //nolint:gosec // UnixNano
-		if seq == keep || (!tooBig && !tooOld) {
+		if seq == keep || !tooOld {
+			break
+		}
+		if n == txDeletes {
+			more = true
 			break
 		}
 		bytes += int64(len(v))
@@ -759,14 +840,14 @@ func (s *Spool) enforceBoundsLocked(tx *bolt.Tx, st *txState, keep uint64) error
 			dropped++
 		}
 		if err := c.Delete(); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if n == 0 {
-		return nil
+		return false, nil
 	}
 	st.dropped += dropped
-	return s.adjustLocked(meta, -bytes, -n)
+	return more, s.adjustLocked(meta, -bytes, -n)
 }
 
 func (s *Spool) adjustLocked(meta *bolt.Bucket, dBytes, dCount int64) error {
