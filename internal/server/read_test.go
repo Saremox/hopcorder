@@ -301,6 +301,68 @@ func TestPathChangesReadOnlyWhatFits(t *testing.T) {
 	}
 }
 
+// Times outside what records can hold, or a span over 400 days, are the
+// client's error (400), not a failed query (502, an ERROR logged and
+// counted for each request), and no query runs.
+func TestReadTimeRange(t *testing.T) {
+	st := newFakeStore()
+	_, ts := newTestServer(t, st)
+	for _, q := range []string{
+		"to=9223372036854775807", "from=-1&to=1000", "from=-9223372036854775808", "to=9999-01-01T00:00:00Z",
+		"from=1969-12-31T23:59:59Z&to=1970-01-02T00:00:00Z", "from=2261-12-31T00:00:00Z&to=2262-01-01T00:00:01Z",
+		"from=2025-01-01T00:00:00Z&to=2026-02-05T00:00:01Z", // 400 days and a second
+	} {
+		for _, p := range []string{"targets", "cycles", "path-changes", "loops", "outages", "topology"} {
+			var e errorBody
+			if code := getJSON(t, ts.URL+"/api/v1/query/"+p+"?agent=lab&target=dc1.example&"+q, &e); code != http.StatusBadRequest ||
+				!strings.Contains(e.Error, "from and to") {
+				t.Errorf("%s?%s: %d %q", p, q, code, e.Error)
+			}
+		}
+	}
+	for _, q := range []string{"from=0&to=86400000", "from=2025-01-01T00:00:00Z&to=2026-02-05T00:00:00Z",
+		"from=2261-12-31T00:00:00Z&to=2262-01-01T00:00:00Z"} {
+		var body map[string]any
+		if code := getJSON(t, ts.URL+"/api/v1/query/targets?"+q, &body); code != http.StatusOK {
+			t.Errorf("targets?%s: %d %v", q, code, body)
+		}
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.queries) != 3 {
+		t.Errorf("%d queries, want only the 3 valid ones", len(st.queries))
+	}
+}
+
+// Read-API responses, errors included, are neither cached nor sniffed.
+func TestReadAPIHeaders(t *testing.T) {
+	st := newFakeStore()
+	st.answer = func(q string) []string {
+		if strings.Contains(q, "hops.mpls") {
+			return []string{`[]`} // the reshape of cycles fails: 502
+		}
+		return []string{`{"x":1}`}
+	}
+	_, ts := newTestServer(t, st)
+	for path, want := range map[string]int{
+		"/api/v1/query/targets":                               http.StatusOK,
+		"/api/v1/query/topology?agent=lab&target=dc1.example": http.StatusOK,
+		"/api/v1/query/targets?limit=0":                       http.StatusBadRequest,
+		"/api/v1/query/cycles?agent=lab&target=dc1.example":   http.StatusBadGateway,
+	} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != want || resp.Header.Get("Cache-Control") != "no-store" ||
+			resp.Header.Get("X-Content-Type-Options") != "nosniff" || resp.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("%s: %d %v", path, resp.StatusCode, resp.Header)
+		}
+	}
+}
+
 // Topology stays within the budget too: the timeline comes first, and the
 // parts after the one that filled the budget are empty.
 func TestTopologyByteBudget(t *testing.T) {

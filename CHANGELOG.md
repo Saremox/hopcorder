@@ -166,6 +166,9 @@ The section for a version is the text of its GitHub release.
 - `allowed_hosts` refuses a wildcard on a top-level domain (`*.com` allowed
   every `.com` name, an attacker's too). Use `*.domain` only for a domain
   whose names only you can create, not a shared one such as `*.github.io`.
+- The read API answers 400 to `from`/`to` outside 1970 to 2262 or more than
+  400 days apart (they gave 502 and an error in the log), and its responses
+  carry `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
 **Security: agent**
 

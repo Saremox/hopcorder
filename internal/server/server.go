@@ -226,6 +226,9 @@ func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		pw := newProgressWriter(w, progress, WriteTimeout)
 		defer pw.done()
+		// Responses hold stored data: never cached, never sniffed.
+		pw.Header().Set("Cache-Control", "no-store")
+		pw.Header().Set("X-Content-Type-Options", "nosniff")
 		if !acquire(r.Context(), s.querySem) {
 			writeJSON(pw, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
 			return
@@ -619,8 +622,18 @@ type queryParams struct {
 	from, to time.Time
 }
 
+// The time range a read query may ask for: the range of a record's ts
+// (record.Validate), and at most maxQuerySpan of it.
+var (
+	minQueryTime = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxQueryTime = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+const maxQuerySpan = topologyMaxBuckets * 24 * time.Hour
+
 // parseQuery reads agent, target, protocol, from, to (RFC 3339 or Unix
-// milliseconds; default the last 24 hours) and limit.
+// milliseconds; default the last 24 hours, at most 400 days, within
+// 1970-2262) and limit.
 func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	q := r.URL.Query()
 	now := time.Now()
@@ -634,6 +647,16 @@ func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	}
 	if !from.Before(to) {
 		return queryParams{}, errors.New("from must be before to")
+	}
+	// Times outside what records may hold failed in ClickHouse (502, an
+	// error logged and counted); a longer span cannot be drawn either (the
+	// timeline's largest buckets are a day, at most 400 of them).
+	if from.Before(minQueryTime) || to.After(maxQueryTime) {
+		return queryParams{}, fmt.Errorf("from and to must lie within %s and %s",
+			minQueryTime.Format(time.DateOnly), maxQueryTime.Format(time.DateOnly))
+	}
+	if to.Sub(from) > maxQuerySpan {
+		return queryParams{}, fmt.Errorf("from and to may be at most %d days apart", maxQuerySpan/(24*time.Hour))
 	}
 	limit := 1000
 	if v := q.Get("limit"); v != "" {

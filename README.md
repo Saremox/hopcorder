@@ -662,7 +662,8 @@ answer every host.
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
 Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
-ms; default the last 24h), `limit` (default 1000, max 10000; for `cycles`
+ms; default the last 24h; within 1970 to 2262 and at most 400 days apart,
+else 400), `limit` (default 1000, max 10000; for `cycles`
 max 1000). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
 address that answered at each TTL (`nodes`), every pair of consecutive
 answering hops within a cycle (`edges`, which skip silent TTLs), and
@@ -673,7 +674,8 @@ response is bounded by `query.max_response_bytes`
 (32 MiB, streamed as the rows arrive): rows beyond it are left out, and
 `truncated: true` says so (`false` otherwise); `topology` fills its
 `timeline` first. `targets` aggregates at most `ingest.max_streams` streams
-(or `limit`, if more).
+(or `limit`, if more). Responses carry `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`.
 
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the

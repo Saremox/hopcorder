@@ -2621,6 +2621,15 @@ decisions:
   or dynamic-DNS domains, `*.co.uk`) cannot be told apart without a public
   suffix list; the docs warn about them. Tests: `TestHostAllowlist`, the
   `helm` job.
+- **Out-of-range times are the client's error.** `from`/`to` outside
+  1970-2262 (a record's ts range), e.g. `to=9223372036854775807` or negative
+  milliseconds, gave 502, an ERROR log line and a query error per request
+  from any client; now 400, and so does a span of more than 400 days (the
+  timeline's largest buckets are a day, at most 400 of them; longer ranges
+  take several requests). Test: `TestReadTimeRange` (no query runs).
+- **Read-API responses carry `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff`**, errors included (the UI's had
+  nosniff already). Test: `TestReadAPIHeaders`.
 
 **Ingest and storage**
 
