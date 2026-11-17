@@ -1630,6 +1630,37 @@ high-severity issue. Four fixes followed. The decisions:
     `TestLoopRecordsInsertClickHouse` (clickhouse tag: 20 records of 255
     loops of 255 TTLs took 821 MiB in one insert, now 27 MiB in two; their
     hop rows carry the TTLs).
+- **A body reserves its read-buffer chunks at once.** Readers took 64 KiB
+  chunks one at a time as data came, plus a one-byte one to see the end of
+  the body, and kept them until the handler returned. So readers could hold
+  every chunk between them, each waiting for one more: seven max-size
+  bodies at full speed (129 chunks each, 512 in the pool) mostly did, and
+  from `max_body_bytes` 16 MiB two could. All of them then stalled until
+  the 20 s read timeout (408 or 503), and every other request waited
+  behind them. Now a body reserves all it may need before it reads: by its
+  Content-Length, or `max_body_bytes` without one (what it did not fill
+  goes back once read). Reservations are granted in arrival order (a large
+  one is not passed over) by a small weighted semaphore of the standard
+  library (`chunkPool`), so every holder has all it needs and finishes or
+  times out: no set of readers can deadlock. The end of a body is checked
+  with a one-byte read into the stack. Chunks go back as soon as the body
+  is decoded rather than when the handler returns (they were held through
+  the inserts, the body long garbage). The bounds are unchanged: 64
+  readers, 20 s each, a pool of the larger of 32 MiB and twice
+  `max_body_bytes`, 503 when no chunks free up in time, 408 for a body not
+  received in time.
+  - Accepted: a client that announces a max-size body and sends nothing
+    now holds its whole reservation (128 chunks by default) until its read
+    timeout, so four such connections hold the default pool for 20 s;
+    before, four that sent 8 MiB each and stalled did the same. A buffering
+    reverse proxy removes both. A large reservation waiting first holds
+    back smaller ones behind it.
+  - Tests: `TestReadBufferNoDeadlock` (two bodies of four chunks sent in
+    halves, six chunks in the pool: both 503 at the 3 s timeout before, both
+    200 at once now), `TestReadBufferManyMaxBodies` (ten 8 MiB bodies and an
+    agent's batch: `[503 200 503 408 200 200 408 200 503 408]` after 4 s
+    before, all 200 in 0.5 s now), `TestChunkPoolOrder`;
+    `TestReadBufferBounded` and `TestSlowBodiesHoldNoIngestSlot` adapted.
 
 **Read side, enrichment and the browser**
 - **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in

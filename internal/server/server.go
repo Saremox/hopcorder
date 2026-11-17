@@ -117,9 +117,9 @@ type Server struct {
 	ingestSem chan struct{}
 	querySem  chan struct{}
 	// readSem bounds the requests whose bodies are being read; readBuf
-	// holds one token per readChunk bytes buffered for them.
+	// hands out the readChunk-byte chunks their bodies are buffered in.
 	readSem     chan struct{}
-	readBuf     chan struct{}
+	readBuf     *chunkPool
 	bodyTimeout time.Duration
 	// writeProgress, if set (tests), replaces the constant: how long a
 	// read-API client has for each part of its response.
@@ -173,7 +173,7 @@ func New(o Options) *Server {
 	readBuf := max(minReadBuffer, 2*o.MaxBodyBytes)
 	return &Server{opts: o, log: o.Logger, metrics: m, ingester: in,
 		ingestSem: make(chan struct{}, o.MaxConcurrentIngest), querySem: make(chan struct{}, o.MaxConcurrentQueries),
-		readSem: make(chan struct{}, maxReading), readBuf: make(chan struct{}, (readBuf+readChunk-1)/readChunk),
+		readSem: make(chan struct{}, maxReading), readBuf: newChunkPool(chunksFor(readBuf)),
 		bodyTimeout: bodyReadTimeout}
 }
 
@@ -330,7 +330,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		fail(c, err.Error())
 		return
 	}
-	defer release()
+	defer release() // on the way out before decoding; release is idempotent
 	if !acquire(r.Context(), s.ingestSem) {
 		fail(http.StatusServiceUnavailable, "server busy; retry later")
 		return
@@ -338,6 +338,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	defer func() { <-s.ingestSem }()
 
 	recs, res, c, msg := s.decode(enc, raw)
+	// The body is garbage now: its chunks go back to the read buffer
+	// rather than staying reserved while the records are stored.
+	release()
 	if c != 0 {
 		fail(c, msg)
 		return
@@ -373,10 +376,13 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 // readBody reads the compressed request body into memory, at most
 // max_body_bytes: with at most maxReading requests reading at once, each
-// within bodyReadTimeout, and all of them holding at most cap(readBuf)
-// chunks of readChunk bytes, so slow or stalled clients cost neither ingest
-// slots nor unbounded memory. release returns the chunks to readBuf; on an
-// error, code is the status to answer.
+// within bodyReadTimeout, and all of them holding at most the read
+// buffer's chunks of readChunk bytes, so slow or stalled clients cost
+// neither ingest slots nor unbounded memory. A body first reserves all the
+// chunks it may need (by its Content-Length, or max_body_bytes without
+// one), and keeps those it filled until release returns them, which the
+// handler calls once the body is decoded. On an error, code is the status
+// to answer.
 func (s *Server) readBody(w http.ResponseWriter, r *http.Request) (body io.Reader, release func(), code int, err error) {
 	if !acquire(r.Context(), s.readSem) {
 		return nil, nil, http.StatusServiceUnavailable, errors.New("server busy; retry later")
@@ -388,52 +394,77 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request) (body io.Reade
 	_ = http.NewResponseController(w).SetReadDeadline(deadline)
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
-	held := 0
-	release = func() {
-		for range held {
-			<-s.readBuf
+	need := chunksFor(s.opts.MaxBodyBytes)
+	if r.ContentLength >= 0 { // the handler refused larger ones
+		need = chunksFor(r.ContentLength)
+	}
+	if err := s.readBuf.acquire(ctx, need); err != nil {
+		if r.Context().Err() == nil {
+			return nil, nil, http.StatusServiceUnavailable, errors.New("server busy; retry later")
 		}
+		return nil, nil, http.StatusRequestTimeout, errors.New("request body not received in time")
+	}
+	held := need
+	release = func() {
+		s.readBuf.release(held)
 		held = 0
+	}
+	fail := func(code int, msg string) (io.Reader, func(), int, error) {
+		release()
+		return nil, nil, code, errors.New(msg)
 	}
 	in := http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
 	var chunks []io.Reader
 	var total int64
-	for {
-		select {
-		case s.readBuf <- struct{}{}:
-			held++
-		case <-ctx.Done():
-			release()
-			if r.Context().Err() == nil {
-				return nil, nil, http.StatusServiceUnavailable, errors.New("server busy; retry later")
-			}
-			return nil, nil, http.StatusRequestTimeout, errors.New("request body not received in time")
-		}
+	eof := false
+	for !eof && len(chunks) < need {
 		size := int64(readChunk)
 		if r.ContentLength >= 0 {
-			size = min(size, max(r.ContentLength-total, 1))
+			size = min(size, r.ContentLength-total)
 		}
 		c := make([]byte, size)
 		n, err := io.ReadFull(in, c)
 		chunks, total = append(chunks, bytes.NewReader(c[:n])), total+int64(n)
-		var tooBig *http.MaxBytesError
-		switch {
-		case err == nil:
-			continue
-		case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-			return io.MultiReader(chunks...), release, 0, nil
-		case errors.As(err, &tooBig):
-			release()
-			return nil, nil, http.StatusRequestEntityTooLarge, errors.New("request body too large")
-		case errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil:
-			release()
-			return nil, nil, http.StatusRequestTimeout, errors.New("request body not received in time")
-		default:
-			release()
-			return nil, nil, http.StatusBadRequest, errors.New("cannot read body")
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				return fail(readError(ctx, err))
+			}
+			eof = true
 		}
 	}
+	if !eof {
+		// Every reserved chunk is full, so the body has to end here (with
+		// a Content-Length it does: net/http reads no further).
+		var b [1]byte
+		switch _, err := io.ReadFull(in, b[:]); {
+		case errors.Is(err, io.EOF):
+		case err == nil:
+			return fail(http.StatusRequestEntityTooLarge, "request body too large")
+		default:
+			return fail(readError(ctx, err))
+		}
+	}
+	// Chunks reserved for a body of unknown length that it did not fill.
+	s.readBuf.release(held - len(chunks))
+	held = len(chunks)
+	return io.MultiReader(chunks...), release, 0, nil
 }
+
+// readError is the status and message for an error reading a body.
+func readError(ctx context.Context, err error) (int, string) {
+	var tooBig *http.MaxBytesError
+	switch {
+	case errors.As(err, &tooBig):
+		return http.StatusRequestEntityTooLarge, "request body too large"
+	case errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil:
+		return http.StatusRequestTimeout, "request body not received in time"
+	default:
+		return http.StatusBadRequest, "cannot read body"
+	}
+}
+
+// chunksFor is the number of read-buffer chunks n bytes take.
+func chunksFor(n int64) int { return int((n + readChunk - 1) / readChunk) }
 
 // decode decompresses and parses raw. A non-zero code is a failure of the
 // whole request; invalid records are only counted and reported in res.

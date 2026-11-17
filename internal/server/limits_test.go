@@ -262,10 +262,10 @@ func TestSlowBodiesHoldNoIngestSlot(t *testing.T) {
 	}
 	// Every buffered chunk is returned.
 	deadline := time.Now().Add(5 * time.Second)
-	for len(s.readBuf) != 0 && time.Now().Before(deadline) {
+	for s.readBuf.inUse() != 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if n := len(s.readBuf); n != 0 {
+	if n := s.readBuf.inUse(); n != 0 {
 		t.Errorf("%d read-buffer chunks still held", n)
 	}
 }
@@ -504,15 +504,15 @@ func TestIngesterAgentsBounded(t *testing.T) {
 }
 
 // Bodies being read hold memory only within the read buffer: a client that
-// sends a large body quickly and then stalls holds its chunks until its read
-// timeout, and others wait for them rather than adding memory (64 slow
+// announces a large body and stalls holds the chunks it reserved until its
+// read timeout, and others wait for them rather than adding memory (64 slow
 // clients could otherwise hold 64 x max_body_bytes).
 func TestReadBufferBounded(t *testing.T) {
 	st := newFakeStore()
 	s := New(Options{Store: st, Logger: quietLogger(), MaxBodyBytes: 1 << 20})
 	s.ingester.now = func() time.Time { return t0.Add(time.Hour) }
 	s.bodyTimeout = 500 * time.Millisecond
-	s.readBuf = make(chan struct{}, 4) // 256 KiB
+	s.readBuf = newChunkPool(16) // 1 MiB
 	s.SetReady()
 	srv := httptestServer(t, s.Handler())
 	c, err := net.Dial("tcp", strings.TrimPrefix(srv, "http://"))
@@ -523,8 +523,8 @@ func TestReadBufferBounded(t *testing.T) {
 	fmt.Fprintf(c, "POST /api/v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\nContent-Length: 1000000\r\n\r\n")
 	_, _ = c.Write(bytes.Repeat([]byte(" "), 4*readChunk)) // then nothing
 	time.Sleep(100 * time.Millisecond)
-	if n := len(s.readBuf); n != 4 {
-		t.Fatalf("stalled client holds %d chunks, want all 4", n)
+	if n := s.readBuf.inUse(); n != 16 {
+		t.Fatalf("stalled client holds %d chunks, want all 16", n)
 	}
 	// An agent waits for the stalled client's chunks (released at its read
 	// timeout, 400 ms from now), then gets through.
@@ -533,7 +533,7 @@ func TestReadBufferBounded(t *testing.T) {
 		time.Since(start) < 300*time.Millisecond {
 		t.Errorf("behind a full read buffer: %d %+v after %v", code, res, time.Since(start))
 	}
-	if n := len(s.readBuf); n != 0 {
+	if n := s.readBuf.inUse(); n != 0 {
 		t.Errorf("%d chunks still held", n)
 	}
 }

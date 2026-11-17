@@ -563,9 +563,9 @@ the content types a web page can send without a CORS preflight are refused),
 bodies up to `ingest.max_body_bytes` (8 MiB) and `max_decoded_bytes` (32 MiB),
 at most 16 agents and 4096 streams per request, and `ingest.max_concurrent`
 requests at once. A body is read in full (within 20 s, at most 64 at once,
-buffering together at most 32 MiB or twice `max_body_bytes`) before its
-request waits for one of the `max_concurrent` slots, so slow clients hold
-none. Records are validated against the schema's limits: `agent_id` from
+each first reserving its size in a buffer of 32 MiB or twice
+`max_body_bytes`, whichever is larger) before its request waits for one of
+the `max_concurrent` slots, so slow clients hold none. Records are validated against the schema's limits: `agent_id` from
 `[A-Za-z0-9._:-]` (at most 128 characters), targets from `[A-Za-z0-9._:%-]`
 (255; an IPv6 zone at most 15 characters from `[A-Za-z0-9._-]`), protocol
 `icmp`, `udp` or `tcp`, at most 255 hops and 16 MPLS labels per hop, hop and

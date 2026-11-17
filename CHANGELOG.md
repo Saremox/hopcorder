@@ -34,6 +34,11 @@ The section for a version is the text of its GitHub release.
   counts the hop rows the view writes. During a rolling upgrade, cycles that
   a server of the previous version stores get no loop marks on their hop
   rows (`loop_events` has the loops).
+- Concurrent large uploads can no longer stall ingest. A body took its part
+  of the read buffer chunk by chunk, so a few bodies of `max_body_bytes`
+  (seven with the defaults, two from 16 MiB) could hold all of it between
+  them, each waiting for more, until their read timeout. A body now reserves
+  what it needs at once, in turn, and gives it back once it is decoded.
 
 **Security: read side and Grafana**
 

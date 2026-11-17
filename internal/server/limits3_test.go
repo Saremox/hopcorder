@@ -4,11 +4,15 @@ package server
 // before its fix.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -395,5 +399,137 @@ func TestCycleRowHopLoopTTLs(t *testing.T) {
 	}
 	if want := len(b) + 6*hopRowBytes + 4*len("2,4"); cost != want {
 		t.Errorf("cost %d, want %d", cost, want)
+	}
+}
+
+// postRaw posts body as NDJSON from any goroutine.
+func postRaw(url string, body []byte) (int, error) {
+	req, err := http.NewRequest(http.MethodPost, url+"/api/v1/ingest", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+// Readers took read-buffer chunks one at a time (plus one to see the end of
+// the body) and held them until their request ended, so readers could hold
+// every chunk between them, each waiting for another: two bodies of four
+// chunks each, sent in halves, with six chunks in the pool. Both stalled
+// until the read timeout. Now a body reserves its four at once, so the
+// second waits until the first is done.
+func TestReadBufferNoDeadlock(t *testing.T) {
+	s := New(Options{Store: newFakeStore(), Logger: quietLogger(), MaxBodyBytes: 1 << 20})
+	s.ingester.now = func() time.Time { return t0.Add(time.Hour) }
+	s.bodyTimeout = 3 * time.Second
+	s.readBuf = newChunkPool(6)
+	s.SetReady()
+	srv := httptestServer(t, s.Handler())
+	half := bytes.Repeat([]byte("\n"), 2*readChunk) // valid NDJSON: empty lines
+	var conns []net.Conn
+	for range 2 {
+		c, err := net.Dial("tcp", strings.TrimPrefix(srv, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		fmt.Fprintf(c, "POST /api/v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\n"+
+			"Content-Length: %d\r\n\r\n", 2*len(half))
+		_, _ = c.Write(half)
+		conns = append(conns, c)
+		time.Sleep(100 * time.Millisecond)
+	}
+	start := time.Now()
+	for _, c := range conns {
+		_, _ = c.Write(half)
+	}
+	for i, c := range conns {
+		_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		buf := make([]byte, 64)
+		n, _ := c.Read(buf)
+		if !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+			t.Errorf("body %d: %q after %v", i, buf[:n], time.Since(start))
+		}
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("both bodies took %v", d)
+	}
+	if n := s.readBuf.inUse(); n != 0 {
+		t.Errorf("%d chunks still held", n)
+	}
+}
+
+// The review's version: ten bodies of max_body_bytes at full speed (with
+// the default limits, 128 chunks each of a pool of 512) and an agent's
+// batch. Most runs stalled every one of them until the read timeout.
+func TestReadBufferManyMaxBodies(t *testing.T) {
+	s := New(Options{Store: newFakeStore(), Logger: quietLogger()})
+	s.ingester.now = func() time.Time { return t0.Add(time.Hour) }
+	s.bodyTimeout = 4 * time.Second
+	s.SetReady()
+	srv := httptestServer(t, s.Handler())
+	// Valid NDJSON: blank lines (long ones, so they decode quickly).
+	body := bytes.Repeat(append(bytes.Repeat([]byte(" "), 4095), '\n'), DefaultMaxBodyBytes/4096)
+	var wg sync.WaitGroup
+	codes := make([]int, 10)
+	start := time.Now()
+	for i := range codes {
+		wg.Go(func() {
+			codes[i], _ = postRaw(srv, body)
+		})
+	}
+	time.Sleep(100 * time.Millisecond)
+	code, res := post(t, srv, "", ndjson(mk("lab", 1, pathA...)))
+	wg.Wait()
+	if d := time.Since(start); code != 200 || res.Accepted != 1 || fmt.Sprint(codes) != "[200 200 200 200 200 200 200 200 200 200]" ||
+		d > 3*time.Second {
+		t.Errorf("agent %d %+v, max-size bodies %v, after %v", code, res, codes, d)
+	}
+	if n := s.readBuf.inUse(); n != 0 {
+		t.Errorf("%d chunks still held", n)
+	}
+}
+
+// Reservations are granted in order: a large one is not passed over by
+// smaller ones behind it, and one given up lets those behind it through.
+func TestChunkPoolOrder(t *testing.T) {
+	p := newChunkPool(4)
+	if err := p.acquire(t.Context(), 3); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 3)
+	wait := func(name string, ctx context.Context, n int) {
+		go func() {
+			if err := p.acquire(ctx, n); err != nil {
+				got <- name + " gave up"
+				return
+			}
+			got <- name
+		}()
+		time.Sleep(20 * time.Millisecond) // queued in this order
+	}
+	cancelled, cancel := context.WithCancel(t.Context())
+	wait("big", cancelled, 4) // first in line, does not fit
+	wait("small", t.Context(), 1)
+	select {
+	case g := <-got:
+		t.Fatalf("%s got through ahead of its turn", g)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	if g := []string{<-got, <-got}; !slices.Contains(g, "big gave up") || !slices.Contains(g, "small") {
+		t.Fatalf("got %q", g)
+	}
+	p.release(3)
+	if err := p.acquire(t.Context(), 3); err != nil || p.inUse() != 4 {
+		t.Errorf("%v, %d in use", err, p.inUse())
+	}
+	if err := p.acquire(t.Context(), 5); err == nil {
+		t.Error("a reservation larger than the pool was granted")
 	}
 }
