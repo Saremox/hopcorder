@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -461,9 +460,10 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 	return 0
 }
 
-// shutdownGrace bounds how long the agent waits for outputs to stop after
-// SIGINT/SIGTERM. Nothing is lost by cutting it short: undelivered records
-// stay in the spool.
+// shutdownGrace bounds how long a configuration that stops (SIGINT/SIGTERM,
+// or a reload) waits for its outputs to deliver what is spooled, and then
+// how long for their drains to return. Nothing is lost by cutting it short:
+// undelivered records stay in the spool.
 var shutdownGrace = 3 * time.Second
 
 // daemonEnv is what runDaemon gets from its supervisor.
@@ -566,40 +566,39 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	if err != nil {
 		return err
 	}
+	var ms *output.MetricsServer
 	if mc := cfg.Outputs.Metrics; mc != nil {
-		ms := env.metrics
-		if ms == nil {
+		if ms = env.metrics; ms == nil {
 			if ms, err = output.ListenMetrics(ctx, mc.Listen, logger); err != nil {
 				return err
 			}
 			defer ms.Close()
 		}
 		ms.Serve(mc.Path, metrics)
-		defer ms.Serve(mc.Path, nil) // 503 until the next configuration runs
 	}
 	if env.started != nil {
 		env.started()
 	}
 
-	// Outputs drain on their own context so they can be stopped after the
-	// schedulers, letting the last records reach them when that is quick.
-	drainCtx, stopDrains := context.WithCancel(context.WithoutCancel(ctx))
-	defer stopDrains()
 	flushNow := make(chan struct{})
-	var drains sync.WaitGroup
-	for i, o := range outs {
+	for i := range drainOpts {
 		drainOpts[i].FlushNow = flushNow
-		drains.Go(func() { output.Drain(drainCtx, sp, o, drainOpts[i]) })
 	}
+	drains := output.StartDrains(ctx, sp, outs, drainOpts)
 
 	logger.Info("agent started", "agent_id", cfg.AgentID, "targets", len(cfg.Targets),
 		"outputs", names, "spool", cfg.Spool.Dir, "spool_records", sp.Stats().Records)
 	err = a.Run(ctx)
+	if ms != nil {
+		ms.Serve("", nil) // 503 from now until the next configuration runs: nothing is probed
+	}
 	logger.Info("shutting down")
 	close(flushNow) // ship partial batches now rather than after flush_interval
 	waitIdle(sp, names, shutdownGrace)
-	stopDrains()
-	drains.Wait()
+	// A delivery that blocks for good (a pipe nobody reads) is left
+	// behind after another shutdownGrace: a reload or shutdown never
+	// waits for it longer.
+	drains.Stop(shutdownGrace, logger)
 	return err
 }
 

@@ -134,6 +134,14 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			m.outputErrors.WithLabelValues(name)
 		}
 	}
+	for _, name := range o.Outputs {
+		c := abandonedCount(name)
+		r.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "hopcorder_output_abandoned_total",
+			Help:        "Deliveries still blocked (a write that never returned) when a configuration stopped for a reload or shutdown, left behind after the grace period; their records stay spooled.",
+			ConstLabels: prometheus.Labels{"output": name},
+		}, func() float64 { return float64(c.Load()) }))
+	}
 	if pr := o.Prober; pr != nil {
 		r.MustRegister(
 			prometheus.NewCounterFunc(prometheus.CounterOpts{

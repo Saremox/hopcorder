@@ -134,6 +134,17 @@ The section for a version is the text of its GitHub release.
   configuration's ICMP targets were not probed until it let go. Both
   configurations' identifiers are now held while the new one starts, and
   the old ones released once it runs.
+- A JSONL write that blocks (a FIFO for a log shipper that is not reading,
+  stdout under a blocking log driver, a hung NFS mount) no longer hangs a
+  reload or the shutdown. The agent waited for it for good: after SIGHUP
+  nothing was probed, the metrics endpoint answered 200 with frozen
+  numbers, and SIGTERM was ignored until systemd killed the agent. Writes
+  to FIFOs and pipes now give up when the outputs stop; a delivery still
+  blocked 3 s later is left behind, logged and counted in the new
+  `hopcorder_output_abandoned_total{output}` (its records stay spooled).
+  The metrics endpoint answers 503 from the moment probing stops. JSONL to
+  a FIFO or pipe also works now: every batch failed at its fsync after it
+  was written, and was written again on every retry.
 
 **Security: CI, release and deployment**
 

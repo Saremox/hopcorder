@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/saremox/hopcorder/internal/spool"
@@ -134,6 +136,76 @@ func Drain(ctx context.Context, src Source, out Output, o DrainOptions) {
 			sleep(ctx, o.RetryMin)
 		}
 	}
+}
+
+// Drains is a set of drains started together (StartDrains), one per output.
+type Drains struct {
+	cancel context.CancelFunc
+	names  []string
+	done   []chan struct{}
+}
+
+// StartDrains runs Drain for each of outs, with opts[i] for outs[i], in
+// goroutines of their own, until Stop. They run on a context that keeps
+// ctx's values but not its cancellation, so that they can be stopped after
+// the schedulers, letting the last records reach the outputs when that is
+// quick.
+func StartDrains(ctx context.Context, src Source, outs []Output, opts []DrainOptions) *Drains {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	d := &Drains{cancel: cancel}
+	for i, out := range outs {
+		done := make(chan struct{})
+		d.names, d.done = append(d.names, out.Name()), append(d.done, done)
+		go func() {
+			defer close(done)
+			Drain(ctx, src, out, opts[i])
+		}()
+	}
+	return d
+}
+
+// Stop cancels the drains and waits up to grace for them to return. One
+// that is still delivering then, in a write that does not heed its context
+// (a pipe nobody reads, on a blocking file descriptor; a hung network file
+// system), is left behind: logged, counted in
+// hopcorder_output_abandoned_total, and its batch stays in the spool for the
+// next delivery. Stop returns the names of the outputs left behind. Without
+// that bound one such write held up a reload, and the agent's shutdown, for
+// as long as it blocked.
+func (d *Drains) Stop(grace time.Duration, log *slog.Logger) []string {
+	d.cancel()
+	timeout := time.After(grace)
+	expired := false
+	var stuck []string
+	for i, done := range d.done {
+		if !expired {
+			select {
+			case <-done:
+				continue
+			case <-timeout:
+				expired = true
+			}
+		}
+		select {
+		case <-done:
+		default:
+			stuck = append(stuck, d.names[i])
+			abandonedCount(d.names[i]).Add(1)
+			log.Error("output does not stop: its delivery is blocked, leaving it behind (its records stay spooled)",
+				"output", d.names[i], "waited", grace)
+		}
+	}
+	return stuck
+}
+
+// abandoned counts, per output name, the drains Stop left behind. It is
+// kept for the process, not per configuration: a delivery left behind
+// outlives the configuration that started it.
+var abandoned sync.Map // string -> *atomic.Uint64
+
+func abandonedCount(output string) *atomic.Uint64 {
+	c, _ := abandoned.LoadOrStore(output, new(atomic.Uint64))
+	return c.(*atomic.Uint64)
 }
 
 func full(batch []spool.Entry, o DrainOptions) bool {

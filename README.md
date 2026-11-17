@@ -400,10 +400,11 @@ arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
 
 **Outputs** (at least one):
 
-- `jsonl.path` (`--jsonl`): append records to a file, `-` for stdout. Synced to
-  disk per batch. After a crash records may repeat (dedup on
-  `(agent_id, seq)`); a torn write never runs into the next record. Rotate
-  by renaming and sending SIGHUP (see Operations) or with `copytruncate`.
+- `jsonl.path` (`--jsonl`): append records to a file (or a FIFO), `-` for
+  stdout. A regular file is synced to disk per batch. After a crash records
+  may repeat (dedup on `(agent_id, seq)`); a torn write never runs into the
+  next record. Rotate by renaming and sending SIGHUP (see Operations) or
+  with `copytruncate`.
 - `http`: POST zstd-compressed NDJSON to `<url>/api/v1/ingest`. Options: `url`,
   `headers`, `bearer_token` or `bearer_token_file`, `basic_auth`
   (`username`, `password` or `password_file`), `tls` (`ca_file`, `cert_file`,
@@ -436,6 +437,7 @@ hop addresses.
 | `hopcorder_resolve_errors_total` | target, protocol | Failed DNS lookups |
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
+| `hopcorder_output_abandoned_total` | output | Deliveries still blocked when a configuration stopped (reload or shutdown), left behind; their records stay spooled |
 | `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
 | `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
@@ -446,8 +448,13 @@ hop addresses.
 ## Operations
 
 - **Shutdown** (SIGINT/SIGTERM): probing stops at once (in-flight cycles are
-  abandoned), outputs get up to 3 seconds to ship what is spooled, and the rest
-  stays in the spool for the next start.
+  abandoned) and the metrics endpoint answers 503, outputs get up to 3
+  seconds to ship what is spooled, and the rest stays in the spool for the
+  next start. A delivery that blocks (a JSONL file on a hung mount, a
+  blocking stdout nobody reads) is given 3 more seconds and then left
+  behind, counted in `hopcorder_output_abandoned_total`; writes to a FIFO or
+  pipe give up at once. A reload stops the running configuration the same
+  way.
 - **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent

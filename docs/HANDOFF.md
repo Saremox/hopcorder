@@ -1964,6 +1964,10 @@ high-severity issue. Four fixes followed. The decisions:
     retrying rather than probing without outputs, because every record
     must go through the spool. `runDaemon` returning on its own (it does
     not today) restarts the configuration the same way.
+  - (Round four found two ways a reload still stopped the agent: a
+    `metrics.path` that panicked `http.ServeMux`, and a JSONL write that
+    blocked for good, which the stopping configuration waited for. Both
+    are fixed; see there.)
   - Accepted: a local user who binds the port before the agent's first
     start still fails that start (exit 1, systemd retries), as for any
     service on an unprivileged port; the first start failing loudly is
@@ -2358,6 +2362,53 @@ decisions:
     TestInnerHoldFlows (rawsock) checks what this rests on: a uid 65534
     process can bind neither identifier while both are held, and gets the
     old one once only the new one is.
+- **A configuration that stops waits a bounded time for its outputs.**
+  After `a.Run` returned, `runDaemon` gave the outputs up to
+  `shutdownGrace` to catch up, cancelled the drains, and then waited for
+  them without a bound, while `JSONL.Deliver` ignored its context. A write
+  that blocks (a FIFO for a log shipper that is not reading, stdout under a
+  blocking log driver, a hung NFS mount) held up the reload or the
+  shutdown for as long as it blocked: in the review, after SIGHUP with the
+  JSONL output on a FIFO nobody read, nothing was probed again, scrapes got
+  200 with frozen numbers, and SIGTERM was ignored (systemd kills after
+  `TimeoutStopSec=15s`). Now:
+  - `output.StartDrains` and `Drains.Stop` replace the WaitGroup. Stop
+    cancels the drains and waits up to `shutdownGrace` again; a drain still
+    delivering then is left behind, with an error in the log and
+    `hopcorder_output_abandoned_total{output}` (kept for the process: the
+    stuck delivery outlives its configuration). Its batch is not
+    acknowledged, so the next configuration delivers it again. A stop takes
+    at most twice `shutdownGrace` (6 s), plus closing the spool.
+  - JSONL writes take deadlines where the file does: a FIFO or pipe opened
+    by path (Go makes it non-blocking and polls it, on Linux) or a
+    non-blocking stdout. When the drain's context ends, `context.AfterFunc`
+    sets a deadline in the past, so such a write returns at once and
+    nothing is left behind. Regular files and a blocking stdout take no
+    deadlines; the bound is for them.
+  - The metrics endpoint answers 503 as soon as `a.Run` returns, not only
+    once `runDaemon` does.
+  - Found on the way: JSONL to a FIFO or pipe never worked. `fsync` fails
+    with EINVAL there, so every delivery failed after its write and was
+    written again on every retry. Only regular files are synced now.
+  - Accepted: a delivery left behind keeps its goroutine and its batch (up
+    to 1 MiB) until its write returns, one per stop that meets it. On a
+    blocking stdout the next configuration's JSONL writes queue behind it
+    (Go serializes writes to a file), so the next stop leaves that drain
+    behind too. A spool on a hung file system still hangs the agent, whose
+    appends block as well.
+  - Tests, without root (a FIFO in a temporary directory, and a full
+    blocking pipe as `os.Stdout`): TestReloadWithJSONLOnAFullFIFO and
+    TestReloadWithJSONLOnABlockedStdout (the reload completes, metrics
+    answer 503 in between; the FIFO's write stops at its deadline, the
+    stdout drain is left behind and counted once),
+    TestShutdownWithJSONLOnAFullFIFO and
+    TestShutdownWithJSONLOnABlockedStdout (cancelled as SIGTERM does, the
+    supervisor returns within twice the grace plus 2 s),
+    TestJSONLWriteHeedsItsContext, TestJSONLToAFIFO and
+    TestDrainsStopLeavesStuckDeliveryBehind. Against the previous code the
+    four daemon tests hang (the reload never completes, the supervisor
+    does not stop), and the two JSONL tests fail (the write ignores its
+    context; "sync: invalid argument").
 
 **CI, release and deployment**
 
