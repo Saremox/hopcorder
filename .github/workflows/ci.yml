@@ -223,6 +223,35 @@ jobs:
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.22.1
+      # A released chart runs its images by digest (image.digest, which
+      # scripts/release-build.sh writes into the packages and checks), so
+      # moving the tag does not change what it runs; from a checkout, by
+      # tag. A tag of your own replaces both.
+      - name: image references
+        run: |
+          d=sha256:$(printf '%064d' 0 | tr 0 d)
+          for chart in hopcorder-server hopcorder-agent hopcorder-agent:daemonset; do
+            c=${chart%:*} set=()
+            if [ "$c" = hopcorder-agent ]; then set=(--set 'config.targets[0].host=example.net'); fi
+            if [ "$chart" != "$c" ]; then set+=(--set mode=daemonset); fi
+            app=$(helm show chart "deploy/helm/$c" | sed -n 's/^appVersion: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p')
+            image() { helm template a "deploy/helm/$c" "${set[@]}" "$@" | sed -n 's/^ *image: //p'; }
+            expect() {
+              local want=$1 got
+              shift
+              got=$(image "$@")
+              if [ "$got" != "$want" ]; then
+                echo "$chart $*: image $got, want $want"; exit 1
+              fi
+            }
+            expect "\"ghcr.io/saremox/$c:$app\""
+            expect "\"ghcr.io/saremox/$c:$app@$d\"" --set "image.digest=$d"
+            expect "\"ghcr.io/saremox/$c:main\"" --set "image.digest=$d" --set image.tag=main
+            expect "\"ghcr.io/saremox/$c:1.2.3@$d\"" --set "image.tag=1.2.3@$d"
+            if helm template a "deploy/helm/$c" "${set[@]}" --set image.digest=sha256:abc >/dev/null 2>&1; then
+              echo "$chart: accepted image.digest=sha256:abc"; exit 1
+            fi
+          done
       - name: lint
         run: |
           helm lint --strict deploy/helm/hopcorder-server

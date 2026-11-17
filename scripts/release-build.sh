@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # Builds the release assets into dist/: static Linux binaries (amd64, arm64)
 # with the license, README, example configs and systemd units (in archives
-# owned by root, reproducible from the commit), the Helm chart packages and
-# SHA256SUMS; and notes.md, the version's section of
-# CHANGELOG.md (empty if there is none). Used by .github/workflows/images.yml
-# for releases and, as a dry run, for pull requests and main.
+# owned by root, reproducible from the commit), the Helm chart packages
+# (their images pinned by digest) and SHA256SUMS; and notes.md, the
+# version's section of CHANGELOG.md (empty if there is none). Used by
+# .github/workflows/images.yml for releases (with the digests the image job
+# pushed) and, as a dry run with made-up digests, for pull requests and main.
 #
-#   scripts/release-build.sh 1.2.3
+#   scripts/release-build.sh 1.2.3 <agent image digest> <server image digest>
 set -euo pipefail
-version=${1:?usage: release-build.sh <version without the leading v>}
+usage="usage: release-build.sh <version without the leading v> <agent image digest> <server image digest>"
+version=${1:?$usage}
+agent_digest=${2:?$usage}
+server_digest=${3:?$usage}
+for d in "$agent_digest" "$server_digest"; do
+  if [[ ! $d =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "release-build: not an image digest: '$d'" >&2
+    exit 1
+  fi
+done
 cd "$(dirname "$0")/.."
 
 # Releases are built with go.mod's toolchain (the Go release of the images,
@@ -52,8 +62,30 @@ out=$("build/hopcorder_${version}_linux_amd64/hopcorder" version)
 echo "$out"
 grep -qF "v${version}" <<<"$out"
 
+# The charts run the images of this release by digest (image.digest in
+# their values, used while image.tag is empty), not by the tag, which any
+# workflow with packages: write can move.
 for chart in hopcorder-server hopcorder-agent; do
-  helm package "deploy/helm/$chart" --version "$version" --app-version "$version" -d dist
+  digest=$server_digest set=()
+  if [ "$chart" = hopcorder-agent ]; then
+    digest=$agent_digest set=(--set 'config.targets[0].host=example.net')
+  fi
+  mkdir -p build/charts
+  cp -R "deploy/helm/$chart" build/charts/
+  values=build/charts/$chart/values.yaml
+  if [ "$(grep -c '^  digest: ""$' "$values")" != 1 ]; then
+    echo "release-build: $chart: no single line '  digest: \"\"' (image.digest) in values.yaml" >&2
+    exit 1
+  fi
+  sed -i "s/^  digest: \"\"\$/  digest: \"$digest\"/" "$values"
+  helm package "build/charts/$chart" --version "$version" --app-version "$version" -d dist
+  # The packaged chart renders its image by that digest.
+  want="image: \"ghcr.io/saremox/$chart:$version@$digest\""
+  got=$(helm template a "dist/$chart-$version.tgz" "${set[@]}" | sed -n 's/^ *\(image: "ghcr\.io\/saremox\/\)/\1/p')
+  if [ "$got" != "$want" ]; then
+    printf 'release-build: dist/%s-%s.tgz renders\n%s\nnot %s\n' "$chart" "$version" "$got" "$want" >&2
+    exit 1
+  fi
 done
 
 (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)

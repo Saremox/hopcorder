@@ -9,25 +9,28 @@ name: images
 # - A v* tag is checked first (scripts/release-verify.sh: v<semver>, a commit
 #   of main on which ci succeeded, above the latest release, not released
 #   before). Its images are then built without caches and pushed only as
-#   :sha-<full commit> (the image job may write packages, nothing else), and
-#   the binaries and chart packages are built in a job without write tokens.
-#   Only then does the "publish" job, in the "release" environment (its
-#   required reviewers approve it), check again and
-#   publish: it attests the release files and both image digests (signed
-#   build provenance), tags those digests :<version>, :<major>.<minor> and
-#   :latest (a pre-release only :<version>), pushes the charts to
-#   oci://ghcr.io/saremox/charts and creates the GitHub release with the
-#   notes for that version from CHANGELOG.md plus the digests and how to
-#   verify them (scripts/release-notes.sh). It builds nothing itself.
+#   :sha-<full commit> (the image job may write packages, nothing else),
+#   then the binaries and chart packages (their images pinned by those
+#   digests) are built in a job without write tokens. The "attest" job, the
+#   only one that may sign, attests the release files and both image
+#   digests (signed build provenance) and runs nothing else. Only then does
+#   the "publish" job, in the "release" environment (its required reviewers
+#   approve it), check again and publish: it tags the digests :<version>,
+#   :<major>.<minor> and :latest (a pre-release only :<version>), pushes the
+#   charts to oci://ghcr.io/saremox/charts and creates the GitHub release
+#   with the notes for that version from CHANGELOG.md plus the digests and
+#   how to verify them (scripts/release-notes.sh): as a draft, published once
+#   its files are exactly this run's and its tag names this commit
+#   (scripts/release-publish.sh). It builds nothing itself.
 #
 # The environment gates this job only. Anyone with write access can push a
 # workflow of their own to a branch that asks for packages: write and
 # contents: write and skips it: ghcr and releases take GITHUB_TOKEN from any
 # workflow of the repository. What holds against that is in the repository
-# settings (a tag ruleset for v*, immutable releases) and in the
-# attestations: they name the workflow file and the ref of the run that
-# made them, and users check for this file and the release's tag
-# (docs/HANDOFF.md, security review round three).
+# settings (a tag ruleset, immutable releases) and in the attestations: they
+# name the workflow file, the tag and the commit of the run that made them,
+# and users check for exactly this file, the tag and the tag's commit
+# (README.md; docs/HANDOFF.md, security reviews rounds three and four).
 #
 # Third-party actions are pinned to commits (Dependabot keeps them current),
 # and so is the BuildKit image the builds run in (by hand: Dependabot does
@@ -44,8 +47,13 @@ on:
 # pushing (two merges in a row would otherwise race, and the one finishing
 # last would own :main, newer or not); a newer commit replaces a waiting run.
 # A new commit on a pull request cancels the run for the one before.
+# Concurrency groups are shared by the repository's workflows, so the group
+# is named after this file and the ref (github.workflow is only the name,
+# which another workflow may have too). Any workflow can still join a group
+# on purpose (a pull request's run uses the pull request's workflow files)
+# and cancel a run: publish can be run again (docs/HANDOFF.md, round four).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow_ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -165,11 +173,13 @@ jobs:
         run: echo "$TARGET=$DIGEST" >> "$GITHUB_OUTPUT"
 
   # The binaries, chart packages, SHA256SUMS and notes. Pull requests and
-  # main: a dry run, nothing is published. A tag: handed to publish as an
-  # artifact. No write token, no caches either way.
+  # main: a dry run with made-up image digests, nothing is published. A tag:
+  # the charts pin the digests the image job pushed, and everything goes to
+  # attest and publish as an artifact. No write token, no caches either way.
+  # It waits for image (skipped on pull requests), whose digests a tag needs.
   release-assets:
-    needs: verify-tag
-    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    needs: [verify-tag, image]
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') && (github.ref_type != 'tag' || needs.image.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -183,18 +193,24 @@ jobs:
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.22.1
+          # Fail rather than install helm without its published checksum.
+          checksum-policy: required
       - name: build
+        env:
+          AGENT_DIGEST: ${{ needs.image.outputs.agent }}
+          SERVER_DIGEST: ${{ needs.image.outputs.server }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            scripts/release-build.sh "${GITHUB_REF_NAME#v}"
+            scripts/release-build.sh "${GITHUB_REF_NAME#v}" "$AGENT_DIGEST" "$SERVER_DIGEST"
             if [ ! -s notes.md ]; then
               echo "CHANGELOG.md has no section '## ${GITHUB_REF_NAME}'" >&2
               exit 1
             fi
           else
-            scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}"
-            # What publish adds to the notes, with made-up digests.
+            # Made-up digests: these images are not released. Then what
+            # publish adds to the notes.
             zero=sha256:$(printf '%064d' 0)
+            scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}" "$zero" "$zero"
             scripts/release-notes.sh v0.0.0 "$zero" "$zero" >/dev/null
           fi
       - if: github.ref_type == 'tag'
@@ -207,24 +223,71 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  publish:
+  # Signed build provenance (this workflow, the tag, the commit, this run)
+  # for every file of the release and both images by digest, before anything
+  # is published. Kept in GitHub's attestation store, checked with
+  # `gh attestation verify` (README.md and the release notes say how). The
+  # only job that may sign, and it runs nothing but download-artifact and
+  # attest: any action of a job with id-token: write could sign as
+  # images.yml for this tag. It runs before the release environment's
+  # approval: provenance says how the files and images were built, the
+  # release that publish creates says they were released.
+  attest:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [verify-tag, image, release-assets]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # A Sigstore certificate for this run (OIDC token), and GitHub's
+      # attestation store.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+      - name: the image digests
+        env:
+          AGENT_DIGEST: ${{ needs.image.outputs.agent }}
+          SERVER_DIGEST: ${{ needs.image.outputs.server }}
+        run: |
+          for digest in "$AGENT_DIGEST" "$SERVER_DIGEST"; do
+            if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "no image digest: '$digest'" >&2
+              exit 1
+            fi
+          done
+      - name: attest the release files
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: attest the agent image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/saremox/hopcorder-agent
+          subject-digest: ${{ needs.image.outputs.agent }}
+      - name: attest the server image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/saremox/hopcorder-server
+          subject-digest: ${{ needs.image.outputs.server }}
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-tag, image, release-assets, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
     # One release at a time, so two approved tags cannot both pass the
-    # checks below before either is released.
+    # checks below before either is released. Named after this file (see
+    # the workflow's concurrency).
     concurrency:
-      group: ${{ github.workflow }}-publish
+      group: .github/workflows/images.yml publish
     permissions:
       contents: write
       packages: write
       actions: read
-      # Build provenance attestations: a Sigstore certificate for this run
-      # (OIDC token) and GitHub's attestation store. Only this job has them.
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -251,27 +314,10 @@ jobs:
               exit 1
             fi
           done
-      # Signed build provenance (this workflow, the tag, the commit, this
-      # run) for every file of the release and both images by digest, before
-      # anything is published. Kept in GitHub's attestation store, checked
-      # with `gh attestation verify` (the release notes say how).
-      - name: attest the release files
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/*
-      - name: attest the agent image
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ghcr.io/saremox/hopcorder-agent
-          subject-digest: ${{ needs.image.outputs.agent }}
-      - name: attest the server image
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ghcr.io/saremox/hopcorder-server
-          subject-digest: ${{ needs.image.outputs.server }}
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.22.1
+          checksum-policy: required
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
@@ -314,33 +360,16 @@ jobs:
           for chart in hopcorder-server hopcorder-agent; do
             helm push "dist/$chart-$version.tgz" oci://ghcr.io/saremox/charts
           done
+      # A draft first, published only once it has exactly this run's files
+      # and the tag still names this commit; checked again once published.
+      # Anyone with write access can create a release of the tag, or change
+      # a draft, before then (scripts/release-publish.sh).
       - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           AGENT_DIGEST: ${{ needs.image.outputs.agent }}
           SERVER_DIGEST: ${{ needs.image.outputs.server }}
         run: |
           scripts/release-notes.sh "$GITHUB_REF_NAME" "$AGENT_DIGEST" "$SERVER_DIGEST" >> notes.md
-          pre=()
-          case $GITHUB_REF_NAME in *-*) pre=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag "${pre[@]}" \
-            --title "hopcorder $GITHUB_REF_NAME" --notes-file notes.md
-          # A release belongs to a tag name, not a commit, and GitHub ignores
-          # --target for a tag that exists: if the tag was moved after this
-          # run checked it, the release now shows another commit. So check
-          # the tag again now that the release exists (with immutable
-          # releases it can no longer move), and take the release down if
-          # it has moved. Its images, charts and files are this commit's.
-          tag_commit() {
-            local obj
-            obj=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type + " " + .object.sha') || return
-            if [ "${obj%% *}" = tag ]; then # annotated: the commit it names
-              obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha') || return
-            fi
-            echo "$obj"
-          }
-          if ! tagged=$(tag_commit) || [ "$tagged" != "commit $GITHUB_SHA" ]; then
-            echo "::error::$GITHUB_REF_NAME is now '${tagged:-unknown}', not commit $GITHUB_SHA, which this run built: deleting the release $GITHUB_REF_NAME again (the tag stays)"
-            gh release delete "$GITHUB_REF_NAME" --yes
-            exit 1
-          fi
+          scripts/release-publish.sh "$GITHUB_REF_NAME"

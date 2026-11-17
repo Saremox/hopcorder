@@ -836,7 +836,8 @@ added in the commit that introduced it.
   `:latest` (a pre-release only `:<version>`) and pushes the charts with
   that version and appVersion to `oci://ghcr.io/saremox/charts`. Charts
   default to their appVersion as the image tag, so a chart runs the images
-  of its own release.
+  of its own release (since round four by digest: `image.digest`, written
+  into the packages).
 - **Releases**: `release-assets` builds the static Linux binaries (amd64,
   arm64; with the license, README, example configs and systemd units), the
   chart packages and `SHA256SUMS`, with the tag's section of `CHANGELOG.md`
@@ -845,7 +846,9 @@ added in the commit that introduced it.
   `main` that is a dry run; for a tag the files go to `publish`, which
   attests them and both image digests and creates the GitHub release from
   them, the notes followed by the digests and how to verify them (round
-  three). The binaries and images carry the
+  three; since round four the `attest` job attests, and `publish` creates
+  the release as a draft and checks it before publishing). The binaries and
+  images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -2107,7 +2110,8 @@ high-severity issue. Four fixes followed. The decisions:
   - **Build provenance attestations** (`actions/attest` v4.2.2, pinned by
     commit; the action that `attest-build-provenance` v4 wraps, which its
     README recommends for new workflows). `id-token: write` and
-    `attestations: write` are on `publish` only. It attests every file in
+    `attestations: write` are on `publish` only (round four: on the
+    `attest` job only, which runs nothing else). It attests every file in
     `dist/` (archives, chart packages, `SHA256SUMS`) and both image digests
     (the multi-arch indexes, by `subject-digest`) before it publishes
     anything. The attestations live in GitHub's attestation store; they are
@@ -2121,6 +2125,12 @@ high-severity issue. Four fixes followed. The decisions:
     pushed the tag. So `gh attestation verify … --signer-workflow
     Saremox/hopcorder/.github/workflows/images.yml --source-ref
     refs/tags/vX.Y.Z` tells a replaced file or image from a released one.
+    (Round four: not with these flags. gh matches `--signer-workflow` as a
+    regex anchored at the start only, so `images.yml.evil.yml` passed, and
+    `--source-ref` ignoring case, so a tag `VX.Y.Z` passed; and without
+    `--source-digest` any commit did. README and the notes now use
+    `--cert-identity …/images.yml@refs/tags/vX.Y.Z`, compared exactly,
+    and the tag's commit; see round four.)
     It detects replacement, it does not prevent it, and helps only users
     who verify.
   - **Digests in the release notes**: `scripts/release-notes.sh` appends
@@ -2132,7 +2142,9 @@ high-severity issue. Four fixes followed. The decisions:
   - Charts: `helm pull`, `gh attestation verify` on the `.tgz` (an OCI
     chart's content layer is that file), then install from the file.
     `--set image.tag=X.Y.Z@sha256:…` pins the image in both charts without
-    a template change.
+    a template change. (Round four: a verified chart still pulled the
+    mutable tag unless one did; a release's charts now carry their images'
+    digests, and README installs the release's `.tgz`.)
   - **No environment-only credential.** Considered: an environment secret
     (a bot's classic PAT, as ghcr takes nothing finer) with a fallback to
     `GITHUB_TOKEN`. It only helps once no other workflow can write the
@@ -2141,7 +2153,11 @@ high-severity issue. Four fixes followed. The decisions:
     packages with `GITHUB_TOKEN`, so that would break main's images, and
     keeping them would take a separate package for main. Release files are
     protected by immutable releases, not by a credential. Left to the
-    owner; not implemented.
+    owner; not implemented. (Round four: once published. Until then anyone
+    with write access can create a release of the pushed tag, or add files
+    to the draft that `gh release create` uploads into, and the release
+    attestation then vouches for those too; `publish` now checks a draft
+    and fails loudly, see round four.)
   - Accepted: whoever can push a workflow file can publish something. The
     defence is detection plus the repository settings.
 - **The tag is checked again once the release exists.** A release belongs
@@ -2151,7 +2167,10 @@ high-severity issue. Four fixes followed. The decisions:
   the release about a minute later. Now it resolves the tag through the API
   after creating the release, peeling an annotated tag. Unless the tag
   names `$GITHUB_SHA`, it deletes the release (the tag stays) and fails; an
-  API error counts as a mismatch. With immutable releases the tag cannot
+  API error counts as a mismatch. (Round four: it peeled one level, so a
+  genuine release of a tag of a tag was deleted, and so was one after any
+  API error. It now peels every level, retries, and deletes only on a
+  confirmed mismatch.) With immutable releases the tag cannot
   move once the release exists, so the check is final. Without them it can
   move later anyway, which only the tag ruleset prevents. The images,
   charts and files stay: they were built and attested from this commit.
@@ -2277,10 +2296,15 @@ high-severity issue. Four fixes followed. The decisions:
     update and deletion, bypassed only by the Repository admin role, not by
     GitHub Actions or an app. It keeps stray tags out of the Go module
     proxy and the release workflow, and makes `--source-ref refs/tags/v…`
-    mean a maintainer's tag.
+    mean a maintainer's tag. (Round four: gh compares `--source-ref`
+    ignoring case, and whether `v*` also matches `V…` was not checked, so
+    README now names the tag in `--cert-identity`, compared exactly; a
+    ruleset on all tags is recommended.)
   - Immutable releases: a published release's files and tag can no longer
     change (and `gh release verify` / `gh release verify-asset` check
-    GitHub's attestation of the release).
+    GitHub's attestation of the release). (Round four: that attestation
+    shows a file is part of the release, not who built it; and nothing
+    protects a release before it is published.)
   - Required reviewers on the `release` environment, whose deployment
     branches and tags are limited to `v*` tags (no branches). That gates
     `images.yml`'s publishing against mistakes and a stray tag run, not
@@ -2628,4 +2652,193 @@ decisions:
 
 **CI, release and deployment**
 
-<!-- round four: deployment -->
+- **Verifying names the workflow file, the tag and the commit exactly.**
+  README's command (`--signer-workflow …/images.yml --source-ref
+  refs/tags/vX.Y.Z`, no `--source-digest`) let a collaborator's build pass,
+  as gh 2.89 reads the flags (its source, with sigstore-go 1.1.4):
+  `--signer-workflow` becomes the regex `^https://github.com/<value>`,
+  anchored at the start only and with unescaped dots, so a workflow
+  `images.yml.evil.yml` (or `imagesXyml.yml`) of any tagged commit passed;
+  `--source-ref` and `--source-digest` are compared ignoring case, so a tag
+  `V0.1.2` at their own commit, whose `images.yml` triggers on `V*`, passed
+  for `v0.1.2` (if the `v*` ruleset does not cover `V*`, which the review
+  could not check); and an empty `--source-digest` checks nothing. Then
+  ghcr Write let them repoint `:0.1.2`, `:latest` and the chart. Now:
+  - `--cert-identity
+    https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/vX.Y.Z`
+    (sigstore-go compares the certificate's SAN with `!=`: exact, case
+    included), `--source-ref refs/tags/vX.Y.Z`, `--source-digest <commit>`
+    and `--deny-self-hosted-runners`, for files and `oci://` images, in
+    README (in full, as a shell function `verify`) and in the notes
+    (`scripts/release-notes.sh`).
+  - README takes the commit from the tag, not from the notes, which belong
+    to the release (anyone with write access can create a release of a
+    pushed tag before `publish` does):
+    `git ls-remote … 'refs/tags/vX.Y.Z^{}'`, keeping exactly that ref, since
+    ls-remote matches patterns against the end of ref names and also lists
+    a tag `a/refs/tags/vX.Y.Z^{}`; `${commit:?}` refuses to verify without
+    one.
+  - The SAN's spelling (`Saremox/hopcorder`, as `github.repository` has it)
+    and the flags were checked against gh's source, not against a real
+    attestation: v0.1.1 has none. The first release after this is the test.
+  - `scripts/verify_test.go` runs the notes' commands and README's blocks
+    with a fake `gh` and `git` and checks every `gh attestation verify`
+    against a model of gh 2.89's checks: the release's certificate passes;
+    a `V` tag, `images.yml.evil.yml`, `imagesXyml.yml`, a branch, another
+    commit and another repository fail; no verify runs without the commit;
+    round three's flags accept the `V` certificate, as the review found.
+- **The release is published only once it is exactly this run's.**
+  Immutable releases protect a release once it is published, not before.
+  After the tag is pushed, `publish` waits for verify-tag (ci, up to 25
+  minutes), the builds and the approval; meanwhile anyone with write access
+  could create and publish a release of the tag (the tag ruleset is not
+  involved). And `gh release create` with files creates a draft, uploads,
+  then publishes, and a draft can be changed: an added file stays for good.
+  GitHub's attestation of the release then vouches for their files:
+  `gh release verify-asset` checks a SAN of `*.releases.github.com` only,
+  so it proves a file is part of the release, not who built it. Now
+  `scripts/release-publish.sh` (the last step of `publish`):
+  - creates the release with `--draft` and finds it again by its id (`gh
+    release view/edit <tag>` ask for the published release and a draft of
+    the tag at once and take whichever answers first; GitHub allows
+    several drafts of a tag, and a draft next to a published release). It
+    must be the only release of the tag, drafts included.
+  - compares its files with `dist/` by name and GitHub's SHA-256 digest of
+    each asset (uploaded ones; a digest not computed yet is asked for
+    again): none missing, none different, none added; and its tag, title,
+    notes and pre-release flag.
+  - checks the tag (below), publishes by id (`PATCH draft=false`, which is
+    what gh does after uploading; if the answer is lost, the release says
+    whether it was published), then checks the files and the tag again.
+    A warning if GitHub does not report the release as immutable.
+  - Before publishing, any difference deletes this run's draft and fails,
+    saying that someone else created or changed the release, with each
+    asset's uploader; someone else's release stays, to be looked at. After
+    publishing, a difference GitHub confirms deletes the release (the tag
+    stays), as a moved tag did.
+  - `release-verify.sh` says what "a release of vX.Y.Z exists already"
+    means: no run of this workflow published it, so someone else did; look
+    at it, point no one at it, release the next version. A draft (which
+    only `publish` sees) is a cancelled run's or someone else's: look at
+    it, delete it, run `publish` again.
+  - Accepted: someone else's release of a pushed tag, published first, stays
+    and is immutable; `publish` only refuses to add its own and says so.
+    The build provenance tells theirs apart (`verify` fails for files
+    `images.yml` did not build for the tag's commit). Fewer people with
+    write access is the only prevention.
+  - `scripts/publish_test.go` runs the script against a fake GitHub
+    (releases, refs and annotated tags kept between calls; failing calls;
+    someone else acting between the script's calls): a release of the tag
+    published or drafted by someone else, a file added to, replaced in or
+    removed from the draft, its notes changed, a file added and someone
+    else's release published right before publishing, digests computed
+    late, a missing tag. The step it replaces passes none of the
+    someone-else cases.
+- **The tag check peels every annotated tag and deletes only on a confirmed
+  mismatch.** It peeled one level, so a tag of a tag (`git tag -a v0.2.0
+  v0.2.0-rc.1`, about which git only prints a hint) passed every earlier
+  check (`^{commit}` peels fully) and then had its genuine release deleted,
+  after the images, charts and attestations were out; and any API error
+  counted as a mismatch. Now it follows annotated tags (up to 10 levels),
+  tries each API call up to 5 times, 10 s apart, and deletes the release
+  only when GitHub says the tag names something else; when GitHub cannot
+  tell, it fails without deleting and says what to check by hand. It runs
+  before publishing (a moved tag deletes the draft; nothing is published)
+  and after. Tested: lightweight, annotated and nested tags kept; a tag
+  moved before and while publishing; API errors that pass; errors that do
+  not, before (draft deleted) and after publishing (release kept).
+- **Install: download, check, unpack without owners.** README piped
+  v0.1.1's archive into `tar -xz`. Its entries belong to 1001/1001 (round
+  three's root-owned archives start with the next release), so unpacked as
+  root uid 1001 owned the binary, and nothing was saved to check. Now
+  `curl -fLO`, `sha256sum -c SHA256SUMS` (v0.1.1 has no attestations; README
+  says this checks the download, not who built it) or `verify` for later
+  releases, then `tar --no-same-owner -xzf`; `TestReadmeInstall` fails if a
+  README block pipes into tar, unpacks without `--no-same-owner` or before
+  a check. Move the examples to v0.1.2 once it is out.
+- **A release's charts run its images by digest.** A verified chart still
+  pulled `:X.Y.Z` (`IfNotPresent`), which any workflow with `packages:
+  write` can repoint, so new nodes would run a replaced root agent.
+  - `release-assets` needs the `image` job and, for a tag, its success; on
+    pull requests (`image` skipped) and main (its result ignored) it runs
+    as before, as the dry run, with made-up digests. A tag's binaries and
+    charts are now built after its images, not alongside.
+  - `release-build.sh` takes both digests, writes them into the packaged
+    charts' `image.digest` and checks that each package renders
+    `ghcr.io/saremox/<chart>:<version>@<digest>`.
+  - Both charts render `repository:appVersion@digest` while `image.tag` is
+    empty, and the tag alone without a digest (a checkout, as before). A
+    tag of your own replaces both: otherwise `--set image.tag=main` with a
+    released chart would run the release by digest while claiming `main`
+    (a reference with both resolves by digest); `tag: X.Y.Z@sha256:…` still
+    pins. A digest that is not `sha256:<64 hex digits>` is refused. ci's
+    helm job checks all four renderings for both charts (the agent in both
+    modes) and the refusal; the dry run renders the packages.
+  - README installs the chart `.tgz` from the release (immutable once
+    published) rather than from ghcr, and checks it with `verify`.
+- **Signing has a job of its own.** `id-token: write` and `attestations:
+  write` were on `publish`, so every action there (checkout,
+  download-artifact, setup-helm, login-action) could have signed provenance
+  as `images.yml` for the tag. The `attest` job has them (and `contents:
+  read`), runs only download-artifact and attest (and a digest check in
+  bash), and `publish` lost them. It runs after `release-assets` and before
+  `publish`, so still before anything is published, but now before the
+  approval rather than after it. Provenance says how the files and images
+  were built; the release says they were released. A rejected run's builds
+  verify only for that tag's commit (`--source-digest`), and a version
+  without a release is not offered to anyone. The alternative, `attest`
+  in the `release` environment too, would ask for a second approval: each
+  job in an environment waits for its own.
+- setup-helm v5.1.0 has `checksum-policy`; images.yml sets `required`, so a
+  helm without its `.sha256sum` fails rather than installs with a warning
+  (the checksum comes from the same host, get.helm.sh: this catches a
+  broken download, not that host). ci.yml's helm job keeps `auto`: round
+  four changes ci.yml only by its assertions.
+- Dependabot waits 7 days after a version is published before proposing it
+  (`cooldown: {default-days: 7}`, all five ecosystems); security updates do
+  not wait.
+- **Concurrency groups** are the repository's, shared by every workflow:
+  `images-publish` could be joined by any workflow with
+  `cancel-in-progress` to cancel a publish half-way. They are now named
+  after the file (`github.workflow_ref` for runs, `.github/workflows/
+  images.yml publish` for publish) rather than the workflow's name, which
+  another workflow may share. Accepted: any workflow can still join a group
+  on purpose (a pull request's run uses the pull request's workflow files,
+  from a fork too), a denial of service only. A cancelled `publish` can be
+  run again: tagging the images and pushing the charts repeat harmlessly,
+  and a draft it left makes `release-verify.sh` stop and say to delete it.
+  Cancelled after publishing the release, check that release by hand
+  (files against `SHA256SUMS`, the tag).
+- **Only on a real tag push**: the attestations' SAN with `--cert-identity`;
+  GitHub's asset `digest` and `immutable` fields and the release's notes as
+  sent (the fake has them as gh's source reads them); `PATCH draft=false`
+  on a draft of an existing tag; the `attest` job's permissions (artifact
+  download and attest without `actions: read`); matrix outputs of `image`
+  reaching `release-assets`; `checksum-policy: required` against
+  get.helm.sh.
+- **Repository settings** still recommended (round three's list is set):
+  - The tag ruleset on all tags (`~ALL`), or at least `V*` too: whether
+    `v*` matches case-insensitively was not checked. README's flags no
+    longer accept a `V` tag, but the ruleset is what makes a tag's run a
+    maintainer's.
+  - Main: require a pull request with one approval and code-owner review
+    for `.github/**`, `scripts/**`, `Dockerfile`, `deploy/**`,
+    `go.mod`/`go.sum` and `ui/package*.json`; dismiss stale approvals and
+    require approval of the latest push (a single maintainer: an admin
+    bypass for pull requests only). Required checks alone constrain no one
+    with write access, since a pull request can redefine `test` and the
+    rest.
+  - Actions: require actions pinned to full-length commit SHAs, an
+    allow-list of action owners, and approval for every fork pull request
+    run of an outside contributor (also against joining a concurrency
+    group).
+  - ghcr: `:main` in packages of its own, so the release packages can be
+    Read for Actions and pushed only with an environment credential: the
+    only fix for collaborators overwriting images and charts.
+  - Fewer people with write access: any of them can create a release of a
+    pushed tag before `publish` does.
+  - Still to be checked with GitHub's documentation (blocked here):
+    whether a collaborator can edit an immutable release's notes, and
+    whether an immutable release can be deleted and its tag name reused
+    (`publish` deletes a release on a confirmed difference; if the name
+    cannot be reused, that version is skipped, and the next one released).

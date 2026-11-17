@@ -7,6 +7,12 @@
 image:
   repository: ghcr.io/saremox/hopcorder-agent
   tag: ""                     # default: the chart's appVersion
+  # The digest (sha256:...) of the appVersion's image, used while tag is
+  # empty: the chart then runs repository:appVersion@digest, whatever the
+  # tag names by now. The charts of a release carry their images' digests;
+  # empty (a checkout), the tag alone names the image. A tag of your own
+  # replaces both (tag: X.Y.Z@sha256:... pins it).
+  digest: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 nameOverride: ""

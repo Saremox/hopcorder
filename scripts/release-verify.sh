@@ -66,9 +66,14 @@ for ((i = 1; ; i++)); do
   esac
 done
 
-releases=$(gh release list --limit 1000 --json tagName,isLatest)
+releases=$(gh release list --limit 1000 --json tagName,isLatest,isDraft)
+# Anyone with write access can create a release of a pushed tag, before
+# this workflow does: say what that means.
+if jq -e --arg t "$tag" 'any(.[]; .tagName == $t and .isDraft)' <<<"$releases" >/dev/null; then
+  fail "a draft release of $tag exists: left by a cancelled run of publish, or someone else's. Look at it (files, notes, who uploaded them); then delete it and run publish again"
+fi
 if jq -e --arg t "$tag" 'any(.[]; .tagName == $t)' <<<"$releases" >/dev/null; then
-  fail "a release of $tag exists already: release the next version instead"
+  fail "a release of $tag exists already. If no run of this workflow published it, someone else did: look at it (files, notes, author) before anything else, and do not point anyone at it. Release the next version"
 fi
 latest=$(jq -r '.[] | select(.isLatest) | .tagName' <<<"$releases")
 if [ -n "$latest" ]; then

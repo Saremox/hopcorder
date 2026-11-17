@@ -218,8 +218,38 @@ The section for a version is the text of its GitHub release.
 - Go: install a released version (`go install …@v0.1.1`), not `@latest`:
   the Go module proxy takes any `v*` tag as a version, released or not, and
   keeps it. `go.mod` retracts the withdrawn v0.1.0.
-
-<!-- round four: deployment -->
+- Verify a release with `--cert-identity
+  https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/vX.Y.Z`,
+  `--source-ref refs/tags/vX.Y.Z` and `--source-digest` with the tag's
+  commit (README has the full commands, the notes the same with the commit
+  filled in). README's previous command (`--signer-workflow`, no
+  `--source-digest`) also accepted builds of a workflow file whose name
+  only starts with `images.yml`, and of a tag `VX.Y.Z` at another commit:
+  gh matches that flag as a prefix, and refs and commits ignoring case.
+- Install: README now downloads the archive, checks it, and unpacks it with
+  `tar --no-same-owner`. Piped into `tar -xz` as root, v0.1.1's archive
+  left uid 1001 owning the binary, and nothing was kept to check. v0.1.1
+  has no attestations: its `SHA256SUMS` shows the download is intact, not
+  who built it.
+- The release job creates the release as a draft and publishes it only if
+  it is the only release of the tag and has exactly the files the job built
+  (by SHA-256, none missing or added), then checks again. Until a release
+  is published, anyone with write access could create one for the pushed
+  tag or add files to its draft, and GitHub's release attestation (`gh
+  release verify-asset`) vouches for whatever a release holds: it shows a
+  file is part of the release, not who built it. If the release job fails
+  with "a release of vX.Y.Z exists already", someone else released that
+  tag.
+- The release job no longer deletes a genuine release when its tag is a tag
+  of a tag (`git tag -a v1.0.0 v1.0.0-rc.1`) or when GitHub's API fails: it
+  peels every annotated tag, retries, and deletes only on a confirmed
+  mismatch.
+- Helm: a release's charts run its images by digest (`image.digest`), so
+  repointing `:X.Y.Z` in ghcr no longer changes what a verified chart runs.
+  Install the chart `.tgz` from the GitHub release. Charts from a checkout,
+  and `image.tag` set by you, work as before.
+- The release's signing runs in a job of its own that does nothing else, and
+  Dependabot proposes a new version only once it is 7 days old.
 
 ## v0.1.1
 

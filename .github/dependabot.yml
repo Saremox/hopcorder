@@ -3,6 +3,10 @@
 # images of the docker-compose try-out stack. Minor and patch updates are
 # grouped into one PR per ecosystem and week.
 #
+# Each waits 7 days after a version is published before proposing it
+# (cooldown), so a hijacked release that is caught and pulled within days
+# never reaches a pull request; security updates do not wait.
+#
 # Not covered, updated by hand: go.mod's toolchain line (it must name the Go
 # release of the Dockerfile's image, which ci checks, so an update of that
 # image needs it too), the BuildKit image in images.yml (driver-opts), the
@@ -13,24 +17,29 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       actions: {update-types: [minor, patch]}
   - package-ecosystem: docker
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
   - package-ecosystem: gomod
     directory: /
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       go: {update-types: [minor, patch]}
   - package-ecosystem: npm
     directory: /ui
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       ui: {update-types: [minor, patch]}
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule: {interval: weekly}
+    cooldown: {default-days: 7}
     groups:
       compose: {update-types: [minor, patch]}
     ignore:

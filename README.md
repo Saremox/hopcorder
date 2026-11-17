@@ -41,26 +41,54 @@ are fixed: it is a try-out, not a deployment.
 
 Releases ([GitHub releases](https://github.com/Saremox/hopcorder/releases),
 changes in [`CHANGELOG.md`](CHANGELOG.md)) have static Linux binaries for
-amd64 and arm64, with the example configs and systemd units:
+amd64 and arm64, with the example configs and systemd units. Download the
+archive, check it, then unpack it; `--no-same-owner` gives the files to
+whoever unpacks them, not to the owner stored in the archive (v0.1.1's
+entries belong to uid 1001, which GNU tar run as root restores):
 
 ```bash
-curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.1/hopcorder_0.1.1_linux_amd64.tar.gz | tar -xz
+v=0.1.1
+curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/hopcorder_${v}_linux_amd64.tar.gz"
+curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar --no-same-owner -xzf "hopcorder_${v}_linux_amd64.tar.gz"
 ```
 
-Releases after v0.1.1 also carry signed build provenance for every file and
-both images, and their notes list the image digests. Check an archive with
-the [GitHub CLI](https://cli.github.com/) before you install it (the notes
-of each release have the exact commands):
+v0.1.1 has no attestations: its `SHA256SUMS` shows that the download is
+intact, not who built it (anyone with write access to the repository could
+have replaced both). Releases after v0.1.1 carry signed build provenance for
+every file and both images, and their notes list the image digests. Check a
+file or image with the [GitHub CLI](https://cli.github.com/) (2.89 checked;
+one too old for a flag fails) before you use it:
 
 ```bash
-gh attestation verify hopcorder_X.Y.Z_linux_amd64.tar.gz --repo Saremox/hopcorder \
-  --signer-workflow Saremox/hopcorder/.github/workflows/images.yml --source-ref refs/tags/vX.Y.Z
+v=X.Y.Z  # the release
+# The commit of the tag, from the repository (exactly this ref: ls-remote
+# also lists any tag whose name ends in it).
+commit=$(git ls-remote https://github.com/Saremox/hopcorder "refs/tags/v$v^{}" |
+  awk -v ref="refs/tags/v$v^{}" '$2 == ref {print $1}')
+verify() {
+  gh attestation verify "$1" --repo Saremox/hopcorder --deny-self-hosted-runners \
+    --cert-identity "https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/v$v" \
+    --source-ref "refs/tags/v$v" --source-digest "${commit:?no such tag}"
+}
+verify "hopcorder_${v}_linux_amd64.tar.gz"
+digest=sha256:…  # the agent image's, from the release notes
+verify "oci://ghcr.io/saremox/hopcorder-agent@$digest"
 ```
 
-That proves the file was built by this repository's `images` workflow for
-the tag `vX.Y.Z`; anyone with write access to the repository can still
-replace a release's files and images, which the attestation then no longer
-matches (see [Releasing](#releasing)).
+That proves the file or image was built by this repository's
+`.github/workflows/images.yml` for the tag `vX.Y.Z`, from the commit the tag
+names. Use these flags, not looser ones: gh compares `--cert-identity`
+exactly, while `--signer-workflow` accepts any workflow file whose name
+starts with `images.yml`, and `--source-ref` and `--source-digest` ignore
+case (so a tag `VX.Y.Z` would pass), and an empty `--source-digest` checks
+nothing. The release notes print the same commands with the commit filled
+in, but take the commit from the tag as above: the notes are part of the
+release, which someone else may have created (see [Releasing](#releasing)).
+`gh release verify-asset` is no substitute: it shows that a file is part of
+the release, not who built it. Anyone with write access to the repository
+can still replace the images, which the attestation then no longer matches.
 
 Or build a release; requires Linux and Go 1.27+:
 
@@ -91,7 +119,7 @@ Tags: releases (`v*` tags) are `<version>` (e.g. `0.1.1`), `<major>.<minor>`
 and `latest`, built without caches; `main` and `sha-<commit>` follow the
 `main` branch. Tags can be moved; for a fixed image use the digest from the
 release notes (`ghcr.io/saremox/hopcorder-agent:X.Y.Z@sha256:…`, which
-`gh attestation verify oci://…` checks like a file).
+`verify oci://…` above checks like a file).
 
 ```bash
 docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET_RAW \
@@ -115,26 +143,38 @@ capabilities to root; give it `NET_RAW` and nothing else. `docker build --target
 ### Kubernetes
 
 Helm charts for both live in [`deploy/helm`](deploy/helm); each release
-publishes them to `oci://ghcr.io/saremox/charts` (and attaches them to the
-GitHub release):
+attaches the packages to the GitHub release and pushes them to
+`oci://ghcr.io/saremox/charts`. Install the release's file: a release
+published with immutable releases on (after v0.1.1) keeps its files, while
+anyone with write access to the repository can replace a chart in ghcr.
+Releases after v0.1.1 have charts that run their images by digest, and that
+`verify` (above) checks like any file:
+
+```bash
+v=0.1.1
+for c in hopcorder-server hopcorder-agent; do
+  curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/$c-$v.tgz"
+done
+sha256sum --ignore-missing -c SHA256SUMS  # from the release, as above
+```
 
 With a ClickHouse of its own (a single pod next to the server, see below):
 
 ```bash
-helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
+helm install hopcorder-server ./hopcorder-server-0.1.1.tgz \
   --set clickhouse.deploy.enabled=true
 ```
 
 Or with an existing ClickHouse:
 
 ```bash
-helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
+helm install hopcorder-server ./hopcorder-server-0.1.1.tgz \
   --set config.clickhouse.url=http://clickhouse.db:8123 \
   --set clickhouse.passwordSecret.name=clickhouse-password
 ```
 
 ```bash
-helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --version 0.1.1 \
+helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   --set server.url=http://hopcorder-server:8080 \
   --set 'config.targets[0].host=example.net' \
   --set 'config.targets[1].host=192.0.2.10' --set 'config.targets[1].protocol=tcp'
@@ -187,13 +227,15 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   create a pod anywhere can give it any label.
 
 Every value is documented in the charts' `values.yaml`. A chart runs the
-image of its own version; `--set image.tag=main` follows `main` instead (or
-install from `deploy/helm` in a checkout), and `--set
-image.tag=X.Y.Z@sha256:…` pins the digest from the release notes. To check a
-chart first, `helm pull` it, run `gh attestation verify` on the `.tgz` (as
-above) and install that file. CI installs both charts into a
-kind cluster, the server with its own ClickHouse, and checks that records
-arrive.
+image of its own version: a release's chart (after v0.1.1) by the digest it
+was released with (`image.digest`), so moving the image's tag changes
+nothing; a chart from `deploy/helm` in a checkout, by tag. `--set
+image.tag=main` follows `main` instead (a tag of your own replaces the
+digest; `image.tag=X.Y.Z@sha256:…` pins one). The same charts are at
+`oci://ghcr.io/saremox/charts/hopcorder-server` (`--version X.Y.Z`); check
+what `helm pull` downloads with `verify` before you install it. CI installs
+both charts into a kind cluster, the server with its own ClickHouse, and
+checks that records arrive.
 
 ### Privileges: `CAP_NET_RAW`, not root
 
@@ -816,28 +858,43 @@ commit of `main` whose `ci` run succeeded (it waits for one still running),
 above the latest release, and not released before. It then builds, all
 without caches, the images (pushed only as `:sha-<commit>`, by a job that
 may write packages and nothing else) and, in a job without write tokens, the
-Linux binaries, chart packages and checksums. The `publish` job, in the
-`release` environment (where required reviewers approve it), checks again,
-attests every release file and both image digests (signed build provenance),
-tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as
-`vX.Y.Z-rc.1` only `:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and
-creates the GitHub release, whose notes get the image digests and the
-`gh attestation verify` commands
-([`scripts/release-notes.sh`](scripts/release-notes.sh)). If the tag no longer
-names the commit it built by then, it deletes the release again and fails.
-A version is released once; to fix a release, release the next version. Pull
-requests run all of it but the publishing.
+Linux binaries, chart packages (which run those images by digest) and
+checksums. The `attest` job, the only one that can sign and which runs
+nothing else, attests every release file and both image digests (signed
+build provenance). The `publish` job, in the `release` environment (where
+required reviewers approve it), checks again, tags the images `:X.Y.Z`,
+`:X.Y` and `:latest` (a pre-release such as `vX.Y.Z-rc.1` only
+`:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and creates the GitHub
+release, whose notes get the image digests and the `gh attestation verify`
+commands ([`scripts/release-notes.sh`](scripts/release-notes.sh)). It
+creates the release as a draft and publishes it only if the draft is the
+only release of the tag, has exactly the files the run built (by name and
+SHA-256: none missing, none changed, none added) and its notes, and the tag
+still names the commit it built, through any number of annotated tags (so
+promoting with `git tag -a v1.0.0 v1.0.0-rc.1` is fine); then it checks all
+that again, and deletes the release if GitHub confirms a difference
+([`scripts/release-publish.sh`](scripts/release-publish.sh)). A version is
+released once; to fix a release, release the next version. Pull requests
+run all of it but the attestations and the publishing.
 
 What the `release` environment does not do: it gates this workflow's
 `publish` job, not the repository's packages and releases. Anyone with write
 access can push a workflow of their own that asks for `packages: write` and
-`contents: write` and leaves the environment out, and replace the images,
-charts and release files of any version. The attestations show that (a
-replaced file or digest no longer matches one made by `images.yml` for the
-tag), and the repository settings limit it: a tag ruleset for `v*` that only
-the maintainers may bypass (not GitHub Actions), immutable releases, and
-required reviewers on `release`. Give write access only to people you would
-let release.
+`contents: write` and leaves the environment out, and replace the images
+and charts of any version, and the files of a release that is not
+immutable. They can also create a release of a tag that has none yet, and
+change a draft: immutable releases protect a release only once it is
+published. GitHub's attestation of a release (`gh release verify` and
+`verify-asset`) then vouches for their files as well, since it shows that a
+file is part of the release, not who built it. The build provenance shows it
+(a file or digest that `images.yml` did not build for the tag's commit
+fails the `verify` above), and `publish` fails loudly: `a release of vX.Y.Z
+exists already` or `someone else created a release`/`changed the draft`
+means that release is someone else's. Look at it, point no one at it, and
+release the next version. The repository settings limit all this: a tag
+ruleset that only the maintainers may bypass (not GitHub Actions),
+immutable releases, and required reviewers on `release`. Give write access
+only to people you would let release.
 
 ## License
 
