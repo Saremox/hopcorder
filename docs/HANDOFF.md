@@ -694,7 +694,9 @@ added in the commit that introduced it.
   remembers the last address seen at each TTL, treats silent hops as
   wildcards, and reports a change when a TTL answers from a different
   address, a reached destination is at a different distance, or the target
-  address changed. Gaining or losing reachability alone is not a path change.
+  address changed (since round six: further away only behind a TTL that
+  answered, see there). Gaining or losing reachability alone is not a path
+  change.
   `hopcorder_path_changes_total` uses it; **M2's path-change table must use
   the same algorithm** per `(agent_id, target, protocol, flow_id)` stream
   rather than comparing `path_hash`.
@@ -3394,7 +3396,42 @@ decisions:
 
 **Route changes**
 
-<!-- round six: distance -->
+- **A destination further away behind silent TTLs is no route change.**
+  The tracker reported any reached cycle at another distance than the last
+  one. When the destination's reply at its distance d was lost or late and
+  TTL d+1's arrived (adaptive mode probes d+1..d+3, and the destination
+  answers each), the cycle was a change to d+1 and the next normal one a
+  change back: two route changes per ordinary loss on the last hop, in
+  `hopcorder_path_changes_total`, the server's `path_changes` and the UI
+  and Grafana counts. 1% loss at the target gave 22 route changes in 930
+  cycles on an unchanged path, about 400 a day per target at 5 s (review,
+  round six, with the real binary). Now (`record.PathTracker`, shared by
+  agent and server):
+  - closer is a change, as before (the destination cannot answer below its
+    distance);
+  - further away is a change only if a TTL from d up to the new distance
+    answered (a router where the destination was); a TTL d that answered
+    from a new address was already a router change;
+  - otherwise the distance stays d, and the cycle is no change.
+  - Cost: a path that grows by hops that never answer, right before the
+    destination, is not reported, as with a router replaced by a silent
+    one (the wildcard rule). It is reported once one of those TTLs answers,
+    as a router change against the destination's address there. A
+    baseline cycle (the first, or the one after a change) with a lost
+    destination reply still gives one change on the next cycle (closer).
+    A two-cycle confirmation for silent growth was considered: still about
+    p² false changes per cycle, and a change's "before" cycle would be the
+    first one at the new distance.
+  - Tests: `TestPathTracker` (lost reply, twice in a row and with a
+    silent hop elsewhere; growth behind a router past the distance; growth
+    by a silent hop, then caught when it answers), `TestPathTrackerChangeDetail`
+    (further away is `distance` only behind a router nothing was known of)
+    and the server's `TestLostDestinationReplyIsNoRouteChange` (100 cycles,
+    every tenth with the reply lost: 20 route changes before, none now).
+  - The server's restored trackers replay the stream's recent cycles, so
+    after a restart a stream whose path grew by silent hops takes the
+    longer distance; a later return to the shorter one is then a change
+    there and not at the agent.
 
 **TCP flows**
 

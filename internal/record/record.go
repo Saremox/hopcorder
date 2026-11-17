@@ -434,7 +434,17 @@ func IntPtr(c int) *int { return &c }
 //
 //   - a different target address (the name resolved elsewhere);
 //   - a TTL answering from a different address than last seen there;
-//   - a reached destination at a different distance than last reached.
+//   - a reached destination closer than its distance;
+//   - a reached destination further away, where a TTL from its distance on
+//     answered as a router.
+//
+// A destination further away behind TTLs that are all silent is not a
+// change, and its distance stays: the destination's reply at its distance
+// was lost or late while the next TTL's arrived (the destination answers
+// every TTL from its distance on), and one ordinary loss made two route
+// changes, there and back (review, round six). A path that really grew by
+// silent hops is caught as any router replaced by a silent one is: when
+// one of those TTLs answers.
 //
 // Gaining or losing reachability alone is not a path change; it is visible
 // in Reached. The zero value is ready to use; it is not safe for concurrent
@@ -443,7 +453,7 @@ type PathTracker struct {
 	started bool
 	target  netip.Addr
 	ips     []netip.Addr // last address seen per TTL-1; invalid = unknown
-	dist    int          // last reached distance, 0 = unknown
+	dist    int          // the destination's distance, 0 = unknown
 }
 
 // PathChange describes why PathTracker considered a cycle a route change.
@@ -494,7 +504,9 @@ func (p *PathTracker) ObserveChange(rec *Record) (PathChange, bool) {
 			p.ips[h.TTL-1] = h.IP
 		}
 	}
-	if rec.Reached {
+	// A cycle that is no change reached the destination at its distance or
+	// further away behind silent TTLs: the distance stays.
+	if rec.Reached && p.dist == 0 {
 		p.dist = rec.PathLen
 	}
 	return ch, changed
@@ -519,8 +531,23 @@ func (p *PathTracker) differs(rec *Record) (PathChange, bool) {
 		ch.Reason = ReasonRouter
 		return ch, true
 	}
-	if rec.Reached && p.dist != 0 && rec.PathLen != p.dist {
+	if rec.Reached && p.dist != 0 && (rec.PathLen < p.dist || p.grew(rec)) {
 		return PathChange{Reason: ReasonDistance, PrevDistance: p.dist, Distance: rec.PathLen}, true
 	}
 	return PathChange{}, false
+}
+
+// grew reports whether rec, reached further away than p.dist, shows that
+// the path grew: a TTL from p.dist on answered, so the destination is no
+// longer there.
+func (p *PathTracker) grew(rec *Record) bool {
+	if rec.PathLen <= p.dist {
+		return false
+	}
+	for _, h := range rec.Hops {
+		if h.TTL >= p.dist && h.TTL < rec.PathLen && h.Status.Responded() {
+			return true
+		}
+	}
+	return false
 }

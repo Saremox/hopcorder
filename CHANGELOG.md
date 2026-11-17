@@ -70,8 +70,13 @@ The section for a version is the text of its GitHub release.
   of 2 GiB within seconds. Give only trusted users access to Grafana's
   ClickHouse data source; the compose try-out's anonymous viewers are for
   localhost only.
-
-<!-- round six: distance -->
+- Route changes: one lost or late reply from the destination, with the
+  next TTL's reply in, counted as two route changes on an unchanged path
+  (to one hop further, and back), in `hopcorder_path_changes_total`, the
+  server's path changes and the UI and Grafana: about 400 a day per target
+  at 1% loss. A destination further away now counts only if a TTL from its
+  old distance on answered as a router; behind silent TTLs it keeps its
+  distance.
 
 <!-- round six: tcp flows -->
 

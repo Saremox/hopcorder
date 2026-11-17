@@ -370,8 +370,11 @@ Derived per cycle:
   don't count route changes by comparing hashes. hopcorder decides route
   changes (for `hopcorder_path_changes_total`) by remembering the last
   address at each TTL and treating silent hops as wildcards: a change is a
-  TTL answering from a different address, a reached destination at a
-  different distance, or a different target address.
+  TTL answering from a different address, a reached destination closer
+  than before or further away behind a TTL that answered, or a different
+  target address. A destination further away behind TTLs that are all
+  silent is no change: that is what a lost reply from the destination
+  looks like.
 - **`loops`**: addresses that answered *time exceeded* at more than one TTL.
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
