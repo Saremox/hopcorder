@@ -1816,7 +1816,9 @@ high-severity issue. Four fixes followed. The decisions:
     shared domains.)
   - NOTES print the list (or warn when it is `*`). Entries are checked at
     template time (host name, `*.domain` or address, no port), so a bad one
-    fails the install instead of crash-looping the server.
+    fails the install instead of crash-looping the server. (Round four: the
+    check was looser than the server's, so `10.0.0.5:8080`, `cafe:443`,
+    `::::` and a 300-character name still crash-looped it; fixed there.)
   - Tests: `TestHostCheck` and `TestHostAllowlist` cover `*.domain`; the CI
     `helm` job renders the list (service names, ingress host, extra names,
     `*`, `config.allowed_hosts`) and the refusals; smoke.sh as above.
@@ -2596,6 +2598,22 @@ decisions:
     the first row and an error; before, the cut row was passed on),
     `TestTimeouts` (queries, inserts and statements without an answer in
     time still fail).
+- **The chart's Host check matches the server's.** Its regular expression
+  took `10.0.0.5:8080`, `cafe:443`, `::::` and 300-character names, which the
+  server refuses at start: the pod crash-looped instead of the install
+  failing. Both now take host names by label rules (labels of 1 to 63
+  letters, digits, `-` and `_`, not starting or ending with `-`; at most 253
+  characters and a trailing dot; the last label not all digits, which
+  would be a malformed IPv4 address), IPv4 as a dotted quad (0-255, no
+  leading zeros), IPv6 in RFC 3986's forms, bare or in brackets, and
+  `*.domain` of two labels at least; no ports. The chart may refuse what the
+  server takes (an IPv6 zone, an IPv4 address in brackets), never the
+  reverse, and it checks `config.allowed_hosts` the same way now.
+  - Checked: 600,000 random host-like strings through the chart's
+    expressions (rebuilt in Go): 35,877 accepted, every one by the server
+    too; 51 chosen entries through `helm template`, the same.
+  - Tests: `TestHostAllowlist`; the CI `helm` job's refusal checks (both
+    values, and that IPv6, wildcards and a 253-character name pass).
 - **Wildcards on a top-level domain are refused.** `*.com` allowed
   `attacker.com`: round three's argument holds only for a domain whose names
   the operator alone can create. A single label after `*.` is refused, in

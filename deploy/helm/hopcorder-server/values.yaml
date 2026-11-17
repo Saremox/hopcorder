@@ -170,8 +170,13 @@ service:
 # the other names clients use: another Ingress, a Gateway or a proxy that
 # passes the client's Host on, a NodePort or LoadBalancer address (the chart
 # refuses those Service types, and an ingress rule without host, until you
-# do). "*.example.net" allows one label below example.net. ["*"] turns the
-# check off. config.allowed_hosts, if set, replaces all of this.
+# do). "*.example.net" allows one label below example.net: only for a domain
+# whose names you alone can create, not a shared one (*.github.io, a hosting
+# or dynamic-DNS domain), and not a top-level domain ("*.com" is refused).
+# Entries are host names (labels of letters, digits, - and _, at most 253
+# characters), *.domain or IP addresses, without port; others fail the
+# install. ["*"] turns the check off. config.allowed_hosts, if set (checked
+# the same way), replaces all of this.
 allowedHosts: []
 clusterDomain: cluster.local
 

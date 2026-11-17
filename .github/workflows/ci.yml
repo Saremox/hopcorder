@@ -325,6 +325,22 @@ jobs:
           refused deploy/helm/hopcorder-server "${ing[@]}" --set-json 'ingress.hosts=[{"host":"","paths":[{"path":"/","pathType":"Prefix"}]}]'
           refused deploy/helm/hopcorder-server --set 'allowedHosts={hopcorder.example.net:8080}'
           helm template a deploy/helm/hopcorder-server --set service.type=LoadBalancer --set 'allowedHosts={192.0.2.7}' >/dev/null
+          # Entries are checked like the server checks them (it would refuse
+          # its config at start, and the pod crash-loop instead of the
+          # install failing), in allowedHosts and in config.allowed_hosts:
+          # ports, malformed addresses, label rules and 253 characters at
+          # most, and no wildcard on a top-level domain.
+          l=$(printf 'a%.0s' {1..63})
+          for h in 10.0.0.5:8080 cafe:443 :::: 1.2.3 256.0.0.1 '[::1]:8080' -a.example a..example "$l$l.example" \
+            "$l.$l.$l.$l" '*.com' '*.' 'a.*.example'; do
+            refused deploy/helm/hopcorder-server --set-json "allowedHosts=[\"$h\"]"
+            refused deploy/helm/hopcorder-server --set-json "config.allowed_hosts=[\"$h\"]"
+          done
+          for h in 192.0.2.7 ::1 '[2001:db8::1]' ::ffff:192.0.2.1 '*.lab.example' hopcorder.example. a_b.example \
+            "$l.$l.$l.${l:2}"; do
+            helm template a deploy/helm/hopcorder-server --set-json "allowedHosts=[\"$h\"]" >/dev/null
+            helm template a deploy/helm/hopcorder-server --set-json "config.allowed_hosts=[\"$h\"]" >/dev/null
+          done
           # With the bundled ClickHouse, the read API's queries may use a
           # third of what it may use (80% of its memory limit), two at once.
           cfg() { helm template a deploy/helm/hopcorder-server --show-only templates/configmap.yaml "$@"; }
