@@ -889,7 +889,7 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 		var err error
 		rows, err = clickhouseQuery[cyc](ctx, in.store, `SELECT seq, ts, target_ip, reached, path_len,
 			path_hash, hops.ttl, hops.status, hops.ip FROM cycles WHERE `+where+` AND seq < {before:UInt64}
-			AND ts >= {since:DateTime64(3)} ORDER BY seq DESC LIMIT {depth:UInt32}`,
+			AND ts >= {since:DateTime64(3, 'UTC')} ORDER BY seq DESC LIMIT {depth:UInt32}`,
 			withParam(params, "since", clickhouse.Time(first.TS.Add(-back))))
 		if err != nil {
 			return fmt.Errorf("replay cycles: %w", err)
@@ -945,7 +945,7 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 				N int `json:"n"`
 			}
 			cnt, err := clickhouseQuery[n](ctx, in.store, `SELECT count() AS n FROM cycles WHERE `+where+`
-				AND seq >= {start:UInt64} AND seq < {before:UInt64} AND ts >= {start_ts:DateTime64(3)}`,
+				AND seq >= {start:UInt64} AND seq < {before:UInt64} AND ts >= {start_ts:DateTime64(3, 'UTC')}`,
 				withParam(withParam(params, "start", strconv.FormatUint(open[0].StartSeq, 10)), "start_ts", open[0].StartTS))
 			if err != nil {
 				return fmt.Errorf("count outage cycles: %w", err)

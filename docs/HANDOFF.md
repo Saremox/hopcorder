@@ -3177,7 +3177,29 @@ findings are listed at the end, for the owner to decide on. The decisions:
 
 **Time zones**
 
-<!-- round five: time zone -->
+- **Every time parameter names UTC.** The columns are `DateTime64(3, 'UTC')`
+  and `clickhouse.Time` sends UTC wall-clock text, but the queries typed
+  their parameters `{from:DateTime64(3)}`, which ClickHouse parses in its
+  own server time zone. The official image runs in UTC, so compose, the
+  chart's bundled ClickHouse and CI never showed it; a ClickHouse installed
+  from packages takes the host's zone. 17 parameters were affected: the
+  read API's `from`/`to`/`last`/`oldest` (cycles, loops, path changes,
+  outages, streams, topology) and the restore's `since` and `start_ts` (the
+  round-four lookup of stored seqs already named UTC). In Europe/Berlin a
+  stream with 720 cycles in the last hour listed 1 and its 719 route
+  changes of the day 0 (review, round five); in America/New_York a
+  restored outage counted 4 of its 10 cycles. All now read
+  `DateTime64(3, 'UTC')`. Functions on the columns (`toStartOfInterval(ts,
+  …)`) use the column's zone and were right.
+  - The rule: a date or time parameter always names its zone.
+    `TestTimeParametersNameTheirZone` checks the server's query text for a
+    parameter without one (it found 17 before the fix).
+  - CI's `clickhouse` job runs its ClickHouse in America/New_York (`TZ`), so
+    the integration tests see a zone other than UTC: before the fix,
+    `TestIngestEndToEndClickHouse`, `TestTopologyClickHouse`,
+    `TestTopologyLongPathsClickHouse`, `TestReadViewsOfPlantedDataClickHouse`
+    and `TestReadBudgetClickHouse` failed there; all pass now. The `ui` and
+    `grafana` jobs keep UTC, as deployed by compose and the chart.
 
 **Grafana's ClickHouse user**
 
