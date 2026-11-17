@@ -45,6 +45,9 @@ The section for a version is the text of its GitHub release.
   `Bearer`, `X-Jwt` and `X-AccessToken` in `config` (they would land in a
   ConfigMap). The check goes by name; send credentials only through the
   chart's Secrets.
+- The release archives are owned by root (0/0) and reproducible. They
+  carried the build user's uid, which GNU tar restores when root unpacks
+  them, so that uid owned the unpacked binary.
 
 ## v0.1.1
 

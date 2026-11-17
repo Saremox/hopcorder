@@ -1619,3 +1619,14 @@ high-severity issue. Four fixes followed. The decisions:
   README say to pass credentials only through the Secrets. ci checks the
   new names, and that `X-Tenant`, `X-Scope-OrgID` and `X-Request-Source`
   still pass.
+- **Release archives are owned by root, and reproducible.** `tar -czf`
+  stored the runner's uid (1001), and GNU tar run as root restores stored
+  owners, so README's `curl … | tar -xz` as root left uid 1001 owning the
+  directory and binary, free to replace it before `install` or `setcap`.
+  `scripts/release-build.sh` now writes `--owner=0 --group=0
+  --numeric-owner --sort=name --mtime=@<commit time>` (`SOURCE_DATE_EPOCH`
+  if set) with modes normalised to 0644/0755, through `gzip -n`, and fails
+  unless every entry lists 0/0 and the binary is 0755; it runs on every pull
+  request as the dry run. Two builds of the same commit give the same
+  archives (checked). The chart packages are not reproducible: `helm
+  package` stamps the current time.
