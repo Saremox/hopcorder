@@ -2531,6 +2531,18 @@ decisions:
     106 MiB without) and `max_bytes_before_remerge_sort` a quarter of the
     budget (a sort with LIMIT keeps only its top rows once it holds that
     much; ClickHouse's default waits for 1 GB).
+  - **Budget**: with `clickhouse.deploy` the chart sets
+    `query.max_concurrent` to 2 and `query.max_memory_bytes` to 80% of the
+    memory limit / 3 / `max_concurrent` (273 MiB for the default 2Gi; it
+    fails on a limit it cannot read), unless `config.query` sets them:
+    reads get a third of what ClickHouse may use, the rest is for its
+    caches (up to 448 MiB), inserts, merges and the read-only user. Two at
+    a time with more each rather than four with less: a query over its
+    budget fails, a request beyond the slots only waits (up to 10 s), and
+    the stream view's five requests take milliseconds on real data. The
+    rule for an external ClickHouse, in the docs: their product at most
+    about a third of its `max_server_memory_usage`. The server's defaults
+    stay (8 x 1 GiB, for a large ClickHouse).
   - Accepted: planted data still fills the views of its own streams, now
     cut by the caps and the budget (the cost of ingest without
     authentication, §2). A node's median keeps up to 8192 samples, so a

@@ -112,6 +112,22 @@ allowedHosts must list them.
 {{- end }}
 {{- end }}
 
+{{/*
+The bundled ClickHouse's memory limit (clickhouse.deploy.resources.limits.memory)
+in MiB, 0 without one.
+*/}}
+{{- define "hopcorder-server.clickhouseMemoryMiB" -}}
+{{- $m := toString (dig "limits" "memory" "" (.Values.clickhouse.deploy.resources | default dict)) }}
+{{- $num := "^[0-9]+(\\.[0-9]+)?" }}
+{{- if regexMatch (printf "%s(k|M|G|T|Ki|Mi|Gi|Ti)?$" $num) $m }}
+{{- $unit := get (dict "" 1.0 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0) (regexReplaceAll $num $m "") }}
+{{- divf (mulf (regexFind $num $m | float64) $unit) 1048576 | floor | int64 }}
+{{- else if $m }}
+{{- fail (printf "clickhouse.deploy.resources.limits.memory %q: write it in bytes or with a k, M, G, T, Ki, Mi, Gi or Ti suffix (the chart sizes the read API's budget from it), or set config.query.max_memory_bytes" $m) }}
+{{- else }}0
+{{- end }}
+{{- end }}
+
 {{/* The configuration file: the user's config plus what the chart owns. */}}
 {{- define "hopcorder-server.config" -}}
 {{- if (default dict .Values.config.clickhouse).password }}
@@ -126,6 +142,23 @@ allowedHosts must list them.
 {{- if .Values.clickhouse.deploy.enabled }}
 {{- $_ := set $ch "url" (printf "http://%s:8123" (include "hopcorder-server.clickhouseName" .)) }}
 {{- $_ := set $ch "user" .Values.clickhouse.deploy.user }}
+{{- /*
+Read budgets that fit the bundled ClickHouse (round four): read queries may
+use at most a third of what it may use (80% of its memory limit), two at a
+time, unless config.query says otherwise. The server's defaults (1GiB a
+query, 8 at once) are for a large ClickHouse: 2Gi gives 273MiB and 2.
+*/}}
+{{- $q := default dict $cfg.query }}
+{{- if not (hasKey $q "max_concurrent") }}
+{{- $_ := set $q "max_concurrent" 2 }}
+{{- end }}
+{{- if not (hasKey $q "max_memory_bytes") }}
+{{- $mib := include "hopcorder-server.clickhouseMemoryMiB" . | int64 }}
+{{- if gt $mib 0 }}
+{{- $_ := set $q "max_memory_bytes" (printf "%dMiB" (max 16 (div (mul $mib 8) (mul 30 (int64 $q.max_concurrent))))) }}
+{{- end }}
+{{- end }}
+{{- $_ := set $cfg "query" $q }}
 {{- end }}
 {{- if include "hopcorder-server.clickhousePasswordSecret" . }}
 {{- $_ := set $ch "password_file" "/etc/hopcorder/secrets/clickhouse-password" }}

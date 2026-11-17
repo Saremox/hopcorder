@@ -151,6 +151,11 @@ The section for a version is the text of its GitHub release.
   distinct nodes and edges and the stream list at most `ingest.max_streams`
   streams (beyond, the busiest of those ClickHouse came across first), and
   read queries use at most 4 threads.
+- Helm: with `clickhouse.deploy`, the chart sets `query.max_concurrent` to 2
+  and `query.max_memory_bytes` so that reads get a third of what the bundled
+  ClickHouse may use (273 MiB a query for its 2Gi; they were 8 x 1 GiB),
+  unless `config.query` sets them. With your own ClickHouse, keep their
+  product to about a third of its memory: the defaults are for a large one.
 - Streamed read-API responses are no longer cut off 30 s after their query
   started (the ClickHouse timeout also covered reading the result): slow
   clients get them whole. A result cut off inside a row is an error, not a

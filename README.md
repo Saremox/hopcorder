@@ -715,7 +715,8 @@ streams for as long as its client keeps reading. Size the two so that their
 product is at most about a third of what ClickHouse may use
 (`max_server_memory_usage`, by default 90% of its RAM; less if others, such
 as Grafana, query it too): the rest is for its caches, inserts and merges.
-The defaults (8 GiB) are for a large ClickHouse. A query that
+The defaults (8 GiB) are for a large ClickHouse; the Helm chart sets them
+for the ClickHouse it deploys (273 MiB and 2 for its 2Gi). A query that
 would need more fails (502) instead of taking that memory from ingest.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from

@@ -325,6 +325,15 @@ jobs:
           refused deploy/helm/hopcorder-server "${ing[@]}" --set-json 'ingress.hosts=[{"host":"","paths":[{"path":"/","pathType":"Prefix"}]}]'
           refused deploy/helm/hopcorder-server --set 'allowedHosts={hopcorder.example.net:8080}'
           helm template a deploy/helm/hopcorder-server --set service.type=LoadBalancer --set 'allowedHosts={192.0.2.7}' >/dev/null
+          # With the bundled ClickHouse, the read API's queries may use a
+          # third of what it may use (80% of its memory limit), two at once.
+          cfg() { helm template a deploy/helm/hopcorder-server --show-only templates/configmap.yaml "$@"; }
+          test "$(cfg --set clickhouse.deploy.enabled=true | grep -A2 '^    query:')" = \
+            "$(printf '    query:\n      max_concurrent: 2\n      max_memory_bytes: 273MiB')"
+          cfg --set clickhouse.deploy.enabled=true --set config.query.max_concurrent=4 | grep -qx '      max_memory_bytes: 136MiB'
+          cfg -f deploy/helm/ci/server-values.yaml | grep -qx '      max_memory_bytes: 136MiB'
+          if cfg | grep -q 'max_memory_bytes'; then echo "a read budget without clickhouse.deploy"; exit 1; fi
+          refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.resources.limits.memory=2e9
           # The bundled ClickHouse's read-only user: readonly = 1, under
           # which its queries may change max_execution_time (what the Grafana
           # plugin sends) and no other setting, the spill settings constant

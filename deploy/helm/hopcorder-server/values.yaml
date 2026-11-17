@@ -20,9 +20,12 @@ fullnameOverride: ""
 # key; unknown keys are rejected). The chart sets listen, the ASN cache file,
 # allowed_hosts unless set here (see allowedHosts below), with
 # clickhouse.passwordSecret or clickhouse.deploy clickhouse.password_file,
-# and with clickhouse.deploy clickhouse.url and clickhouse.user; it refuses
-# clickhouse.password (it would land in a ConfigMap, readable with the
-# built-in view role).
+# and with clickhouse.deploy clickhouse.url and clickhouse.user, and
+# query.max_concurrent and query.max_memory_bytes unless set here (see
+# clickhouse.deploy.resources); it refuses clickhouse.password (it would
+# land in a ConfigMap, readable with the built-in view role). For an
+# external ClickHouse, keep query.max_concurrent x query.max_memory_bytes
+# (by default 8 x 1GiB) to about a third of what it may use.
 config:
   log:
     level: info
@@ -83,7 +86,11 @@ clickhouse:
       storageClass: ""
       accessModes: [ReadWriteOnce]
     # Caches are sized for a small instance, and the server may use 80% of
-    # the memory limit.
+    # the memory limit. The read API's queries get a third of that, two at a
+    # time: config.query.max_concurrent 2 and max_memory_bytes 80% x limit /
+    # 3 / max_concurrent (273MiB for 2Gi), unless config.query sets them.
+    # Planted data costs a read query up to about 200MiB; one that needs
+    # more than its budget fails rather than taking memory from ingest.
     resources:
       requests:
         cpu: 100m
