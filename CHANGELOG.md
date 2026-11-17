@@ -143,6 +143,14 @@ The section for a version is the text of its GitHub release.
   1,200 queries/s, about 0.45 MB/s with the chart's logging: keep untrusted
   users away from Grafana, or rate-limit it.
 
+- The read API's views no longer cost ClickHouse up to about 1 GiB a query
+  on data posted to that end: topology, path changes, cycles and the
+  stream list of planted data took 494 to 793 MiB each, and two UI viewers
+  of such a stream got 502 from the chart's ClickHouse; now at most about
+  120 MiB, cut to the views' caps. Topology aggregates at most 20,000
+  distinct nodes and edges and the stream list at most `ingest.max_streams`
+  streams (beyond, the busiest of those ClickHouse came across first), and
+  read queries use at most 4 threads.
 - Streamed read-API responses are no longer cut off 30 s after their query
   started (the ClickHouse timeout also covered reading the result): slow
   clients get them whole. A result cut off inside a row is an error, not a

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -177,9 +179,125 @@ func TestReadQuerySettings(t *testing.T) {
 		t.Fatalf("%d queries", len(got))
 	}
 	for _, s := range got {
-		if s["max_memory_usage"] != "536870912" || s["max_result_bytes"] != "8388608" || s["result_overflow_mode"] != "break" {
+		if s["max_memory_usage"] != "536870912" || s["max_result_bytes"] != "8388608" || s["result_overflow_mode"] != "break" ||
+			// Round four: what a query costs ClickHouse depends neither on
+			// the machine's cores nor on formatting whole blocks at once,
+			// and the result backstop can stop between small blocks.
+			s["max_threads"] != "4" || s["max_block_size"] != "1024" || s["output_format_parallel_formatting"] != "0" ||
+			s["max_bytes_before_remerge_sort"] != "134217728" {
 			t.Errorf("settings %v", s)
 		}
+	}
+}
+
+// The GROUP BYs of the read API have a group limit (with overflow mode
+// any), above the row caps, so that a response it cuts has more rows than
+// its cap and says truncated: without one, 20,000 planted cycles of new
+// addresses cost ClickHouse 793 MiB (nodes) and 681 MiB (edges), and
+// 660,000 planted streams 494 MiB (targets).
+func TestReadGroupLimits(t *testing.T) {
+	if topologyMaxGroups <= topologyMaxNodes+1 || topologyMaxGroups <= topologyMaxEdges+1 {
+		t.Fatalf("topologyMaxGroups %d must exceed the caps", topologyMaxGroups)
+	}
+	var mu sync.Mutex
+	var got []string
+	st := funcStore{newFakeStore(), func(_ context.Context, q string, _ func(json.RawMessage) error) error {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, q)
+		return nil
+	}}
+	ts := readServer(t, st, Options{MaxStreams: 30000})
+	for _, p := range []string{"/api/v1/query/topology?agent=lab&target=dc1.example", "/api/v1/query/targets?limit=10000",
+		"/api/v1/query/targets?limit=10000&agent=lab"} {
+		resp, err := http.Get(ts.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	limited := 0
+	for _, q := range got {
+		switch {
+		case strings.Contains(q, "FROM hops"), strings.Contains(q, "ARRAY JOIN"):
+			if !strings.Contains(q, "max_rows_to_group_by = 20000, group_by_overflow_mode = 'any'") {
+				t.Errorf("topology query without the group limit: %s", q)
+			}
+			limited++
+		case strings.Contains(q, "GROUP BY agent_id, target, protocol, flow_id"):
+			// as many as the ingester tracks (ingest.max_streams)
+			if !strings.Contains(q, "max_rows_to_group_by = 30000, group_by_overflow_mode = 'any'") {
+				t.Errorf("targets query without the group limit: %s", q)
+			}
+			limited++
+		}
+	}
+	if limited != 4 {
+		t.Errorf("%d of the queries with a group limit: %q", limited, got)
+	}
+}
+
+// paramStore answers with rows(query, params) and records every query's
+// params.
+type paramStore struct {
+	*fakeStore
+	mu     sync.Mutex
+	params []clickhouse.Params
+	rows   func(q string, p clickhouse.Params) []string
+}
+
+func (p *paramStore) Query(_ context.Context, q string, params clickhouse.Params, row func(json.RawMessage) error) error {
+	p.mu.Lock()
+	p.params = append(p.params, maps.Clone(params))
+	p.mu.Unlock()
+	for _, r := range p.rows(q, params) {
+		if err := row(json.RawMessage(r)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// path-changes first reads the times and sizes of the newest rows, then
+// only the rows that can fit the response: ClickHouse sorted whole rows of
+// every change in the window, 537 MiB for 10,000 changes of 255 TTLs.
+func TestPathChangesReadOnlyWhatFits(t *testing.T) {
+	const n = 50 // rows of about 100 KB, 5 MB in all
+	var phases []string
+	st := &paramStore{fakeStore: newFakeStore()}
+	st.rows = func(q string, p clickhouse.Params) []string {
+		var out []string
+		if strings.Contains(q, "AS bytes") {
+			phases = append(phases, "sizes")
+			for i := range n {
+				out = append(out, fmt.Sprintf(`{"ts":"2026-11-16T23:%02d:00.000Z","bytes":100000}`, 59-i))
+			}
+			return out
+		}
+		phases = append(phases, "rows")
+		limit, _ := strconv.Atoi(p["limit"])
+		for i := range limit {
+			out = append(out, fmt.Sprintf(`{"seq":%d,"pad":"%s"}`, n-i, strings.Repeat("x", 100000)))
+		}
+		return out
+	}
+	ts := readServer(t, st, Options{MaxResponseBytes: 1 << 20})
+	var body struct {
+		Rows []struct {
+			Seq int `json:"seq"`
+		} `json:"rows"`
+		Truncated bool `json:"truncated"`
+	}
+	if code := getJSON(t, ts.URL+"/api/v1/query/path-changes?agent=lab&limit=10000", &body); code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	// 1 MiB holds 10 rows of 100 KB; the eleventh is the first past it.
+	if len(phases) != 2 || phases[0] != "sizes" || st.params[1]["limit"] != "11" ||
+		st.params[1]["oldest"] != "2026-11-16 23:49:00.000" {
+		t.Errorf("queries %v, params of the second %v", phases, st.params[len(st.params)-1])
+	}
+	if !body.Truncated || len(body.Rows) != 10 || body.Rows[0].Seq != n {
+		t.Errorf("truncated %v, %d rows", body.Truncated, len(body.Rows))
 	}
 }
 

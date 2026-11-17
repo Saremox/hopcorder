@@ -60,6 +60,11 @@ ingest:
   stream_idle_timeout: 1h       # idle streams are dropped and restored from ClickHouse when they return
   max_record_age: 720h          # older records are refused (keep it above the agents' spool max_age)
 
+# Read API. Keep max_concurrent x max_memory_bytes to about a third of what
+# ClickHouse may use (max_server_memory_usage: 90% of its RAM by default),
+# less if others query it too: the rest is for its caches, inserts and
+# merges. The defaults (8GiB) are for a large ClickHouse. A query that needs
+# more fails (502).
 query:
   max_concurrent: 8             # read-API requests at once
   max_response_bytes: 32MiB     # rows per response; beyond it rows are left out and "truncated": true

@@ -1128,7 +1128,8 @@ decisions:
 - **`cycles` takes `limit` up to 1000** (other endpoints keep 10000).
   ClickHouse formats such a result as one block: 3000 maximal cycles needed
   1.64 GiB in ClickHouse and failed the 1 GiB limit, 1000 need about
-  650 MiB. The UI asks for one cycle at a time.
+  650 MiB (round four: most of it for formatting the block's text in
+  parallel, now off; 52 MiB). The UI asks for one cycle at a time.
 - **Rows passed to `Query` callbacks are copies**: `bufio.Scanner` reuses
   its buffer, and the read API kept rows across callbacks. A result above
   the scanner's first 64 KiB came back with earlier rows overwritten.
@@ -2486,6 +2487,67 @@ decisions:
 
 **Read API**
 
+- **Read views of planted data stay within a read budget that fits
+  ClickHouse.** Data posted through ingest made the common read views cost
+  ClickHouse about 1 GiB each (25.8, configured like the chart's, 2 GiB):
+  20,000 cycles of 255 new addresses (26 s to post) took topology's nodes
+  793 MiB and its edges 681 MiB (the number of groups, not round three's
+  lambda), their 10,000 newest path changes (the UI's limit) 537 MiB for a
+  response cut at 32 MiB (a 144 MB result block, which `max_result_bytes`
+  with `break` cannot cut), 1000 of 10,000 maximal cycles 765 MiB, and the
+  stream list over 660,000 planted streams 494 MiB. `query.max_memory_bytes`
+  (1 GiB) times `max_concurrent` (8) was far more than the chart's
+  ClickHouse may use (1.6 GiB): two simulated UI viewers of such a stream got
+  502 for 9 of 12 topology and path-change requests, four for 15 of 16
+  (ClickHouse's overcommit killed readers; ingest stayed at 200). Now, on the
+  same data, no read query of the stream view or the stream list takes more
+  than 117 MiB, and both runs got 200 throughout (ingest 80 of 80):
+  - Topology's nodes and edges and the stream list have a group limit
+    (`max_rows_to_group_by`, `group_by_overflow_mode = 'any'`: ClickHouse
+    keeps aggregating the groups it has and skips new ones): 20,000
+    distinct nodes and edges, 10 and 4 times the caps, so that a response
+    it cuts has more rows than the cap and says `truncated`; and
+    `ingest.max_streams` streams (or `limit`, if more), about 800 bytes each
+    per thread. Nodes now 64 MiB, edges 117 MiB, targets 74 MiB.
+  - `path-changes` runs in two parts: the newest rows' times and a lower
+    bound of their JSON (computed before the sort:
+    `query_plan_execute_functions_after_sorting = 0`; otherwise ClickHouse
+    carries the arrays through it), then whole rows only from the time of
+    the first row past the response budget, which cuts the response there at
+    the latest. 54 and 96 MiB, the same response.
+  - `cycles` with a protocol filters the stream by equalities, so ClickHouse
+    reads in the sort key's order and stops after `limit` (the `'' OR` form
+    of the stream filter defeated that; the primary key was used either
+    way): 52 MiB. Without a protocol (streams merged, so sorted) a first
+    query finds the times of the cycles to return, and the sort gets only
+    those: 82 MiB.
+  - Every read query: `max_threads = 4` (memory for reading and aggregating
+    grows with the threads, which default to the node's cores; reading 255
+    new addresses per cycle costs about 40 MiB a thread),
+    `max_block_size = 1024` (the result backstop stops only between blocks,
+    and a group limit is exceeded by up to a block of new keys per thread),
+    `output_format_parallel_formatting = 0` (it keeps the text of whole
+    blocks: 1000 maximal cycles were one 200 MB block, 522 MiB for the query,
+    106 MiB without) and `max_bytes_before_remerge_sort` a quarter of the
+    budget (a sort with LIMIT keeps only its top rows once it holds that
+    much; ClickHouse's default waits for 1 GB).
+  - Accepted: planted data still fills the views of its own streams, now
+    cut by the caps and the budget (the cost of ingest without
+    authentication, §2). A node's median keeps up to 8192 samples, so a
+    stream with some 20,000 distinct nodes of thousands of cycles each
+    (several hundred thousand planted cycles) can still exceed the budget;
+    that view then fails (502) at the budget, not at ClickHouse's limit.
+    The test's layout of parts made the edges 190 MiB; with a smaller
+    ClickHouse than 2Gi (the CI's 1Gi: 136 MiB a query) that view of
+    planted addresses fails the same way.
+  - Tests: `TestReadViewsOfPlantedDataClickHouse` (`clickhouse` tag) plants
+    the review's data by SQL (20,000 cycles of new addresses with their
+    path changes, 1500 maximal cycles, 660,000 streams) and runs every view
+    with 273 MiB a query: before, each got 502; now each answers within it,
+    truncated where it should be and newest first. `TestReadQuerySettings`,
+    `TestReadGroupLimits`, `TestPathChangesReadOnlyWhatFits` and
+    `TestCyclesOrder` check the settings, the limits and the two-part
+    queries; the CI `helm` job checks the chart's budget.
 - **A streamed response lasts as long as its client reads.** The ClickHouse
   client's `http.Client.Timeout` (`clickhouse.timeout`, 30 s) also covered
   reading the result, so a streamed read-API response was cut off 30 s after
