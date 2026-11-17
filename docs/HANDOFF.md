@@ -3681,3 +3681,25 @@ decisions:
     first checked everything that walk does (branch key order among it).
     Left for the owner.
 
+
+### Security and correctness review, round seven
+
+The same four areas, on the code after round six's PRs (#48 to #52). The
+decisions:
+
+- **Upgrade paths are out of scope while hopcorder is at 0.x** (the
+  owner's decision: no deployment exists). Reviews cover fresh installs and
+  normal operation of the current version (install, restart, reload,
+  scale, crashes); chart upgrades from earlier versions, `--reuse-values`,
+  carried values, older spool files, databases migrated from older schema
+  versions and rolling upgrades between server versions are not reviewed
+  or fixed. Round five's `--reuse-values` digest medium and the upgrade
+  lows of earlier rounds are dropped on that basis. Revisit before the
+  first release meant for deployment.
+- **`TestPrototypeQueriesRun` no longer depends on the date.** It seeds
+  cycles at a fixed `t0` (2026-11-16 23:00 UTC) and runs the prototype's
+  queries from `docs/prototype/schema.sql` unchanged, which look back from
+  `now()` (Q5 one day, the others three): from a day after `t0` Q5 found
+  nothing and CI's `clickhouse` job failed on every run (review, round
+  seven). The test now replaces `now()` with `t0` plus an hour;
+  `schema.sql` stays as the prototype has it.
