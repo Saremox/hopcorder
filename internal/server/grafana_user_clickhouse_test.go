@@ -264,9 +264,10 @@ func TestGrafanaUserClickHouse(t *testing.T) {
 	} {
 		err := query(q)
 		var ce *clickhouse.Error
+		notAllowed := errors.As(err, &ce) && ce.Code == "446"
 		hyperscan := !strings.Contains(q, "multiSearch")
 		switch {
-		case hyperscan && !(errors.As(err, &ce) && ce.Code == "446"):
+		case hyperscan && !notAllowed:
 			t.Errorf("%s as the Grafana user: %v, want FUNCTION_NOT_ALLOWED", q, err)
 		case !hyperscan && err != nil:
 			t.Errorf("%s as the Grafana user: %v", q, err)
