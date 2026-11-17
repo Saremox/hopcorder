@@ -436,7 +436,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
 | `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
-| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own |
+| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own, and so does every target of one host and protocol |
 | `paris` | `true` | `--paris` | Flow-stable probing |
 | `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
@@ -452,6 +452,10 @@ for TCP), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
 arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
 `interval`, `timeout`, `max_ttl`, `probe_past`.
+Two targets of one `host` and `protocol` (IPv4 and IPv6 of a name, or two
+ports) need a `flow_id` each: the server tells an agent's streams apart by
+host, protocol and `flow_id` (a record has no port), so the agent refuses
+them otherwise.
 
 **Outputs** (at least one):
 
@@ -500,8 +504,9 @@ hop addresses.
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 
-Two targets with the same `host` and `protocol` (another `port` or `af`)
-share their per-target series, as the labels are only configured values:
+Two targets with the same `host` and `protocol` (another `port` or `af`,
+and each its own `flow_id`) share their per-target series, as the labels
+are only configured values:
 counters count both, the RTT histogram mixes them, `hopcorder_path_length`
 is the last cycle's, and `hopcorder_flow_in_use` counts those not probed.
 The agent warns at start. To tell them apart, give one an address or

@@ -34,7 +34,18 @@ The section for a version is the text of its GitHub release.
   400 MB grew ClickHouse by 95 to 140 MB apiece, and the tenth OOM-killed
   the chart's 2 GiB ClickHouse. No dashboard uses them.
 
-<!-- round five: streams -->
+- Agent: two targets of one host with the same protocol and `flow_id`
+  (IPv4 and IPv6 of one name, or two TCP ports, under the default
+  `flow_id`) are refused at load. The server tells streams apart by host,
+  protocol and `flow_id`, so it recorded both as one: their cycles
+  alternated, and 40 of them with IPv6 down gave 39 route changes and 20
+  one-cycle outages instead of one outage. **Upgrading:** a config that
+  relied on round four's warning about such targets no longer loads until
+  each has its own `flow_id` (`targets[1] (…): same host, protocol and
+  flow_id (33434) as targets[0] …; give each its own flow_id`): the agent
+  does not start, and a reload keeps the running configuration. Their
+  earlier cycles stay in one stream under the old `flow_id`. Every other
+  config keeps its `flow_id`s and records.
 
 **Security: server ingest**
 

@@ -605,8 +605,8 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 
 // warnSharedSeries logs the targets whose metrics share their series with
 // an earlier target's: those with the same host and protocol (another port
-// or address family), since labels are only ever the configured host and
-// protocol. Their counters count both, the RTT histogram mixes them, and
+// or address family, and so another flow_id, which config requires), since
+// labels are only ever the configured host and protocol. Their counters count both, the RTT histogram mixes them, and
 // hopcorder_path_length is whichever cycle ended last.
 func warnSharedSeries(targets []config.Target, logger *slog.Logger) {
 	first := map[[2]string]int{}
