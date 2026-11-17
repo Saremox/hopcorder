@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -43,7 +42,7 @@ func runServer(args []string, stderr io.Writer) int {
 		fs.PrintDefaults()
 	}
 	configPath := fs.String("config", "", "path to the YAML config file")
-	listen := fs.String("listen", "", "HTTP listen address (default 127.0.0.1:8080)")
+	listen := fs.String("listen", "", "HTTP listen address: host:port, unix:<path> or systemd (socket activation) (default 127.0.0.1:8080)")
 	allowedHosts := fs.String("allowed-hosts", "",
 		"comma-separated host names the server answers (DNS rebinding protection; default: the localhost names when listening on loopback, else any; * for any)")
 	chURL := fs.String("clickhouse-url", "", "ClickHouse HTTP interface URL (default http://127.0.0.1:8123)")
@@ -152,19 +151,21 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 			return err
 		}
 	}
+	// Before the server is built: its Host allowlist depends on what it
+	// listens on (see listenerHosts).
+	ln, activated, err := listenServer(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	allowed := listenerHosts(cfg, ln.Addr(), activated)
 	srv := server.New(server.Options{Store: ch, Pinger: ch, Enricher: en, Logger: logger, Registry: reg,
 		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
 		MaxConcurrentIngest: cfg.Ingest.MaxConcurrent, MaxConcurrentQueries: cfg.Query.MaxConcurrent,
 		MaxStreams: cfg.Ingest.MaxStreams, MaxAgents: cfg.Ingest.MaxAgents, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
 		MaxRecordAge:     cfg.Ingest.MaxRecordAge.D(),
 		MaxResponseBytes: int64(cfg.Query.MaxResponseBytes), MaxQueryMemory: int64(cfg.Query.MaxMemoryBytes),
-		AllowedHosts: cfg.HostAllowlist(), UI: uiHandler})
+		AllowedHosts: allowed, UI: uiHandler})
 
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
-	}
 	// Every phase of a connection is bounded, so stalled clients cannot pin
 	// connections (and the decode buffers of their requests) indefinitely.
 	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 2 * time.Minute,
@@ -172,10 +173,11 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
 	hosts := "any"
-	if h := cfg.HostAllowlist(); h != nil {
-		hosts = strings.Join(h, ",")
+	if allowed != nil {
+		hosts = strings.Join(allowed, ",")
 	}
-	logger.Info("server listening", "addr", ln.Addr().String(), "clickhouse", cfg.ClickHouse.URL,
+	logger.Info("server listening", "addr", ln.Addr().String(), "network", ln.Addr().Network(),
+		"systemd_socket", activated, "clickhouse", cfg.ClickHouse.URL,
 		"database", cfg.ClickHouse.Database, "allowed_hosts", hosts)
 	if ready != nil {
 		ready <- ln.Addr().String()

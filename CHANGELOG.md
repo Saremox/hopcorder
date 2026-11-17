@@ -2,6 +2,66 @@
 
 The section for a version is the text of its GitHub release.
 
+## Unreleased
+
+**Added**
+
+- The server chart can run a single ClickHouse pod next to the server
+  (`clickhouse.deploy.enabled`, opt-in): the official image, a persistent
+  volume, a generated password kept across upgrades, an optional read-only
+  user for Grafana, and a NetworkPolicy. No operator.
+
+**Fixed**
+
+- UI: a click on the timeline while it reloads no longer throws.
+
+**Security: server ingest**
+
+<!-- round three: ingest -->
+
+**Security: read side and Grafana**
+
+<!-- round three: read side -->
+
+**Security: agent**
+
+<!-- round three: agent -->
+
+**Security: CI, release and deployment**
+
+- Releases carry signed build provenance: every file and both images (by
+  digest) are attested by the release job, and the notes list the image
+  digests with the `gh attestation verify` commands. The `release`
+  environment only gates the repository's own release job; anyone with
+  write access can still replace a release's images and files with a
+  workflow of their own, and the attestations are how to tell. The
+  repository settings that limit it (a tag ruleset for `v*`, immutable
+  releases) are listed in `docs/HANDOFF.md`.
+- The release job checks, once the release exists, that its tag still
+  names the commit it built, and deletes the release again if not.
+- systemd: the server can take its socket from systemd
+  (`deploy/hopcorder-server.socket` with `listen: systemd`), a unix socket
+  that only the reverse proxy's group may open. On `127.0.0.1:8080` every
+  local user reached the server around the proxy. Without systemd,
+  `listen: unix:<path>` creates a socket with mode 0660. The default stays
+  `127.0.0.1:8080`.
+- Helm: the agent pods no longer have a liveness probe. It used the metrics
+  endpoint, which holds at most 64 connections, so anything that could
+  reach the port could have the agent restarted again and again. An opt-in
+  NetworkPolicy (`networkPolicy.enabled`, with `networkPolicy.from`) limits
+  the metrics port to the peers you list; with `hostNetwork` it does not
+  apply, and the chart refuses it.
+- Helm: the agent chart also refuses headers such as `Authentication`,
+  `Bearer`, `X-Jwt` and `X-AccessToken` in `config` (they would land in a
+  ConfigMap). The check goes by name; send credentials only through the
+  chart's Secrets.
+- The release archives are owned by root (0/0) and reproducible. They
+  carried the build user's uid, which GNU tar restores when root unpacks
+  them, so that uid owned the unpacked binary.
+- Go: install a released version (`go install …@v0.1.1`), not `@latest`:
+  the Go module proxy takes any `v*` tag as a version, released or not, and
+  keeps it. `go.mod` retracts the withdrawn v0.1.0.
+
 ## v0.1.1
 
 The first published release. v0.1.0 was withdrawn: its tag and release are

@@ -831,7 +831,9 @@ added in the commit that introduced it.
   as the notes (it fails without one), using
   `scripts/release-build.sh` with go.mod's toolchain. On pull requests and
   `main` that is a dry run; for a tag the files go to `publish`, which
-  creates the GitHub release from them. The binaries and images carry the
+  attests them and both image digests and creates the GitHub release from
+  them, the notes followed by the digests and how to verify them (round
+  three). The binaries and images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -1017,7 +1019,9 @@ fixes. The decisions:
   environment variable.
 - **Releases**: a `v*` tag is checked by `scripts/release-verify.sh` (see
   round two) before anything is built, and published only by the `publish`
-  job in the `release` environment. The release build is
+  job in the `release` environment (as far as this workflow goes: round
+  three found that any workflow with write tokens can publish). The release
+  build is
   `scripts/release-build.sh`, shared with the dry run.
 - **When workflows run**: `ci` runs on pull requests, on main and by hand,
   not on every branch push (a pull request's branch ran everything twice,
@@ -1303,6 +1307,10 @@ decisions:
     tags, so two approved tags cannot both pass the checks.
   - A version is released once. To fix a release, release the next version
     (or delete the release, and its tag, by hand).
+  - (Round three: this holds for `images.yml` only. The environment gates
+    that one job, not the packages and releases, which take `GITHUB_TOKEN`
+    from any workflow of the repository; anyone with write access can
+    still publish with a workflow of their own. See round three.)
 - **One Go release for binaries and images.**
   - `go.mod` has `toolchain go1.27.4`. The release binaries and CI used to
     build with Go 1.27.0, because setup-go installs the version from the
@@ -1391,13 +1399,17 @@ decisions:
   image, not `:main`, which is built with the shared Actions cache. Chart
   version and appVersion in `Chart.yaml` are 0.1.1, so installs from a
   checkout run 0.1.1 images too.
-- **Still to do in the repository settings**:
+- **Still to do in the repository settings** (superseded by round three's
+  list, which makes immutable releases and the tag ruleset required: the
+  `release` environment alone gates nothing for a collaborator):
   - Add required reviewers to the `release` environment; until then
-    `publish` runs without approval, though after all the checks.
+    `publish` runs without approval, though after all the checks. (Wrong
+    as a gate, round three found: with reviewers too, a collaborator's own
+    workflow publishes without `publish`.)
   - Restrict it to `v*` tags (deployment tag policy).
   - Enforce the main ruleset with `ci` as a required check.
   - Add a tag ruleset for `v*`.
-  - Optionally turn on immutable releases.
+  - Optionally turn on immutable releases (required since round three).
 
 **Agent**
 - **Corrupt spool files are read in full before bbolt's check.** The
@@ -1498,7 +1510,9 @@ decisions:
     `O_NOFOLLOW` would break deliberate symlinks.
   - 64 idle keep-alive connections can block scrapes of the metrics
     endpoint. That is inherent to a connection cap. Bind the endpoint to
-    localhost or restrict it with a NetworkPolicy.
+    localhost or restrict it with a NetworkPolicy. (Round three: the agent
+    chart's liveness probe on `/metrics` turned this into restarts of the
+    agent. The probe is gone, and the chart has an opt-in NetworkPolicy.)
 - **Tests:**
   - `TestDamagedLeafIsQuarantined` opens damaged spools in a child
     process, so a regression fails the test instead of killing the binary.
@@ -1517,3 +1531,227 @@ decisions:
   - It also runs the review's PoC, given the exact id of the silent TTL 2:
     the PoC can no longer plant a hop there or end the path there. It
     could with the check disabled.
+
+### Security review, round three
+
+A third review of the whole code base (the same four areas, every finding
+reproduced, ClickHouse-dependent ones against ClickHouse 25.8) found no
+high-severity issue. Four fixes followed. The decisions:
+
+**Ingest and storage**
+
+<!-- round three: ingest -->
+
+**Read side, enrichment and the browser**
+
+<!-- round three: read side -->
+
+**Agent**
+
+<!-- round three: agent -->
+
+**CI, release and deployment**
+
+- **The `release` environment gates the `publish` job, not publishing.**
+  `publish` has no credential of its own: it uses `GITHUB_TOKEN`, and a
+  workflow file pushed to any branch (or in a same-repository pull request)
+  can ask for `packages: write` and `contents: write` and leave out
+  `environment:`. ghcr grants writes per repository, not per workflow or
+  environment, and release assets take any token with `contents: write`.
+  So a collaborator, or a stolen token of theirs with the `workflow` scope,
+  can overwrite `:<version>`, `:<major>.<minor>`, `:latest`, the charts and
+  the release files (`gh release upload --clobber`), with all of round
+  two's settings applied. Round two's "until then publish runs without
+  approval" read as if reviewers closed this; they do not. What the code
+  does now:
+  - **Build provenance attestations** (`actions/attest` v4.2.2, pinned by
+    commit; the action that `attest-build-provenance` v4 wraps, which its
+    README recommends for new workflows). `id-token: write` and
+    `attestations: write` are on `publish` only. It attests every file in
+    `dist/` (archives, chart packages, `SHA256SUMS`) and both image digests
+    (the multi-arch indexes, by `subject-digest`) before it publishes
+    anything. The attestations live in GitHub's attestation store; they are
+    not pushed to ghcr, since `gh attestation verify oci://…` fetches them
+    from GitHub by digest, and so no `artifact-metadata` permission or
+    storage records are needed.
+  - The Sigstore certificate names the workflow file, the ref
+    (`refs/tags/vX.Y.Z`) and the commit. A collaborator's own workflow can
+    attest too, but its certificate names its own file or a branch, and
+    with the tag ruleset (below) a run for a `v*` tag means a maintainer
+    pushed the tag. So `gh attestation verify … --signer-workflow
+    Saremox/hopcorder/.github/workflows/images.yml --source-ref
+    refs/tags/vX.Y.Z` tells a replaced file or image from a released one.
+    It detects replacement, it does not prevent it, and helps only users
+    who verify.
+  - **Digests in the release notes**: `scripts/release-notes.sh` appends
+    the commit, both image digests and the verify commands to the
+    CHANGELOG section. Every dry run runs it with made-up digests. `publish`
+    also checks that each tag it sets names the attested digest
+    (`imagetools create` with one source copies the index as it is). The
+    notes are a convenience; the attestations are the proof.
+  - Charts: `helm pull`, `gh attestation verify` on the `.tgz` (an OCI
+    chart's content layer is that file), then install from the file.
+    `--set image.tag=X.Y.Z@sha256:…` pins the image in both charts without
+    a template change.
+  - **No environment-only credential.** Considered: an environment secret
+    (a bot's classic PAT, as ghcr takes nothing finer) with a fallback to
+    `GITHUB_TOKEN`. It only helps once no other workflow can write the
+    packages, that is with this repository's Actions access on them set to
+    Read. But the `image` job pushes `:main` and `:sha-…` to the same
+    packages with `GITHUB_TOKEN`, so that would break main's images, and
+    keeping them would take a separate package for main. Release files are
+    protected by immutable releases, not by a credential. Left to the
+    owner; not implemented.
+  - Accepted: whoever can push a workflow file can publish something. The
+    defence is detection plus the repository settings.
+- **The tag is checked again once the release exists.** A release belongs
+  to a tag name, and GitHub ignores `--target` (`target_commitish`) for a
+  tag that exists, so `--target` would not pin the commit. checkout v7.0.1
+  fails if the tag moved before the job checked out, but `publish` creates
+  the release about a minute later. Now it resolves the tag through the API
+  after creating the release, peeling an annotated tag. Unless the tag
+  names `$GITHUB_SHA`, it deletes the release (the tag stays) and fails; an
+  API error counts as a mismatch. With immutable releases the tag cannot
+  move once the release exists, so the check is final. Without them it can
+  move later anyway, which only the tag ruleset prevents. The images,
+  charts and files stay: they were built and attested from this commit.
+- **verify-tag does not see drafts.** GitHub lists draft releases only to
+  tokens with push access, and verify-tag's has `contents: read`. `publish`
+  (`contents: write`) runs the same check and sees them, so "no release of
+  the tag, drafts included" still holds before anything is published.
+  Noted in `release-verify.sh`.
+- **The `image` job has `packages: write`.** README said a tag's images
+  were built "without write tokens"; corrected. The job pushes
+  `:sha-<full commit>` for a tag and `:main`/`:sha-<short>` for main, so it
+  keeps the permission. The Dockerfile's `RUN` steps cannot see the token,
+  only the job's actions can.
+- **The server can listen on a unix socket, its own or systemd's.** On a
+  systemd host the docs put the server on 127.0.0.1 behind the reverse
+  proxy, but every local user reached that port without the proxy's
+  authentication: they could read everything and inject records, among
+  them round two's `seq` 2^64−1, which leaves an agent refused with 409
+  until the manual recovery.
+  - `listen: systemd` takes the socket systemd passes (socket activation:
+    `LISTEN_FDS`/`LISTEN_PID`, fd 3, read with `os.NewFile` and
+    `net.FileListener`, no dependency). `deploy/hopcorder-server.socket`
+    creates `/run/hopcorder-server.sock`, `root:<SocketGroup>`, mode 0660,
+    so only root and the proxy's group connect. Exactly one socket; the
+    variables are unset once used, and ignored when `LISTEN_PID` is another
+    process (inherited).
+  - `listen: systemd` without a passed socket fails at start, and so does a
+    passed socket with any other `listen`: the server would listen
+    elsewhere, and the socket's connections would wait forever.
+  - The unit ships `SocketGroup=hopcorder-proxy`, a group that does not
+    exist, so the socket fails to start until the admin names the proxy's
+    group (or creates that one). Every process with the group reaches the
+    server unauthenticated, and on Debian nginx's `www-data` is often
+    shared with PHP-FPM and the like; hence the advice of a group of its own.
+  - `listen: unix:<absolute path>` creates the socket itself (outside
+    systemd, or with a sidecar proxy sharing a volume), mode 0660 after the
+    bind. Between bind and chmod it has the mode the umask leaves
+    (accepted; the docs say to use a directory only the server and proxy
+    can enter). A stale socket (connection refused) is replaced, a live one
+    or any other file is not; a clean shutdown removes it. Abstract sockets
+    (`unix:@name`) are refused: they have no permissions. Paths are at most
+    107 bytes.
+  - The Host allowlist: on a unix socket there is no check unless
+    `allowed_hosts` lists names. DNS rebinding needs a TCP listener the
+    browser can reach, which is now the proxy's, and the proxy
+    authenticates and picks the Host header it sends (nginx's `unix:`
+    upstream sends `localhost`, Caddy the client's). Accepted: a proxy that
+    admits clients by address rather than by credentials would forward a
+    rebinding page's request; the docs say to list its names then. A TCP
+    socket from systemd is judged by its address, like a configured
+    `listen` (127.0.0.1 gets the localhost names).
+  - `/healthz`, `/readyz` and `/metrics` are served on the socket as well;
+    Prometheus scrapes through the proxy. The default stays
+    `127.0.0.1:8080` (containers, the charts, quick installs; the server
+    chart owns `listen`).
+  - Tests: a socket in a temporary directory (mode, stale, live and
+    regular files, removal), `serve` on a socket (health, metrics, the Host
+    check with and without `allowed_hosts`), socket activation in a child
+    test binary that gets a listening socket as fd 3, and the refusals.
+    Checked by hand with `systemd-socket-activate` (unix and TCP) and
+    `systemd-analyze verify`.
+- **The agent chart has no liveness probe.** It probed `/metrics` (1 s
+  timeout, three failures), whose listener takes 64 connections and keeps
+  one that sends nothing for 10 s. So any workload that could reach the pod
+  (or, with hostNetwork, the node's port) could hold 64 idle connections
+  and have the agent restarted with growing backoff, leaving gaps in the
+  recording; the review reproduced 11 of 11 failed probes with 120 held
+  connections. A live `/metrics` says nothing about the probing loop
+  anyway, and the agent serves no traffic, so there is no readiness probe
+  either (one on `/metrics` would only take it out of the Service). A hung
+  probing loop was never caught by the probe, since the metrics listener
+  runs on its own; alert on the rate of `hopcorder_cycles_total` instead.
+  ci's helm job fails if the chart renders any probe, in either mode.
+- **Opt-in NetworkPolicy for the agent** (`networkPolicy.enabled`, off by
+  default): inbound connections only to the metrics port and only from
+  `networkPolicy.from`, required when the metrics are exposed, as in the
+  server chart. With hostNetwork the chart refuses it: NetworkPolicy does
+  not apply to host-network pods, and a policy that does nothing would look
+  like protection. Replies to the agent's probes are not new connections;
+  routers' ICMP errors count as related traffic in conntrack-based
+  implementations, but this was not tested in a cluster (kind's CI run does
+  not enable it), so `values.yaml` says to check that hops still answer.
+  ci lints it and checks both refusals.
+- **The agent chart's header check is wider, and called a heuristic.** It
+  accepted `Authentication`, `X-Jwt`, `Bearer`, `X-Access-Tokens` and
+  `X-AccessToken`. Names containing token, secret, passw, credential,
+  cookie, signature, session, jwt, bearer, api-key, authoriz/authoris or
+  authent anywhere are refused now, and so are names with a part key(s),
+  auth, pass or sig. It still goes by name only, so `values.yaml` and the
+  README say to pass credentials only through the Secrets. ci checks the
+  new names, and that `X-Tenant`, `X-Scope-OrgID` and `X-Request-Source`
+  still pass.
+- **Release archives are owned by root, and reproducible.** `tar -czf`
+  stored the runner's uid (1001), and GNU tar run as root restores stored
+  owners, so README's `curl … | tar -xz` as root left uid 1001 owning the
+  directory and binary, free to replace it before `install` or `setcap`.
+  `scripts/release-build.sh` now writes `--owner=0 --group=0
+  --numeric-owner --sort=name --mtime=@<commit time>` (`SOURCE_DATE_EPOCH`
+  if set) with modes normalised to 0644/0755, through `gzip -n`, and fails
+  unless every entry lists 0/0 and the binary is 0755; it runs on every pull
+  request as the dry run. Two builds of the same commit give the same
+  archives (checked). The chart packages are not reproducible: `helm
+  package` stamps the current time.
+- **A tag is a Go release, whatever the workflow says.** proxy.golang.org
+  serves any `vX.Y.Z` tag as a version once someone asks for it, and
+  `@latest` resolves to the highest: off main, without CI, even when
+  verify-tag fails. It caches it for good; deleting the tag does not help,
+  and undoing it takes a higher version whose `go.mod` retracts it, which
+  pushes the version numbers up for good. README recommended
+  `go install …@latest`.
+  - README now recommends the release archives, or
+    `go install …@vX.Y.Z` of a version with a GitHub release, and says why.
+  - `go.mod` retracts v0.1.0 (withdrawn, its tag deleted). Whether the
+    proxy cached it was not checked, to keep the module path off an outside
+    service. The retraction takes effect with the next release, whose
+    `go.mod` carries it; `go mod tidy` keeps it, and the toolchain checks
+    (ci, `release-build.sh`) read only the `toolchain` line.
+  - Only a tag ruleset (a repository setting) keeps stray `v*` tags out;
+    nothing in the repository's files can.
+- **Still to do in the repository settings** (the owner; replaces round
+  two's list):
+  - A tag ruleset for `refs/tags/v*` restricting creation, update and
+    deletion, with only the maintainers (the admin role) as bypass, not
+    GitHub Actions or an app. It keeps stray tags out of the Go module proxy
+    and the release workflow, and makes `--source-ref refs/tags/v…` mean a
+    maintainer's tag.
+  - Immutable releases: a published release's files and tag can no longer
+    change (and `gh release verify` / `gh release verify-asset` check
+    GitHub's attestation of the release).
+  - Required reviewers on the `release` environment, and its deployment
+    tag policy limited to `v*`. That gates `images.yml`'s publishing
+    against mistakes and a stray tag run, not against collaborators.
+  - The ghcr packages (`hopcorder-agent`, `hopcorder-server`,
+    `charts/hopcorder-server`, `charts/hopcorder-agent`): under Manage
+    Actions access, only this repository, with no other repository granted
+    write. Read for this repository needs main's images moved first (see
+    the first bullet).
+  - Enforce the main ruleset with `ci` as a required check (from round
+    two).
+  - Give write access only to people you would let release.
+  - Artifact attestations need a public repository (or GitHub Enterprise
+    Cloud): if the repository is private, `publish` fails at the first
+    attest step, before it publishes anything.

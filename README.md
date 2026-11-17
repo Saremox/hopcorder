@@ -47,13 +47,31 @@ amd64 and arm64, with the example configs and systemd units:
 curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.1/hopcorder_0.1.1_linux_amd64.tar.gz | tar -xz
 ```
 
-Or build it; requires Linux and Go 1.27+:
+Releases after v0.1.1 also carry signed build provenance for every file and
+both images, and their notes list the image digests. Check an archive with
+the [GitHub CLI](https://cli.github.com/) before you install it (the notes
+of each release have the exact commands):
 
 ```bash
-go install github.com/saremox/hopcorder/cmd/hopcorder@latest
+gh attestation verify hopcorder_X.Y.Z_linux_amd64.tar.gz --repo Saremox/hopcorder \
+  --signer-workflow Saremox/hopcorder/.github/workflows/images.yml --source-ref refs/tags/vX.Y.Z
 ```
 
-or from a checkout:
+That proves the file was built by this repository's `images` workflow for
+the tag `vX.Y.Z`; anyone with write access to the repository can still
+replace a release's files and images, which the attestation then no longer
+matches (see [Releasing](#releasing)).
+
+Or build a release; requires Linux and Go 1.27+:
+
+```bash
+go install github.com/saremox/hopcorder/cmd/hopcorder@v0.1.1
+```
+
+Name a version that has a [GitHub release](https://github.com/Saremox/hopcorder/releases),
+not `@latest`: the Go module proxy serves every `v*` tag pushed to the
+repository as a version, released or not, and keeps it after the tag is
+gone (v0.1.0 is retracted for that reason). Or from a checkout:
 
 ```bash
 make build
@@ -71,7 +89,9 @@ the [`Dockerfile`](Dockerfile), static binaries on an empty base:
 
 Tags: releases (`v*` tags) are `<version>` (e.g. `0.1.1`), `<major>.<minor>`
 and `latest`, built without caches; `main` and `sha-<commit>` follow the
-`main` branch.
+`main` branch. Tags can be moved; for a fixed image use the digest from the
+release notes (`ghcr.io/saremox/hopcorder-agent:X.Y.Z@sha256:…`, which
+`gh attestation verify oci://…` checks like a file).
 
 ```bash
 docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET_RAW \
@@ -146,8 +166,14 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   `server.tls` for a CA and client certificate). Inline ones would land in a
   ConfigMap, which the built-in `view` role can read, so the charts refuse
   them: in the agent's `config`, headers such as `Authorization`, `Cookie` or
-  `X-Api-Key` included; in the server's, `clickhouse.password`
-  (`clickhouse.passwordSecret` instead).
+  `X-Api-Key` included (judged by name: a heuristic, so pass credentials only
+  through the Secrets); in the server's, `clickhouse.password`
+  (`clickhouse.passwordSecret` instead). The agent pods have no liveness
+  probe: its metrics endpoint holds at most 64 connections, so a probe on it
+  would let anyone who can reach the port restart the agent.
+  `networkPolicy.enabled` with `networkPolicy.from` (opt-in) admits only those
+  peers to the metrics port; NetworkPolicy does not apply with `hostNetwork`,
+  where the nodes' firewall has to.
 - **Inside the cluster** the server's Service is reachable around the
   ingress's authentication: `networkPolicy.enabled=true` with
   `networkPolicy.from` (required then) limits it to the peers you list.
@@ -157,7 +183,10 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
 
 Every value is documented in the charts' `values.yaml`. A chart runs the
 image of its own version; `--set image.tag=main` follows `main` instead (or
-install from `deploy/helm` in a checkout). CI installs both charts into a
+install from `deploy/helm` in a checkout), and `--set
+image.tag=X.Y.Z@sha256:…` pins the digest from the release notes. To check a
+chart first, `helm pull` it, run `gh attestation verify` on the `.tgz` (as
+above) and install that file. CI installs both charts into a
 kind cluster, the server with its own ClickHouse, and checks that records
 arrive.
 
@@ -451,6 +480,32 @@ Point agents at it with `outputs.http.url`. For production use
 hopcorder does **no authentication**: it listens on localhost by default; put a
 reverse proxy in front and secure the path prefixes separately.
 
+**Only the proxy.** Every local user can reach `127.0.0.1:8080` around the
+proxy, and so read everything and send records. To admit only the proxy,
+listen on a unix socket: under systemd, install
+[`deploy/hopcorder-server.socket`](deploy/hopcorder-server.socket) too and set
+`listen: systemd`. systemd then creates `/run/hopcorder-server.sock` with
+mode 0660 for the group in `SocketGroup=` (the proxy's; the shipped
+`hopcorder-proxy` does not exist, so the socket does not start until you set
+it) and hands it to the server:
+
+```bash
+sudo install -m 0644 deploy/hopcorder-server.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl edit hopcorder-server.socket   # [Socket] SocketGroup=caddy (your proxy's group)
+# /etc/hopcorder/server.yaml: listen: systemd
+sudo systemctl enable --now hopcorder-server.socket && sudo systemctl restart hopcorder-server
+curl --unix-socket /run/hopcorder-server.sock http://localhost/healthz
+```
+
+Point the proxy at it (Caddy `reverse_proxy unix//run/hopcorder-server.sock`,
+nginx `proxy_pass http://unix:/run/hopcorder-server.sock;`). Health and metrics
+are on the socket too; Prometheus scrapes through the proxy. Without systemd,
+`listen: unix:/path/to.sock` creates the socket itself, with mode 0660 for its
+owner and group. On a unix socket the server checks no `Host` header unless
+`allowed_hosts` lists names: list the proxy's public names if it admits
+clients by address rather than by credentials.
+
 **Host names.** So that a web page cannot reach a server on localhost or an
 internal address through DNS rebinding (its own name resolving to the
 server's address), the server answers only requests whose `Host` header is in
@@ -666,14 +721,31 @@ git tag -a vX.Y.Z -m "hopcorder vX.Y.Z" && git push origin vX.Y.Z
 The `images` workflow first checks the tag
 ([`scripts/release-verify.sh`](scripts/release-verify.sh)): `v<semver>` on a
 commit of `main` whose `ci` run succeeded (it waits for one still running),
-above the latest release, and not released before. It then builds the images
-(pushed only as `:sha-<commit>`), the Linux binaries, chart packages and
-checksums, all without caches and without write tokens. The `publish` job,
-in the `release` environment (where required reviewers approve it), checks
-again, tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as
+above the latest release, and not released before. It then builds, all
+without caches, the images (pushed only as `:sha-<commit>`, by a job that
+may write packages and nothing else) and, in a job without write tokens, the
+Linux binaries, chart packages and checksums. The `publish` job, in the
+`release` environment (where required reviewers approve it), checks again,
+attests every release file and both image digests (signed build provenance),
+tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as
 `vX.Y.Z-rc.1` only `:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and
-creates the GitHub release. A version is released once; to fix a release,
-release the next version. Pull requests run all of it but the publishing.
+creates the GitHub release, whose notes get the image digests and the
+`gh attestation verify` commands
+([`scripts/release-notes.sh`](scripts/release-notes.sh)). If the tag no longer
+names the commit it built by then, it deletes the release again and fails.
+A version is released once; to fix a release, release the next version. Pull
+requests run all of it but the publishing.
+
+What the `release` environment does not do: it gates this workflow's
+`publish` job, not the repository's packages and releases. Anyone with write
+access can push a workflow of their own that asks for `packages: write` and
+`contents: write` and leaves the environment out, and replace the images,
+charts and release files of any version. The attestations show that (a
+replaced file or digest no longer matches one made by `images.yml` for the
+tag), and the repository settings limit it: a tag ruleset for `v*` that only
+the maintainers may bypass (not GitHub Actions), immutable releases, and
+required reviewers on `release`. Give write access only to people you would
+let release.
 
 ## License
 

@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -40,8 +41,10 @@ const (
 // ServerConfig configures `hopcorder server`.
 type ServerConfig struct {
 	// Listen is the HTTP address for ingest, the read API, health and
-	// metrics. hopcorder does no authentication: put a reverse proxy in
-	// front, which is why the default only listens on localhost.
+	// metrics: host:port, unix:<absolute path> for a unix socket, or
+	// "systemd" for the socket systemd passes (socket activation; see
+	// ListenAddress). hopcorder does no authentication: put a reverse proxy
+	// in front, which is why the default only listens on localhost.
 	Listen     string           `yaml:"listen"`
 	Log        Log              `yaml:"log"`
 	ClickHouse ClickHouseConfig `yaml:"clickhouse"`
@@ -220,8 +223,8 @@ func (c *ServerConfig) Finalize() error {
 	}
 	setDur(&a.Refresh, 24*time.Hour)
 
-	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
-		fail("listen %q: want host:port: %v", c.Listen, err)
+	if _, _, err := ListenAddress(c.Listen); err != nil {
+		fail("listen %q: %v", c.Listen, err)
 	}
 	for _, h := range c.AllowedHosts {
 		if !validAllowedHost(h) {
@@ -347,4 +350,36 @@ func (c *ServerConfig) ClickHousePassword() (string, error) {
 		return "", fmt.Errorf("clickhouse.password_file: %w", err)
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// ListenSystemd as the listen address takes the listening socket from
+// systemd (socket activation, e.g. deploy/hopcorder-server.socket).
+const ListenSystemd = "systemd"
+
+// maxUnixPath is the longest unix socket path Linux takes (sun_path holds
+// 108 bytes with the terminating NUL).
+const maxUnixPath = 107
+
+// ListenAddress splits a listen value into a network and an address:
+// "unix" and the socket's path for unix:<absolute path>, ListenSystemd and
+// "" for "systemd", else "tcp" and host:port. Abstract unix sockets
+// ("unix:@name") are refused: they have no file permissions, so every
+// process in the network namespace could connect.
+func ListenAddress(listen string) (network, address string, err error) {
+	if listen == ListenSystemd {
+		return ListenSystemd, "", nil
+	}
+	if path, ok := strings.CutPrefix(listen, "unix:"); ok {
+		switch {
+		case !filepath.IsAbs(path):
+			return "", "", errors.New("want unix:<absolute path>")
+		case len(path) > maxUnixPath:
+			return "", "", fmt.Errorf("unix socket path longer than %d bytes", maxUnixPath)
+		}
+		return "unix", path, nil
+	}
+	if _, _, err := net.SplitHostPort(listen); err != nil {
+		return "", "", fmt.Errorf("want host:port, unix:<path> or systemd: %w", err)
+	}
+	return "tcp", listen, nil
 }

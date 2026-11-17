@@ -145,3 +145,43 @@ func TestHostAllowlist(t *testing.T) {
 		t.Errorf("addresses refused: %v", err)
 	}
 }
+
+// listen takes host:port, a unix socket's absolute path or "systemd".
+func TestListenAddress(t *testing.T) {
+	long := "/" + strings.Repeat("s", maxUnixPath)
+	for _, tc := range []struct {
+		listen, network, addr string
+		bad                   bool
+	}{
+		{listen: "127.0.0.1:8080", network: "tcp", addr: "127.0.0.1:8080"},
+		{listen: ":8080", network: "tcp", addr: ":8080"},
+		{listen: "unix:/run/hopcorder-server.sock", network: "unix", addr: "/run/hopcorder-server.sock"},
+		{listen: "systemd", network: ListenSystemd},
+		{listen: "unix:run/x.sock", bad: true},
+		{listen: "unix:@hopcorder", bad: true},
+		{listen: "unix:", bad: true},
+		{listen: "unix:" + long, bad: true},
+		{listen: "unix:8080", bad: true},
+		{listen: "Systemd", bad: true},
+		{listen: "/run/x.sock", bad: true},
+	} {
+		network, addr, err := ListenAddress(tc.listen)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("%q accepted as %s %q", tc.listen, network, addr)
+			}
+			continue
+		}
+		if err != nil || network != tc.network || addr != tc.addr {
+			t.Errorf("%q: %s %q %v, want %s %q", tc.listen, network, addr, err, tc.network, tc.addr)
+		}
+		c := &ServerConfig{Listen: tc.listen}
+		if err := c.Finalize(); err != nil {
+			t.Errorf("%q refused by Finalize: %v", tc.listen, err)
+		}
+	}
+	c := &ServerConfig{Listen: "unix:relative.sock"}
+	if err := c.Finalize(); err == nil || !strings.Contains(err.Error(), "listen") {
+		t.Errorf("relative socket path: %v", err)
+	}
+}

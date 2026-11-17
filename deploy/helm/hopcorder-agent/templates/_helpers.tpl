@@ -46,11 +46,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- fail "config.outputs.http: set credentials and TLS with server.bearerTokenSecret, server.basicAuth and server.tls (from Secrets), not in config" }}
 {{- end }}
 {{- /* Headers that carry credentials, matched by name in any case: they would
-  land in the ConfigMap. Authorization, Proxy-Authorization, Cookie, and any
-  name with a part such as key, token, secret, auth or session (X-Api-Key,
-  X-Auth-Token, Private-Token, ...). */}}
+  land in the ConfigMap. A heuristic, not a guarantee: names containing
+  token, secret, passw(or)d, credential, cookie, signature, session, jwt,
+  bearer, api-key, authori[sz]ation or authentication anywhere
+  (X-AccessToken, Proxy-Authorization, X-Jwt), and names with a part key(s),
+  auth, pass or sig (X-Key, X-Auth). */}}
 {{- range $name, $_ := (default dict $http.headers) }}
-{{- if regexMatch "(^|[-_])(authorization|cookie|api[-_]?key|key|token|secret|password|passwd|pass|auth|credentials?|session|signature)([-_]|$)" (lower $name) }}
+{{- if regexMatch "(token|secret|passw|credential|cookie|signature|session|jwt|bearer|api[-_]?key|authori[sz]|authent)|(^|[-_])(keys?|auth|pass|sig)([-_]|$)" (lower $name) }}
 {{- fail (printf "config.outputs.http.headers.%s: looks like a credential; in config it would land in a ConfigMap. Use server.bearerTokenSecret, server.basicAuth or server.tls" $name) }}
 {{- end }}
 {{- end }}
@@ -134,16 +136,15 @@ spec:
         {{- with .Values.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- /* No liveness probe: /metrics answering says nothing about the
+        probing loop, and its listener holds at most 64 connections, so
+        anything that can reach the port could hold them and have the agent
+        restarted over and over. */}}
       {{- if and .Values.metrics.enabled (ne .Values.metrics.listenAddress "127.0.0.1") }}
       ports:
         - name: metrics
           containerPort: {{ .Values.metrics.port }}
           protocol: TCP
-      livenessProbe:
-        httpGet:
-          path: /metrics
-          port: metrics
-        periodSeconds: 30
       {{- end }}
       resources:
         {{- toYaml .Values.resources | nindent 8 }}

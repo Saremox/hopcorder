@@ -4,6 +4,10 @@ go 1.27.0
 
 toolchain go1.27.4
 
+// Withdrawn: its tag and release were deleted, and it predates two security
+// reviews. Use a version with a GitHub release.
+retract v0.1.0
+
 require (
 	github.com/klauspost/compress v1.20.4
 	github.com/prometheus/client_golang v1.25.0
