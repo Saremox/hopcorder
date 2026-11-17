@@ -78,6 +78,10 @@ The section for a version is the text of its GitHub release.
   and got it OOM-killed in the chart's 1 GiB container on every try; the
   worst file the new bounds allow peaks at about 380 MiB while the old
   database is still in use.
+- The topology view's edges cost ClickHouse memory in proportion to a
+  path's hops, not to their square: 20,000 cycles of 255 answering hops
+  took 3.1 GiB and 29 s, more than a read query may use (1 GiB), so long
+  paths, real or sent to that end, broke the view; now 49 MiB and 0.4 s.
 
 **Security: agent**
 
