@@ -42,6 +42,10 @@ The section for a version is the text of its GitHub release.
   A `config.allowed_hosts` of your own replaces the chart's list.
 - `allowed_hosts` takes `*.example.net` (one label below `example.net`, as
   an Ingress host of that form), so wildcard ingress hosts work.
+- The read API gives up on a client that stops reading its response after
+  10 s (each 64 KiB of it must be taken within 10 s), which frees its
+  `query.max_concurrent` slot: eight such connections kept the read API and
+  the UI at 503 for as long as they stayed open, up to two minutes each.
 
 **Security: agent**
 

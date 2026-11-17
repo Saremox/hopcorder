@@ -1627,6 +1627,36 @@ high-severity issue. Four fixes followed. The decisions:
   - Tests: `TestHostCheck` and `TestHostAllowlist` cover `*.domain`; the CI
     `helm` job renders the list (service names, ingress host, extra names,
     `*`, `config.allowed_hosts`) and the refusals; smoke.sh as above.
+- **A read-API client that stops reading loses its slot after 10 s.** A
+  request held its `query.max_concurrent` slot for the whole response, and
+  the only bound on writing it was the server's 2-minute `WriteTimeout`: 8
+  connections that sent `cycles?limit=1000` and never read kept every other
+  read request and the UI at 503 (the review: 503 at 2, 52 and 102 s, 200
+  at 137 s), and could start over. Now every write of a read-API response,
+  in parts of at most 64 KiB (topology writes its response at once), and
+  every flush get a deadline 10 s from then, never past the request's
+  `WriteTimeout` (`server.WriteTimeout`, which the http.Server uses; a
+  write deadline replaces the server's). 64 KiB in 10 s is 6.4 KB/s, far
+  below any real link; 10 s is also how long a request waits for a slot.
+  - The slot is still held while the response is sent rather than given
+    back once ClickHouse has finished (`wait_end_of_query`): ClickHouse
+    keeps a finished result in a temporary file, and the query in
+    `system.processes`, until the server has read it (measured on 25.8: a
+    2M-row result read at 20 KB/s sat in a 261 MB file in
+    `/var/lib/clickhouse/tmp`). Without the slot, unread results would pile
+    up there without bound.
+  - Accepted: a client that keeps reading at least 64 KiB every 10 s holds
+    its slot until its response is done or `WriteTimeout`, as a slow
+    download does; and clients can still take every slot by opening new
+    connections every 10 s, as they can with ordinary requests. Both are
+    for a rate limit at the proxy (a buffering proxy, nginx's default,
+    absorbs slow readers entirely).
+  - Tests: `TestNonReadingClientLosesQuerySlot` (one slot, small socket
+    buffers, a client that never reads): another reader gets 200 within a
+    second; without the deadlines it got 503 after the 10 s queue wait.
+    `TestSlowReaderGetsWholeResponse`: a client reading 1.6 MB/s gets a
+    2.4 MB topology response whole with a 0.5 s deadline per part; with one
+    deadline for the whole write it was cut off after 0.6 s.
 
 **Agent**
 
