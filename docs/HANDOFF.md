@@ -1004,7 +1004,9 @@ fixes. The decisions:
   `readonly = 2` (no writes; the plugin may still set query settings; since
   round four `readonly = 1`, see there), and no
   privileges for table functions (`url()`, `file()`). Any viewer, anonymous
-  ones included, can send Grafana SQL, so that user is the boundary.
+  ones included, can send Grafana SQL, so that user is the boundary (for
+  the data and settings; not for ClickHouse's availability, see round
+  six).
 - **ClickHouse is no longer published** on the host (`docker compose exec
   clickhouse clickhouse-client` instead), so web pages a user visits cannot
   post SQL to `127.0.0.1:8123`. The server uses its own ClickHouse user; the
@@ -3231,7 +3233,8 @@ findings are listed at the end, for the owner to decide on. The decisions:
     MiB) and not counted in the chart's cache figures; a viewer can still
     keep ClickHouse's CPUs busy within the limits (16 concurrent queries of
     up to 300 s slowed topology from 60 ms to 1.2 s; ingest was not slowed).
-    Keep untrusted users away from Grafana (round four).
+    Keep untrusted users away from Grafana (round four; round six found a
+    way to OOM-kill ClickHouse in seconds, see there).
 
 **One stream per target**
 
@@ -3361,6 +3364,33 @@ decisions:
     a refused call left `user_files/probe.db`.
   - Compose: an existing ClickHouse container takes the new config when it
     is recreated (`docker compose up -d`).
+- **Accepted risk: whoever can query Grafana's data source can OOM-kill
+  ClickHouse.** Grafana viewers are trusted with ClickHouse's availability
+  (the owner's decision). Every time zone a query names
+  (`toTimeZone(now(), 'Asia/Kolkata')`, `CAST(x AS DateTime('…'))`) makes
+  ClickHouse 25.8 build a lookup table of about 5 MiB and keep it in a
+  global cache for good, outside every query and user limit. It needs no
+  table, grant or setting, and the names are practically unbounded (597
+  IANA zones and `Fixed/UTC±hh:mm:ss`). Queries of 70 zones each took the
+  chart's 2 GiB ClickHouse from 0.38 to 1.95 GiB and OOM-killed it about
+  13 s after the start; 594 one-zone queries, 4 at a time, did so in 4.4 s
+  through the compose profile (review, round six; reproduced: one query
+  naming 40 zones grew ClickHouse by 176 MiB). Then reads 502 and ingest
+  503, and it can be repeated after every restart. Neither
+  `system.settings` nor the grants can bound it, so the read-only user
+  protects the data and settings, not ClickHouse's uptime.
+  - Docs: `clickhouse-init.sql`, the chart's values, `clickhouse.yaml` and
+    NOTES, `docker-compose.yml` and README no longer call that user the
+    boundary, and say to give only trusted users access to the data
+    source; README names a proxy that passes only the dashboard's queries
+    for untrusted viewers.
+  - The compose try-out keeps its anonymous Viewer: it listens on
+    localhost only, and its comments and README say to turn anonymous
+    access off before publishing Grafana.
+  - Rejected for now: a query allowlist proxy in front of ClickHouse (a
+    new component to keep in step with the dashboard) and Grafana's shared
+    dashboards (saved queries only, but without the template variables the
+    dashboard needs).
 
 **Route changes**
 

@@ -32,9 +32,11 @@ only requests for `localhost` (so a web page cannot reach them through DNS
 rebinding), ClickHouse is not published (`docker compose -f
 deploy/docker-compose.yml exec clickhouse clickhouse-client` to query it) and
 Grafana reads it with a read-only user whose queries are bounded in time and
-memory. Grafana's `admin` password is `HOPCORDER_GRAFANA_ADMIN_PASSWORD`
-(default `admin`, set when Grafana's volume is created); the other passwords
-are fixed: it is a try-out, not a deployment.
+memory. Anonymous viewers can still crash ClickHouse through Grafana (see
+[Dashboards](#dashboards)), so keep the stack on localhost. Grafana's `admin`
+password is `HOPCORDER_GRAFANA_ADMIN_PASSWORD` (default `admin`, set when
+Grafana's volume is created); the other passwords are fixed: it is a
+try-out, not a deployment.
 `docker compose -f deploy/docker-compose.yml down -v` removes it with its data.
 
 ## Install
@@ -200,7 +202,8 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   it (a NetworkPolicy; add Grafana with `clickhouse.deploy.networkPolicy.from`).
   `clickhouse.deploy.readOnlyUser.enabled` adds a read-only user for Grafana
   (SELECT on the hopcorder database, bounded queries), with its password in a
-  generated Secret.
+  generated Secret. Whoever can query Grafana's data source can still crash
+  ClickHouse (see [Dashboards](#dashboards)): give only trusted users access to it.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
   after their pods, each with its own spool volume; `mode: daemonset` runs one
   agent per node, named after the node, with its spool on the node.
@@ -809,6 +812,17 @@ with `readonly = 2` one query could switch off ClickHouse's memory tracking
 and crash it, fill its disk with temporary data or its own logs, or pin
 memory in the query cache. Set Grafana's `server.domain` and `enforce_domain`
 when it runs on localhost, as the compose stack does, against DNS rebinding.
+
+That user protects the data and ClickHouse's settings, not its availability.
+A query that names a time zone (`toTimeZone(now(), 'Asia/Kolkata')`) makes
+ClickHouse 25.8 build a table of about 5 MiB for it and keep it for good,
+outside every query and user memory limit, and no setting or grant prevents
+it: queries naming a few hundred zones OOM-kill a ClickHouse of 2 GiB within
+seconds. Everyone who can query the data source, which includes every
+dashboard viewer, must be trusted with ClickHouse's uptime: no anonymous
+access outside a try-out on localhost. If your viewers are not trusted, put
+a proxy between Grafana and ClickHouse that passes only the dashboard's
+queries.
 
 ## Development
 

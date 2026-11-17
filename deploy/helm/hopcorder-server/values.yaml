@@ -104,7 +104,10 @@ clickhouse:
     # but max_execution_time, up to 300 s: keep the data source's query
     # timeout at 295 s or below, and add no custom settings or row limit),
     # bounded memory and concurrency, and no temporary data on disk (like
-    # deploy/compose/clickhouse-init.sql).
+    # deploy/compose/clickhouse-init.sql). It protects the data, not
+    # ClickHouse's uptime: any query can fill memory ClickHouse never frees
+    # (a table of about 5 MiB per time zone it names) and OOM-kill it, so
+    # give only trusted users access to the data source (README, Dashboards).
     # Its password comes from passwordSecret or a generated Secret
     # (<release>-hopcorder-server-clickhouse-readonly, key password).
     readOnlyUser:

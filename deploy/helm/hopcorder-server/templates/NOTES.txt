@@ -39,6 +39,9 @@ ClickHouse's read-only user for Grafana is {{ .Values.clickhouse.deploy.readOnly
 http://{{ include "hopcorder-server.clickhouseName" . }}.{{ .Release.Namespace }}.svc:8123; its password:
 
   kubectl -n {{ .Release.Namespace }} get secret {{ include "hopcorder-server.clickhouseReadOnlySecret" . }} -o jsonpath='{.data.{{ include "hopcorder-server.clickhouseReadOnlyKey" . }}}' | base64 -d
+
+Its queries can still crash ClickHouse: give only trusted users access to
+that data source (no anonymous viewers).
 {{- if .Values.clickhouse.deploy.networkPolicy.enabled }}
 
 Add Grafana's namespace to clickhouse.deploy.networkPolicy.from so it may connect.

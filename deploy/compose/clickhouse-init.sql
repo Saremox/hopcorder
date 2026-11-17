@@ -2,8 +2,16 @@
 -- hopcorder database and nothing else. No writes or DDL, and no table
 -- functions that reach outside, such as url(), file() or remote(), which
 -- need privileges it does not have. Anyone who can reach Grafana can send it
--- SQL (anonymous viewers included), so this user is the boundary. Use the
--- same pattern for Grafana in production.
+-- SQL (anonymous viewers included). This user keeps them from writes, other
+-- data and settings, and bounds each query, but it does not keep ClickHouse
+-- up: a query that names a time zone makes ClickHouse build a table of
+-- about 5 MiB for it and keep it for good, outside every query and user
+-- limit, and no setting or grant prevents that (ClickHouse 25.8). Queries
+-- naming a few hundred zones OOM-killed a ClickHouse of 2 GiB within
+-- seconds. So everyone who can query this data source must be trusted
+-- with ClickHouse's availability: the try-out allows anonymous viewers
+-- because it listens on localhost only. Use the same pattern for Grafana
+-- in production, without anonymous access.
 --
 -- OR REPLACE, so re-running the script on an existing volume brings the
 -- user and its profile up to date: a user's own settings win over its
