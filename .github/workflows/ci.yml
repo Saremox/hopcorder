@@ -140,6 +140,18 @@ jobs:
           go-version-file: go.mod
       - name: start the stack
         run: docker compose -f deploy/docker-compose.yml up -d --build --wait --wait-timeout 300
+      - name: Grafana's ClickHouse user leaves no files
+        # sqlite() creates its file under user_files_path before it checks
+        # the grant; compose points that path at an empty directory the
+        # clickhouse user cannot write (compose/clickhouse-config.xml).
+        run: |
+          dc() { docker compose -f deploy/docker-compose.yml "$@"; }
+          if out=$(dc exec -T clickhouse clickhouse-client --user grafana --password grafana \
+            --query "SELECT * FROM sqlite('probe.db','t')" 2>&1); then
+            echo "the Grafana user may use sqlite(): $out"; exit 1
+          fi
+          dc exec -T clickhouse sh -c 'test -z "$(ls -A /srv)" && test ! -e /var/lib/clickhouse/user_files/probe.db' ||
+            { echo "sqlite() left a file behind: $out"; exit 1; }
       - name: dashboards through Grafana
         env:
           HOPCORDER_SERVER_URL: http://127.0.0.1:8080
@@ -362,6 +374,7 @@ jobs:
           ch=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --show-only templates/clickhouse.yaml)
           grep -qF '<readonly>1</readonly>' <<<"$ch" || { echo "readonly.xml: not readonly = 1"; exit 1; }
           grep -qF '<allow_hyperscan>0</allow_hyperscan>' <<<"$ch" || { echo "readonly.xml: hyperscan is allowed"; exit 1; }
+          grep -qF '<user_files_path>/srv/</user_files_path>' <<<"$ch" || { echo "hopcorder.xml: user_files_path is writable"; exit 1; }
           if [ "$(grep -c '<changeable_in_readonly/>' <<<"$ch")" != 1 ] ||
             ! grep -qF '<max_execution_time><min>1</min><max>300</max><changeable_in_readonly/></max_execution_time>' <<<"$ch"; then
             echo "readonly.xml: a query may change settings other than max_execution_time (1 to 300 s)"; exit 1

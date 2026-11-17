@@ -3328,3 +3328,37 @@ findings are listed at the end, for the owner to decide on. The decisions:
     panels read the per-stream tables and are right. A `flow_id`
     variable is left for the owner; another round-five fix changes
     Grafana's side.
+
+### Security and correctness review, round six
+
+A sixth review (the same four areas; round five's fixes re-checked, every
+one held) found two more ways for a Grafana viewer to take ClickHouse down
+through the read-only user, and medium and lower findings elsewhere. The
+decisions:
+
+**Grafana's ClickHouse user**
+
+- **user_files is an empty directory ClickHouse cannot write**
+  (`<user_files_path>/srv/</user_files_path>`: compose's
+  `compose/clickhouse-config.xml`, the chart's `hopcorder.xml`). ClickHouse
+  25.8's `sqlite()` opens, and so creates, its database file under
+  user_files before it checks the caller's grant: the read-only user got
+  ACCESS_DENIED and still left a 0-byte file, any name it chose, never
+  removed. 1,513 a second from 16 connections; on a data directory of
+  40,000 inodes, 42,000 queries in 28.6 s made inserts fail (no space to
+  create the part directory) and reads 502 (review, round six). The
+  chart's 20 GiB ext4 volume has about 1.3 million inodes: 15 to 18
+  minutes. `/srv` is root-owned and empty in the image; the chart runs
+  ClickHouse as uid 101, and compose sets `CLICKHOUSE_DO_NOT_CHOWN` so the
+  root entrypoint does not hand it to the clickhouse user. `sqlite()` now
+  fails with PATH_ACCESS_DENIED and creates nothing; no hopcorder query
+  uses user_files. About 30 other table functions were checked: all refuse
+  before any side effect.
+  - Checks: CI's `grafana` job runs `sqlite()` as the compose stack's
+    Grafana user and requires `/srv` empty and no file in the old
+    user_files; `smoke.sh` does the same for the chart's user in kind; the
+    helm job checks the rendered `hopcorder.xml`. Verified before the fix:
+    a refused call left `user_files/probe.db`.
+  - Compose: an existing ClickHouse container takes the new config when it
+    is recreated (`docker compose up -d`).
+
