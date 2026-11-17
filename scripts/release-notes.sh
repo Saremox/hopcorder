@@ -2,7 +2,7 @@
 # Prints the "Verify" section that the publish job of
 # .github/workflows/images.yml appends to a release's notes (the tag's
 # section of CHANGELOG.md): the commit, the images by digest, and how to
-# check the build provenance attestations publish created for the
+# check the build provenance attestations the attest job created for the
 # release files and both images. The digests here are a convenience; the
 # attestations are what proves them, checked against the tag's commit.
 #

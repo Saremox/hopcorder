@@ -249,6 +249,8 @@ The section for a version is the text of its GitHub release.
   repointing `:X.Y.Z` in ghcr no longer changes what a verified chart runs.
   Install the chart `.tgz` from the GitHub release. Charts from a checkout,
   and `image.tag` set by you, work as before.
+- The release's signing runs in a job of its own that does nothing else, and
+  Dependabot proposes a new version only once it is 7 days old.
 
 ## v0.1.1
 

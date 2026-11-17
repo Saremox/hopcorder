@@ -846,8 +846,9 @@ added in the commit that introduced it.
   `main` that is a dry run; for a tag the files go to `publish`, which
   attests them and both image digests and creates the GitHub release from
   them, the notes followed by the digests and how to verify them (round
-  three; since round four `publish` creates the release as a draft and
-  checks it before publishing). The binaries and images carry the
+  three; since round four the `attest` job attests, and `publish` creates
+  the release as a draft and checks it before publishing). The binaries and
+  images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -2109,7 +2110,8 @@ high-severity issue. Four fixes followed. The decisions:
   - **Build provenance attestations** (`actions/attest` v4.2.2, pinned by
     commit; the action that `attest-build-provenance` v4 wraps, which its
     README recommends for new workflows). `id-token: write` and
-    `attestations: write` are on `publish` only. It attests every file in
+    `attestations: write` are on `publish` only (round four: on the
+    `attest` job only, which runs nothing else). It attests every file in
     `dist/` (archives, chart packages, `SHA256SUMS`) and both image digests
     (the multi-arch indexes, by `subject-digest`) before it publishes
     anything. The attestations live in GitHub's attestation store; they are
@@ -2774,3 +2776,69 @@ decisions:
     modes) and the refusal; the dry run renders the packages.
   - README installs the chart `.tgz` from the release (immutable once
     published) rather than from ghcr, and checks it with `verify`.
+- **Signing has a job of its own.** `id-token: write` and `attestations:
+  write` were on `publish`, so every action there (checkout,
+  download-artifact, setup-helm, login-action) could have signed provenance
+  as `images.yml` for the tag. The `attest` job has them (and `contents:
+  read`), runs only download-artifact and attest (and a digest check in
+  bash), and `publish` lost them. It runs after `release-assets` and before
+  `publish`, so still before anything is published, but now before the
+  approval rather than after it. Provenance says how the files and images
+  were built; the release says they were released. A rejected run's builds
+  verify only for that tag's commit (`--source-digest`), and a version
+  without a release is not offered to anyone. The alternative, `attest`
+  in the `release` environment too, would ask for a second approval: each
+  job in an environment waits for its own.
+- setup-helm v5.1.0 has `checksum-policy`; images.yml sets `required`, so a
+  helm without its `.sha256sum` fails rather than installs with a warning
+  (the checksum comes from the same host, get.helm.sh: this catches a
+  broken download, not that host). ci.yml's helm job keeps `auto`: round
+  four changes ci.yml only by its assertions.
+- Dependabot waits 7 days after a version is published before proposing it
+  (`cooldown: {default-days: 7}`, all five ecosystems); security updates do
+  not wait.
+- **Concurrency groups** are the repository's, shared by every workflow:
+  `images-publish` could be joined by any workflow with
+  `cancel-in-progress` to cancel a publish half-way. They are now named
+  after the file (`github.workflow_ref` for runs, `.github/workflows/
+  images.yml publish` for publish) rather than the workflow's name, which
+  another workflow may share. Accepted: any workflow can still join a group
+  on purpose (a pull request's run uses the pull request's workflow files,
+  from a fork too), a denial of service only. A cancelled `publish` can be
+  run again: tagging the images and pushing the charts repeat harmlessly,
+  and a draft it left makes `release-verify.sh` stop and say to delete it.
+  Cancelled after publishing the release, check that release by hand
+  (files against `SHA256SUMS`, the tag).
+- **Only on a real tag push**: the attestations' SAN with `--cert-identity`;
+  GitHub's asset `digest` and `immutable` fields and the release's notes as
+  sent (the fake has them as gh's source reads them); `PATCH draft=false`
+  on a draft of an existing tag; the `attest` job's permissions (artifact
+  download and attest without `actions: read`); matrix outputs of `image`
+  reaching `release-assets`; `checksum-policy: required` against
+  get.helm.sh.
+- **Repository settings** still recommended (round three's list is set):
+  - The tag ruleset on all tags (`~ALL`), or at least `V*` too: whether
+    `v*` matches case-insensitively was not checked. README's flags no
+    longer accept a `V` tag, but the ruleset is what makes a tag's run a
+    maintainer's.
+  - Main: require a pull request with one approval and code-owner review
+    for `.github/**`, `scripts/**`, `Dockerfile`, `deploy/**`,
+    `go.mod`/`go.sum` and `ui/package*.json`; dismiss stale approvals and
+    require approval of the latest push (a single maintainer: an admin
+    bypass for pull requests only). Required checks alone constrain no one
+    with write access, since a pull request can redefine `test` and the
+    rest.
+  - Actions: require actions pinned to full-length commit SHAs, an
+    allow-list of action owners, and approval for every fork pull request
+    run of an outside contributor (also against joining a concurrency
+    group).
+  - ghcr: `:main` in packages of its own, so the release packages can be
+    Read for Actions and pushed only with an environment credential: the
+    only fix for collaborators overwriting images and charts.
+  - Fewer people with write access: any of them can create a release of a
+    pushed tag before `publish` does.
+  - Still to be checked with GitHub's documentation (blocked here):
+    whether a collaborator can edit an immutable release's notes, and
+    whether an immutable release can be deleted and its tag name reused
+    (`publish` deletes a release on a confirmed difference; if the name
+    cannot be reused, that version is skipped, and the next one released).

@@ -859,9 +859,10 @@ above the latest release, and not released before. It then builds, all
 without caches, the images (pushed only as `:sha-<commit>`, by a job that
 may write packages and nothing else) and, in a job without write tokens, the
 Linux binaries, chart packages (which run those images by digest) and
-checksums. The `publish` job, in the `release` environment (where
-required reviewers approve it), checks again, attests every release file
-and both image digests (signed build provenance), tags the images `:X.Y.Z`,
+checksums. The `attest` job, the only one that can sign and which runs
+nothing else, attests every release file and both image digests (signed
+build provenance). The `publish` job, in the `release` environment (where
+required reviewers approve it), checks again, tags the images `:X.Y.Z`,
 `:X.Y` and `:latest` (a pre-release such as `vX.Y.Z-rc.1` only
 `:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and creates the GitHub
 release, whose notes get the image digests and the `gh attestation verify`
@@ -874,7 +875,7 @@ promoting with `git tag -a v1.0.0 v1.0.0-rc.1` is fine); then it checks all
 that again, and deletes the release if GitHub confirms a difference
 ([`scripts/release-publish.sh`](scripts/release-publish.sh)). A version is
 released once; to fix a release, release the next version. Pull requests
-run all of it but the publishing.
+run all of it but the attestations and the publishing.
 
 What the `release` environment does not do: it gates this workflow's
 `publish` job, not the repository's packages and releases. Anyone with write
