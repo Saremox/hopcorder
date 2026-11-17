@@ -954,7 +954,8 @@ fixes. The decisions:
   into a tab); credentials in `clickhouse.url` are refused (use `user` and
   `password`); `/readyz` no longer returns ClickHouse's error text.
 - **ASN database**: at most 64 MiB downloaded and 256 MiB uncompressed (it
-  is about 7 and 30 MB), 5 million ranges, AS names cut to 128 bytes without
+  is about 7 and 30 MB), 5 million ranges (2 million, 500,000 ASes and
+  16 MiB of names since round three), AS names cut to 128 bytes without
   control characters; redirects from https to http are refused; a plain-http
   URL is warned about at startup.
 
@@ -1657,6 +1658,45 @@ high-severity issue. Four fixes followed. The decisions:
     `TestSlowReaderGetsWholeResponse`: a client reading 1.6 MB/s gets a
     2.4 MB topology response whole with a 0.5 s deadline per part; with one
     deadline for the whole write it was cut off after 0.6 s.
+- **The ASN database's bounds bound its memory.** Round one's limits (64
+  MiB download, 256 MiB uncompressed, 5 million ranges) let a 45 MiB gzip
+  of 5M ranges with unique AS names through; parsing it peaked at 1.35 GB
+  of live heap (a 56-byte range, a 40-byte `ASNInfo` with two strings and
+  an index-map entry per line), and the server in the chart's 1 GiB
+  container was OOM-killed. The old database stays loaded during a parse
+  and the cache is written only after a successful one, so it crash-looped
+  for as long as the file was served. Now:
+  - New bounds: 2 million ranges, 500,000 distinct (AS, country, name) and
+    16 MiB of countries and names together. The real file has about
+    600,000 ranges, 7 MB gzipped and 30 MB uncompressed (not re-measured:
+    iptoasn.com is not reachable from the development container); the
+    figure of about 80,000 ASes is roughly the number of ASes in BGP.
+  - Compact storage: IPv4 ranges as two `uint32` and an index (12 bytes),
+    IPv6 ranges as two pairs of `uint64` (40 bytes), each AS as 12 bytes
+    pointing into one string that holds every country and name. The index
+    used while parsing maps a seeded `maphash` of AS, country and name to
+    the AS (a collision moves on to the next hash value), so it holds no
+    copy of the names. `ASNInfo` strings returned by `Lookup` share that
+    string, so an old database's text (at most 16 MiB) lives as long as a
+    caller holds one of its names (rows being inserted).
+  - Measured (`TestASNWorstCaseMemory`, opt-in with
+    `HOPCORDER_ASN_MEMTEST=1`): the worst file the bounds allow (2M IPv6
+    ranges, 500,000 ASes, 16 MiB of names; 14 MiB gzipped) is about 105 MB
+    in memory; parsing it while another is in use, with a 64 MiB download
+    held, peaks at 383 MiB of live heap (GOGC 5; 534 MiB at GOGC 100) and
+    keeps 273 MiB. With the old storage the same test peaked at 563 MiB
+    (788 MiB), and the new range and AS bounds alone, without the one on
+    the names' total, allowed 604 MiB (824 MiB) even without a download
+    held: they were not enough by themselves. The server in a 1 GiB
+    container (Go memory limit 966 MB from the cgroup) downloaded it three
+    times at a 1-minute refresh, each parse next to the previous database,
+    without exceeding 600 MiB. The review's 45 MiB file now fails after
+    0.4 s (more than 500,000 ASes) at a peak of 135 MiB.
+  - Lookups are unchanged (`TestParseAndLookup`; IPv4 and IPv6 at the top
+    of the address space and every generated range in the new tests).
+  - Tests: `TestParseMemoryBounds` (each bound, lowered) and
+    `TestASNDatabaseIsCompact` (200,000 ranges keep 31 bytes each; with the
+    old storage 73, over the test's limit of about 54) both failed before.
 
 **Agent**
 

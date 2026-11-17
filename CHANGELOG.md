@@ -46,6 +46,13 @@ The section for a version is the text of its GitHub release.
   10 s (each 64 KiB of it must be taken within 10 s), which frees its
   `query.max_concurrent` slot: eight such connections kept the read API and
   the UI at 503 for as long as they stayed open, up to two minutes each.
+- The ASN database is bounded by its memory: at most 2 million ranges,
+  500,000 distinct ASes and 16 MiB of AS names (the real file has about
+  600,000 ranges), stored compactly (31 instead of 73 bytes per range). A
+  45 MiB download within the old bounds took the server's heap to 1.35 GB
+  and got it OOM-killed in the chart's 1 GiB container on every try; the
+  worst file the new bounds allow peaks at about 380 MiB while the old
+  database is still in use.
 
 **Security: agent**
 

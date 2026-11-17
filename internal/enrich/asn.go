@@ -6,10 +6,13 @@ package enrich
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log/slog"
 	"net/http"
@@ -24,40 +27,88 @@ import (
 	"unicode/utf8"
 )
 
-// ASNInfo is the origin AS of an address.
+// ASNInfo is the origin AS of an address. Name and Country share the
+// memory of the database they came from.
 type ASNInfo struct {
 	ASN     uint32
 	Name    string
 	Country string
 }
 
-type asnRange struct {
-	start, end netip.Addr
+// ASNDB maps address ranges to origin ASes. It is compact (12 bytes per
+// IPv4 range, 40 per IPv6 range, the AS names in one string), because a
+// new database is parsed while the one in use stays loaded.
+type ASNDB struct {
+	v4    []range4
+	v6    []range6
+	infos []asInfo
+	text  string // every AS's country and name, back to back
+}
+
+type range4 struct {
+	start, end uint32
 	info       int32 // index into ASNDB.infos
 }
 
-// ASNDB maps address ranges to origin ASes.
-type ASNDB struct {
-	v4, v6 []asnRange
-	infos  []ASNInfo
+type range6 struct {
+	start, end addr6
+	info       int32
+}
+
+// addr6 is an IPv6 address as two big-endian halves, so it compares as a
+// number.
+type addr6 struct{ hi, lo uint64 }
+
+func toAddr6(a netip.Addr) addr6 {
+	b := a.As16()
+	return addr6{binary.BigEndian.Uint64(b[:8]), binary.BigEndian.Uint64(b[8:])}
+}
+
+func (a addr6) compare(b addr6) int {
+	if c := cmp.Compare(a.hi, b.hi); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.lo, b.lo)
+}
+
+func toAddr4(a netip.Addr) uint32 {
+	b := a.As4()
+	return binary.BigEndian.Uint32(b[:])
+}
+
+// asInfo is an ASNInfo in ASNDB.text: the country at off, then the name.
+type asInfo struct {
+	asn                 uint32
+	off                 uint32
+	countryLen, nameLen uint8
 }
 
 // Limits on an ASN database, whose source is a download: the real file is
-// about 7 MB gzipped, 30 MB and 600,000 ranges uncompressed.
+// about 7 MB gzipped, 30 MB uncompressed and 600,000 ranges of some 80,000
+// ASes. They bound its memory: a database at the limits takes about
+// 100 MB, and parsing one with the largest download while another is in
+// use peaks at about 380 MiB of live heap (TestASNWorstCaseMemory), well
+// inside the Helm chart's 1 GiB. Before, a 5-million-range file peaked at
+// 1.35 GB, and the server was OOM-killed on every try while it was served.
 const (
 	maxASNDownload = 64 << 20 // compressed
-	maxASNRanges   = 5_000_000
 	maxASNameLen   = 128
 	maxCountryLen  = 8
 )
 
-var maxASNDecoded int64 = 256 << 20 // uncompressed; a variable for tests
+// Variables for tests.
+var (
+	maxASNDecoded int64 = 256 << 20 // uncompressed
+	maxASNRanges        = 2_000_000
+	maxASNInfos         = 500_000  // distinct (AS, country, name)
+	maxASNText          = 16 << 20 // their countries and names together
+)
 
 // ParseIPToASN reads the iptoasn.com TSV format (ip2asn-combined.tsv,
 // optionally gzipped): range_start, range_end, AS number, country, AS
 // description. Ranges with AS 0 ("Not routed") are skipped. Its size,
-// range count and field lengths are bounded, and control characters are
-// removed from names.
+// range and AS counts and field lengths are bounded, and control
+// characters are removed from names.
 func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 	br := bufio.NewReader(r)
 	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
@@ -71,7 +122,13 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 	limited := &io.LimitedReader{R: br, N: maxASNDecoded + 1}
 	br = bufio.NewReader(limited)
 	db := &ASNDB{}
-	index := map[ASNInfo]int32{}
+	var text strings.Builder
+	// The ASes seen so far by a hash of AS, country and name, so the index
+	// holds no copy of them. A collision (with a random seed, only by
+	// chance) moves on to the next hash value.
+	seed := maphash.MakeSeed()
+	index := map[uint64]int32{}
+	var key []byte
 	sc := bufio.NewScanner(br)
 	sc.Buffer(make([]byte, 64<<10), 64<<10)
 	line := 0
@@ -80,8 +137,12 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 		if len(db.v4)+len(db.v6) >= maxASNRanges {
 			return nil, fmt.Errorf("asn db: more than %d ranges", maxASNRanges)
 		}
-		f := strings.Split(sc.Text(), "\t")
-		if len(f) < 5 {
+		var f [5]string
+		rest, n := sc.Text(), 0
+		for ok := true; ok && n < len(f); n++ {
+			f[n], rest, ok = strings.Cut(rest, "\t")
+		}
+		if n < len(f) {
 			if strings.TrimSpace(sc.Text()) == "" {
 				continue
 			}
@@ -100,18 +161,33 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 		if asn == 0 {
 			continue
 		}
-		info := ASNInfo{ASN: uint32(asn), Country: cleanField(f[3], maxCountryLen), Name: cleanField(f[4], maxASNameLen)}
-		idx, ok := index[info]
-		if !ok {
-			idx = int32(len(db.infos)) //nolint:gosec // far fewer than 2^31 ASes
-			db.infos = append(db.infos, info)
-			index[info] = idx
+		country, name := cleanField(f[3], maxCountryLen), cleanField(f[4], maxASNameLen)
+		key = binary.BigEndian.AppendUint32(append(append(append(key[:0], country...), 0), name...), uint32(asn))
+		h := maphash.Bytes(seed, key)
+		idx, ok := index[h]
+		for ok && !db.infoIs(idx, uint32(asn), country, name) {
+			h++
+			idx, ok = index[h]
 		}
-		rg := asnRange{start: start, end: end, info: idx}
+		if !ok {
+			if len(db.infos) >= maxASNInfos {
+				return nil, fmt.Errorf("asn db: more than %d distinct ASes", maxASNInfos)
+			}
+			if text.Len()+len(country)+len(name) > maxASNText {
+				return nil, fmt.Errorf("asn db: more than %d MiB of AS names", maxASNText>>20)
+			}
+			idx = int32(len(db.infos)) //nolint:gosec // at most maxASNInfos
+			index[h] = idx
+			db.infos = append(db.infos, asInfo{asn: uint32(asn), off: uint32(text.Len()), //nolint:gosec // < 4 GiB
+				countryLen: uint8(len(country)), nameLen: uint8(len(name))}) //nolint:gosec // bounded above
+			text.WriteString(country)
+			text.WriteString(name)
+			db.text = text.String() // for infoIs; shares the builder's bytes
+		}
 		if start.Is4() {
-			db.v4 = append(db.v4, rg)
+			db.v4 = append(db.v4, range4{start: toAddr4(start), end: toAddr4(end), info: idx})
 		} else {
-			db.v6 = append(db.v6, rg)
+			db.v6 = append(db.v6, range6{start: toAddr6(start), end: toAddr6(end), info: idx})
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -123,10 +199,22 @@ func ParseIPToASN(r io.Reader) (*ASNDB, error) {
 	if len(db.v4)+len(db.v6) == 0 {
 		return nil, errors.New("asn db: no routed ranges")
 	}
-	byStart := func(a, b asnRange) int { return a.start.Compare(b.start) }
-	slices.SortFunc(db.v4, byStart)
-	slices.SortFunc(db.v6, byStart)
+	db.text = text.String()
+	slices.SortFunc(db.v4, func(a, b range4) int { return cmp.Compare(a.start, b.start) })
+	slices.SortFunc(db.v6, func(a, b range6) int { return a.start.compare(b.start) })
 	return db, nil
+}
+
+// info returns the ASNInfo at idx.
+func (db *ASNDB) info(idx int32) ASNInfo {
+	in := db.infos[idx]
+	c := in.off + uint32(in.countryLen)
+	return ASNInfo{ASN: in.asn, Country: db.text[in.off:c], Name: db.text[c : c+uint32(in.nameLen)]}
+}
+
+func (db *ASNDB) infoIs(idx int32, asn uint32, country, name string) bool {
+	in := db.info(idx)
+	return in.ASN == asn && in.Country == country && in.Name == name
 }
 
 // Lookup returns the origin AS of ip.
@@ -134,20 +222,28 @@ func (db *ASNDB) Lookup(ip netip.Addr) (ASNInfo, bool) {
 	if db == nil || !ip.IsValid() {
 		return ASNInfo{}, false
 	}
-	ip = ip.Unmap().WithZone("")
-	ranges := db.v6
-	if ip.Is4() {
-		ranges = db.v4
-	}
+	ip = ip.Unmap()
 	// The last range starting at or before ip.
-	i, found := slices.BinarySearchFunc(ranges, ip, func(r asnRange, ip netip.Addr) int { return r.start.Compare(ip) })
+	if ip.Is4() {
+		a := toAddr4(ip)
+		i, found := slices.BinarySearchFunc(db.v4, a, func(r range4, a uint32) int { return cmp.Compare(r.start, a) })
+		if !found {
+			i--
+		}
+		if i < 0 || db.v4[i].end < a {
+			return ASNInfo{}, false
+		}
+		return db.info(db.v4[i].info), true
+	}
+	a := toAddr6(ip)
+	i, found := slices.BinarySearchFunc(db.v6, a, func(r range6, a addr6) int { return r.start.compare(a) })
 	if !found {
 		i--
 	}
-	if i < 0 || ranges[i].end.Less(ip) {
+	if i < 0 || db.v6[i].end.compare(a) < 0 {
 		return ASNInfo{}, false
 	}
-	return db.infos[ranges[i].info], true
+	return db.info(db.v6[i].info), true
 }
 
 // Len returns the number of ranges.
@@ -182,9 +278,10 @@ func (s *ASNSource) Age() time.Duration {
 }
 
 // cleanField removes control characters and invalid UTF-8 from a field of
-// the downloaded database and truncates it to limit bytes. The result is a
-// copy: a substring would keep the whole line (up to 64 KiB) in memory for
-// as long as the database is in use.
+// the downloaded database and truncates it to limit bytes. The result may
+// share s's memory: ParseIPToASN copies what it keeps into the database's
+// text, as a substring would keep the whole line (up to 64 KiB) in memory
+// for as long as the database is in use.
 func cleanField(s string, limit int) string {
 	s = strings.Map(func(r rune) rune {
 		if r < ' ' || r == 0x7f || r == utf8.RuneError {
@@ -195,7 +292,7 @@ func cleanField(s string, limit int) string {
 	if len(s) > limit {
 		s = strings.ToValidUTF8(s[:limit], "")
 	}
-	return strings.Clone(strings.TrimSpace(s))
+	return strings.TrimSpace(s)
 }
 
 func (s *ASNSource) defaults() {
