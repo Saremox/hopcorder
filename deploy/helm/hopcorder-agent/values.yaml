@@ -29,7 +29,9 @@ server:
   # Credentials for your ingress, from existing Secrets (the chart refuses
   # inline credentials in config, credential-like headers such as
   # Authorization, Cookie or X-Api-Key included: they would land in a
-  # ConfigMap).
+  # ConfigMap). The header check goes by name and is a heuristic: a
+  # credential in a header it does not recognise still ends up in the
+  # ConfigMap, so send credentials only through these Secrets.
   bearerTokenSecret:
     name: ""
     key: token
@@ -66,12 +68,34 @@ metrics:
   port: 9469
   # With hostNetwork, 0.0.0.0 is every address of the node (NetworkPolicy
   # does not apply to host-network pods). 127.0.0.1 keeps the metrics on the
-  # node, without the Service, ServiceMonitor and liveness probe.
+  # node, without the Service and ServiceMonitor. The endpoint holds at most
+  # 64 connections, so whoever can reach it can block scrapes (not the
+  # probing): limit it with networkPolicy or, with hostNetwork, the nodes'
+  # firewall. The pods have no liveness probe: /metrics answering says
+  # nothing about the probing, and a probe on it would let anyone holding
+  # those connections have the agent restarted.
   listenAddress: 0.0.0.0
   serviceMonitor:
     enabled: false
     interval: 30s
     labels: {}
+
+# A NetworkPolicy admitting inbound connections only to the metrics port and
+# only from `from` (NetworkPolicy "from" entries, required when the metrics
+# are exposed). Off by default; needs a CNI that enforces NetworkPolicy.
+# It does not apply to pods with hostNetwork (the chart refuses the
+# combination). Select peers by namespace, which pods cannot fake, e.g.
+#   from:
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: monitoring
+# Replies to the agent's probes are not new connections and stay allowed;
+# that includes the routers' ICMP errors (Time Exceeded) in conntrack-based
+# implementations. Not tested in a cluster: check after enabling it that
+# hops still answer.
+networkPolicy:
+  enabled: false
+  from: []
 
 # mode: statefulset - the spool volume of each agent.
 persistence:

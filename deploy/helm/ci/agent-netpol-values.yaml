@@ -1,0 +1,9 @@
+# Lint only (ci.yml, helm job), with agent-values.yaml: the agent chart's
+# NetworkPolicy, Prometheus's namespace selected by name, as the chart's
+# values.yaml suggests.
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring

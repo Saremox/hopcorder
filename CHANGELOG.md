@@ -35,6 +35,16 @@ The section for a version is the text of its GitHub release.
   local user reached the server around the proxy. Without systemd,
   `listen: unix:<path>` creates a socket with mode 0660. The default stays
   `127.0.0.1:8080`.
+- Helm: the agent pods no longer have a liveness probe. It used the metrics
+  endpoint, which holds at most 64 connections, so anything that could
+  reach the port could have the agent restarted again and again. An opt-in
+  NetworkPolicy (`networkPolicy.enabled`, with `networkPolicy.from`) limits
+  the metrics port to the peers you list; with `hostNetwork` it does not
+  apply, and the chart refuses it.
+- Helm: the agent chart also refuses headers such as `Authentication`,
+  `Bearer`, `X-Jwt` and `X-AccessToken` in `config` (they would land in a
+  ConfigMap). The check goes by name; send credentials only through the
+  chart's Secrets.
 
 ## v0.1.1
 

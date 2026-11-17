@@ -1498,7 +1498,9 @@ decisions:
     `O_NOFOLLOW` would break deliberate symlinks.
   - 64 idle keep-alive connections can block scrapes of the metrics
     endpoint. That is inherent to a connection cap. Bind the endpoint to
-    localhost or restrict it with a NetworkPolicy.
+    localhost or restrict it with a NetworkPolicy. (Round three: the agent
+    chart's liveness probe on `/metrics` turned this into restarts of the
+    agent. The probe is gone, and the chart has an opt-in NetworkPolicy.)
 - **Tests:**
   - `TestDamagedLeafIsQuarantined` opens damaged spools in a child
     process, so a regression fails the test instead of killing the binary.
@@ -1586,3 +1588,34 @@ high-severity issue. Four fixes followed. The decisions:
     test binary that gets a listening socket as fd 3, and the refusals.
     Checked by hand with `systemd-socket-activate` (unix and TCP) and
     `systemd-analyze verify`.
+- **The agent chart has no liveness probe.** It probed `/metrics` (1 s
+  timeout, three failures), whose listener takes 64 connections and keeps
+  one that sends nothing for 10 s. So any workload that could reach the pod
+  (or, with hostNetwork, the node's port) could hold 64 idle connections
+  and have the agent restarted with growing backoff, leaving gaps in the
+  recording; the review reproduced 11 of 11 failed probes with 120 held
+  connections. A live `/metrics` says nothing about the probing loop
+  anyway, and the agent serves no traffic, so there is no readiness probe
+  either (one on `/metrics` would only take it out of the Service). A hung
+  probing loop was never caught by the probe, since the metrics listener
+  runs on its own; alert on the rate of `hopcorder_cycles_total` instead.
+  ci's helm job fails if the chart renders any probe, in either mode.
+- **Opt-in NetworkPolicy for the agent** (`networkPolicy.enabled`, off by
+  default): inbound connections only to the metrics port and only from
+  `networkPolicy.from`, required when the metrics are exposed, as in the
+  server chart. With hostNetwork the chart refuses it: NetworkPolicy does
+  not apply to host-network pods, and a policy that does nothing would look
+  like protection. Replies to the agent's probes are not new connections;
+  routers' ICMP errors count as related traffic in conntrack-based
+  implementations, but this was not tested in a cluster (kind's CI run does
+  not enable it), so `values.yaml` says to check that hops still answer.
+  ci lints it and checks both refusals.
+- **The agent chart's header check is wider, and called a heuristic.** It
+  accepted `Authentication`, `X-Jwt`, `Bearer`, `X-Access-Tokens` and
+  `X-AccessToken`. Names containing token, secret, passw, credential,
+  cookie, signature, session, jwt, bearer, api-key, authoriz/authoris or
+  authent anywhere are refused now, and so are names with a part key(s),
+  auth, pass or sig. It still goes by name only, so `values.yaml` and the
+  README say to pass credentials only through the Secrets. ci checks the
+  new names, and that `X-Tenant`, `X-Scope-OrgID` and `X-Request-Source`
+  still pass.

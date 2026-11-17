@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- if .Values.hostNetwork }}
+{{- fail "networkPolicy: NetworkPolicy does not apply to pods with hostNetwork; restrict the metrics port on the nodes (firewall), or set metrics.listenAddress: 127.0.0.1" }}
+{{- end }}
+{{- $metrics := and .Values.metrics.enabled (ne .Values.metrics.listenAddress "127.0.0.1") }}
+{{- if and $metrics (not .Values.networkPolicy.from) }}
+{{- fail "networkPolicy.from: list who may scrape the metrics (e.g. Prometheus's namespace by kubernetes.io/metadata.name); see the chart's values.yaml" }}
+{{- end }}
+# Inbound connections to the agents: only scrapes of the metrics port from
+# networkPolicy.from. Replies to the agents' own probes are not new
+# connections.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "hopcorder-agent.fullname" . }}
+  labels:
+    {{- include "hopcorder-agent.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "hopcorder-agent.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  {{- if $metrics }}
+  ingress:
+    - from:
+        {{- toYaml .Values.networkPolicy.from | nindent 8 }}
+      ports:
+        - port: metrics
+          protocol: TCP
+  {{- else }}
+  ingress: []
+  {{- end }}
+{{- end }}

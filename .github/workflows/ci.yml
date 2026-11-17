@@ -233,6 +233,19 @@ jobs:
             --set clickhouse.deploy.readOnlyUser.passwordSecret.name=ro >/dev/null
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml
           helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml
+          helm lint --strict deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml -f deploy/helm/ci/agent-netpol-values.yaml
+          # No liveness (or other) probe on the agent: the metrics listener
+          # holds at most 64 connections, so a probe on it lets anyone who
+          # can reach the port have the agent restarted. The port stays.
+          for v in agent-values.yaml agent-ds-values.yaml; do
+            out=$(helm template a deploy/helm/hopcorder-agent -f "deploy/helm/ci/$v")
+            if grep -Eq '(liveness|readiness|startup)Probe' <<<"$out"; then
+              echo "the agent chart renders a probe with $v"; exit 1
+            fi
+            grep -q 'containerPort: ' <<<"$out"
+          done
+          helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
+            --set networkPolicy.enabled=true --set metrics.listenAddress=127.0.0.1 | grep -q 'ingress: \[\]'
           helm template a deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml \
             --set server.basicAuth.username=agent --set server.basicAuth.passwordSecret.name=ba \
             --set server.tls.secretName=mtls --set server.tls.caKey=ca.crt \
@@ -248,9 +261,17 @@ jobs:
           agent=(deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-values.yaml)
           refused "${agent[@]}" --set config.outputs.http.bearer_token=x
           refused "${agent[@]}" --set server.url=https://agent:pw@hopcorder.example.net
-          for h in Authorization authorization Proxy-Authorization Cookie X-Api-Key x-auth-token Private-Token X-Vault-Token; do
+          for h in Authorization authorization Proxy-Authorization Cookie X-Api-Key x-auth-token Private-Token X-Vault-Token \
+            Authentication X-Jwt Bearer X-Access-Token X-Access-Tokens X-AccessToken X-Amz-Security-Token; do
             refused "${agent[@]}" --set "config.outputs.http.headers.$h=x"
           done
+          for h in X-Tenant X-Scope-OrgID X-Request-Source; do
+            helm template a "${agent[@]}" --set "config.outputs.http.headers.$h=x" >/dev/null
+          done
+          # The agent's NetworkPolicy needs peers, and does nothing for
+          # hostNetwork pods.
+          refused "${agent[@]}" --set networkPolicy.enabled=true
+          refused deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml -f deploy/helm/ci/agent-netpol-values.yaml
           refused deploy/helm/hopcorder-server --set config.clickhouse.password=x
           refused deploy/helm/hopcorder-server --set networkPolicy.enabled=true
           # Names that go into the bundled ClickHouse's XML configuration.

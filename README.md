@@ -146,8 +146,14 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   `server.tls` for a CA and client certificate). Inline ones would land in a
   ConfigMap, which the built-in `view` role can read, so the charts refuse
   them: in the agent's `config`, headers such as `Authorization`, `Cookie` or
-  `X-Api-Key` included; in the server's, `clickhouse.password`
-  (`clickhouse.passwordSecret` instead).
+  `X-Api-Key` included (judged by name: a heuristic, so pass credentials only
+  through the Secrets); in the server's, `clickhouse.password`
+  (`clickhouse.passwordSecret` instead). The agent pods have no liveness
+  probe: its metrics endpoint holds at most 64 connections, so a probe on it
+  would let anyone who can reach the port restart the agent.
+  `networkPolicy.enabled` with `networkPolicy.from` (opt-in) admits only those
+  peers to the metrics port; NetworkPolicy does not apply with `hostNetwork`,
+  where the nodes' firewall has to.
 - **Inside the cluster** the server's Service is reachable around the
   ingress's authentication: `networkPolicy.enabled=true` with
   `networkPolicy.from` (required then) limits it to the peers you list.
