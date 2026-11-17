@@ -118,11 +118,17 @@ const (
 	// are not cancelled when the agent disconnects: an insert that
 	// ClickHouse committed must be accounted for.
 	insertTimeout = 30 * time.Second
-	// maxInsertBytes bounds one cycles insert. Enrichment makes a row up to
-	// about seven times its record (AS and rDNS names on every hop), so a
-	// large batch is inserted in parts; an agent's normal batch (1 MiB) is
-	// one insert.
+	// maxInsertBytes bounds one cycles insert: its rows' JSON, and what
+	// hops_mv makes of them, hopRowBytes per hop row plus the hop's loop
+	// TTLs as text (see buildCycleRow). Enrichment makes a row up to about
+	// seven times its record (AS and rDNS names on every hop), and a hop's
+	// loop TTLs can be 900 bytes on each of 255 hops, so a large batch is
+	// inserted in parts; an agent's normal batch (1 MiB) is one insert.
 	maxInsertBytes = 8 << 20
+	// hopRowBytes is about what a hop row costs ClickHouse besides its
+	// strings: the cycle's columns repeated on it and its own fixed-size
+	// ones (about 80 bytes written per row with 25.8).
+	hopRowBytes = 64
 	// A request restores at most maxRestores streams, within restoreTimeout
 	// of its first restore. Each restore is one to four queries, run while
 	// the request holds an ingest slot; the streams left over are restored
@@ -451,7 +457,8 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 }
 
 // insertCycles inserts recs (in seq order) in parts of at most
-// maxInsertBytes and moves a's high-water mark after each. It returns how
+// maxInsertBytes (the rows and the hop rows the view makes of them, see
+// buildCycleRow) and moves a's high-water mark after each. It returns how
 // many records were stored. Not cancelled with the request: if the agent
 // disconnects after ClickHouse committed, the high-water mark must still
 // move.
@@ -463,12 +470,12 @@ func (in *Ingester) insertCycles(ctx context.Context, a *agentState, recs []*rec
 		var rows [][]byte
 		size, end := 0, stored
 		for end < len(recs) && size < maxInsertBytes {
-			b, err := buildCycleRow(recs[end], in.enrich)
+			b, cost, err := buildCycleRow(recs[end], in.enrich)
 			if err != nil {
 				return stored, fmt.Errorf("encode record %s/%d: %w", recs[end].AgentID, recs[end].Seq, err)
 			}
 			rows = append(rows, b)
-			size += len(b)
+			size += cost
 			end++
 		}
 		start := time.Now()

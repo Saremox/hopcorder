@@ -640,8 +640,10 @@ added in the commit that introduced it.
   only the database name changed. `TestPrototypeQueriesRun` (clickhouse tag)
   runs all seven, read straight from the file.
 - **`is_loop` / `loop_ttls` on `hops`**: the prototype keeps loops on the
-  per-hop rows; `hops_mv` now fills both from the cycle's loops. Rows stored
-  before the migration keep the defaults (`loop_events` has every loop).
+  per-hop rows; `hops_mv` now fills both from the cycle's loops (since
+  migration 0003 from each hop's loop TTLs, which the server sends with the
+  cycle; security review, round three). Rows stored before migration 0002
+  keep the defaults (`loop_events` has every loop).
 - **Retention**: the prototype expires data after 90 days.
   `clickhouse.retention_days` (default 90, 0 = forever) sets a TTL on every
   data table on each start (`agent_seq` never expires; it guards dedup).
@@ -1587,6 +1589,47 @@ high-severity issue. Four fixes followed. The decisions:
     all while a locked agent fills the rest; also fails if the level leaves
     locked agents out); `TestStreamsPerAgentBound`, `TestWaterLevel`,
     `TestServerStreamsPerAgent`.
+- **`hops_mv` no longer copies a cycle's loops onto every hop row**
+  (migration 0003). It looked up each hop's loop TTLs with
+  `indexOf(loops.ip, hops.ip)` after `ARRAY JOIN hops`, and ARRAY JOIN
+  copies every column still needed onto each row: the cycle's whole
+  `loops.ip` and `loops.ttls`, per hop, hops x loops per cycle (and loops
+  need not match the hops). Peak memory of one 8 MiB cycles insert (25.8):
+  255 hops without loops 101 MiB; one loop of 255 TTLs (the review's
+  record) 388 MiB; IPv6 hops each seen twice, 127 loops of two TTLs (what
+  `DetectLoops` makes of such a path) 617 MiB; 255 loops of 255 TTLs over
+  1.6 GiB, failing with code 241. Now the server sends each hop's loop TTLs
+  with the cycle (`hops.loop_ttls Array(Array(UInt8))` in `cycles`: those of
+  the first loop with the hop's address, as the view chose them, else
+  empty), and the view only formats them, row by row (`is_loop` is
+  `notEmpty`). `hops` and `path_probes` get the same values as before
+  (prototype compatibility; `TestPrototypeQueriesRun` unchanged).
+- **The size of an insert counts what the view writes.** Parts were sized
+  by the cycles JSON alone, while the view writes the loop's TTLs as text on
+  every hop row (911 bytes on each of 255 hops, 232 KB a record, none of it
+  in the cycles row). A row now counts its JSON (which carries the per-hop
+  TTLs), and for each hop row 64 bytes (the cycle's columns repeated on it
+  and the hop's own fixed-size ones; ClickHouse writes about 80) plus its
+  `loop_ttls` text. The largest 8 MiB part of each shape above now peaks at
+  20 MiB without loops (also for 255 silent hops), 30 MiB for the IPv6
+  pairs, 45 MiB for 255 x 255 and 68 MiB for one 255-TTL loop.
+  - Accepted: loop-heavy batches go in many small parts. The review's
+    23 KB zstd request (31 MiB decoded) is 60 inserts of about 100 ms
+    instead of 3, and still writes 478 MiB into `hops` (2.4 MiB on disk):
+    that is the prototype's per-hop `loop_ttls`. Batches of long paths take
+    about twice as many parts as before; an agent's normal batch is still
+    one insert.
+  - Upgrade: cycles stored before the migration read as empty lists (their
+    hop rows came from the old view). A server of the previous version
+    inserting during a rolling upgrade sends no `hops.loop_ttls`; the
+    column's default (an empty list per hop) keeps its inserts working, and
+    their hop rows get no loop marks (`loop_events` has the loops).
+  - Tests: `TestInsertPartsCountHopRows` (each insert's JSON plus the hop
+    rows, estimated from the rows sent, within the budget; before, one
+    insert of 40 such records came to 10.5 MB), `TestCycleRowHopLoopTTLs`,
+    `TestLoopRecordsInsertClickHouse` (clickhouse tag: 20 records of 255
+    loops of 255 TTLs took 821 MiB in one insert, now 27 MiB in two; their
+    hop rows carry the TTLs).
 
 **Read side, enrichment and the browser**
 - **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in

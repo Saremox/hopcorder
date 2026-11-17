@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -288,5 +291,109 @@ func TestStreamsPerAgentBound(t *testing.T) {
 	}
 	if got := counter(t, reg, "hopcorder_server_unrestored_cycles_total"); got != 2 {
 		t.Errorf("%v cycles counted without events, want 2", got)
+	}
+}
+
+// What hops_mv makes of an insert counts towards its size: each hop row,
+// and the loop TTLs it writes on it as text. With 255 hops at one address
+// and a loop over all of them, an 8 MiB insert wrote 155 MiB of loop_ttls
+// in ClickHouse (and the view copied the cycle's loops onto every hop row
+// to find them). The estimate here is read from the rows ClickHouse gets.
+func TestInsertPartsCountHopRows(t *testing.T) {
+	st := &rowStore{}
+	in := NewIngester(st, nil, quietLogger(), nil)
+	ttls := make([]int, record.MaxHops)
+	spec := make([]string, record.MaxHops)
+	for i := range ttls {
+		ttls[i], spec[i] = i+1, "198.18.120.1"
+	}
+	var recs []*record.Record
+	for seq := uint64(1); seq <= 40; seq++ {
+		r := mk("lab", seq, spec...)
+		r.Loops = []record.Loop{{IP: netip.MustParseAddr("198.18.120.1"), TTLs: ttls}}
+		recs = append(recs, r)
+	}
+	if _, err := in.Ingest(t.Context(), recs); err != nil {
+		t.Fatal(err)
+	}
+	for i, rows := range st.inserts {
+		size, largest := 0, 0
+		for _, b := range rows {
+			n := viewCost(t, b)
+			size, largest = size+n, max(largest, n)
+		}
+		if size > maxInsertBytes+largest {
+			t.Errorf("insert %d: %d rows, %d bytes counting the hop rows (budget %d)", i, len(rows), size, maxInsertBytes)
+		}
+	}
+	if len(st.inserts) < 2 {
+		t.Errorf("%d inserts", len(st.inserts))
+	}
+}
+
+// rowStore keeps the rows of every cycles insert.
+type rowStore struct {
+	nullStore
+	mu      sync.Mutex
+	inserts [][][]byte
+}
+
+func (r *rowStore) InsertJSON(_ context.Context, table string, rows [][]byte) error {
+	if table == "cycles" {
+		r.mu.Lock()
+		r.inserts = append(r.inserts, rows)
+		r.mu.Unlock()
+	}
+	return nil
+}
+
+// viewCost is a cycles row's JSON plus what hops_mv writes for it: per hop
+// hopRowBytes and the loop_ttls of the first loop with the hop's address,
+// as text (the view of migration 0002 looked it up like this).
+func viewCost(t *testing.T, b []byte) int {
+	t.Helper()
+	var row struct {
+		HopIP    []string `json:"hops.ip"`
+		LoopIP   []string `json:"loops.ip"`
+		LoopTTLs [][]int  `json:"loops.ttls"`
+	}
+	if err := json.Unmarshal(b, &row); err != nil {
+		t.Fatal(err)
+	}
+	n := len(b)
+	for _, ip := range row.HopIP {
+		n += hopRowBytes
+		for j, lip := range row.LoopIP {
+			if lip == ip {
+				var s []string
+				for _, ttl := range row.LoopTTLs[j] {
+					s = append(s, strconv.Itoa(ttl))
+				}
+				n += len(strings.Join(s, ","))
+				break
+			}
+		}
+	}
+	return n
+}
+
+// The cycles row carries each hop's loop TTLs for hops_mv: those of the
+// first loop with the hop's address, none for the others.
+func TestCycleRowHopLoopTTLs(t *testing.T) {
+	r := mk("lab", 1, "10.0.0.1", "198.18.120.1", "198.18.120.2", "198.18.120.1", "*", "198.18.120.2")
+	r.Loops = append(r.Loops, record.Loop{IP: netip.MustParseAddr("198.18.120.1"), TTLs: []int{1, 2}})
+	b, cost, err := buildCycleRow(r, noEnrich{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]json.RawMessage
+	if err := json.Unmarshal(b, &row); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(row["hops.loop_ttls"]); got != "[[],[2,4],[3,6],[2,4],[],[3,6]]" {
+		t.Errorf("hops.loop_ttls = %s", got)
+	}
+	if want := len(b) + 6*hopRowBytes + 4*len("2,4"); cost != want {
+		t.Errorf("cost %d, want %d", cost, want)
 	}
 }

@@ -26,6 +26,14 @@ The section for a version is the text of its GitHub release.
   agents with the most streams give theirs up first. Cycles of streams
   beyond the limits are stored, and counted in
   `hopcorder_server_unrestored_cycles_total`.
+- Loops can no longer blow up inserts in ClickHouse. The per-hop view copied
+  a cycle's loops onto each of its hop rows, so one 8 MiB insert of valid
+  records could need 1.6 GiB and fail. The server now sends each hop's loop
+  TTLs with the cycle (migration 0003, applied on start; `hops` and
+  `path_probes` keep their columns and values), and the size of an insert
+  counts the hop rows the view writes. During a rolling upgrade, cycles that
+  a server of the previous version stores get no loop marks on their hop
+  rows (`loop_events` has the loops).
 
 **Security: read side and Grafana**
 
