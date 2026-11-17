@@ -36,9 +36,14 @@ metadata:
     app.kubernetes.io/component: hopcorder-clickhouse
 data:
   # Merged into the image's config.xml: logs to the console only, caches
-  # sized for a small instance, and the system log tables pruned.
+  # sized for a small instance, the system log tables pruned, and
+  # user_files_path an empty directory the clickhouse user (uid 101) cannot
+  # write: sqlite() creates its file there before it checks the caller's
+  # grant, so the read-only user, refused every time, left an empty file per
+  # query until the volume ran out of inodes (review round six).
   hopcorder.xml: |
     <clickhouse>
+        <user_files_path>/srv/</user_files_path>
         <logger>
             <level>warning</level>
             <console>1</console>

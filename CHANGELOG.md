@@ -53,6 +53,17 @@ The section for a version is the text of its GitHub release.
   with IPv6 down). A link without `flow_id` opens its stream if it
   matches only one, else lists those it matches.
 
+**Fixed (review round six)**
+
+- ClickHouse's `user_files_path` (compose and the chart's bundled
+  ClickHouse) is now an empty directory ClickHouse cannot write. Its
+  `sqlite()` table function created a file there before it checked the
+  caller's grant, so Grafana's read-only user, refused every time, still
+  left an empty file per query, never removed: about 1,500 a second, until
+  the data volume ran out of inodes and ingest failed. Compose users: the
+  setting takes effect when the ClickHouse container is recreated
+  (`docker compose up -d`).
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent

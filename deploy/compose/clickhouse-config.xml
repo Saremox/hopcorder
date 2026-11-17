@@ -1,0 +1,13 @@
+<!--
+Merged into the image's config.xml (config.d). user_files_path points at an
+empty directory the clickhouse user cannot write: ClickHouse 25.8's sqlite()
+table function creates its database file there before it checks the
+caller's grant, so Grafana's read-only user, refused every time, still left
+one empty file per query, never removed, until the data volume ran out of
+inodes and ingest failed (review round six). No hopcorder query uses
+user_files. CLICKHOUSE_DO_NOT_CHOWN (docker-compose.yml) keeps the image's
+entrypoint from handing /srv to the clickhouse user.
+-->
+<clickhouse>
+    <user_files_path>/srv/</user_files_path>
+</clickhouse>

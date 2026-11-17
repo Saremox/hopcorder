@@ -86,6 +86,18 @@ for i in $(seq 90); do
         echo "ClickHouse's read-only user may run hyperscan functions (or the check failed otherwise): $out"
         exit 1
       fi
+      # sqlite() creates its file under user_files_path before it checks the
+      # grant: that path is an empty directory ClickHouse cannot write, so a
+      # refused call leaves no file (each would have taken an inode).
+      if out=$(chq "SELECT * FROM sqlite('probe.db','t')" 2>&1); then
+        echo "ClickHouse's read-only user may use sqlite(): $out"
+        exit 1
+      fi
+      if ! kubectl exec statefulset/hopcorder-server-clickhouse -- sh -c \
+        'test -z "$(ls -A /srv)" && test ! -e /var/lib/clickhouse/user_files/probe.db'; then
+        echo "sqlite() left a file behind (user_files_path writable?): $out"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then
