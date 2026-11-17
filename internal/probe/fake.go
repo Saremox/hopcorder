@@ -104,7 +104,8 @@ func (f *Fake) Requests() []TraceRequest {
 // SetHoldErr makes holding flow fail with err from now on (nil: succeed),
 // as if another process held its identifier: HoldFlows leaves it out and
 // returns err, and Trace refuses the flow with err until a retry (on each
-// Trace) succeeds.
+// Trace) succeeds. The fake tells flows apart by protocol and ID, not by
+// Flow.Ports.
 func (f *Fake) SetHoldErr(flow Flow, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -112,11 +113,14 @@ func (f *Fake) SetHoldErr(flow Flow, err error) {
 		f.holdErr = map[Flow]error{}
 	}
 	if err == nil {
-		delete(f.holdErr, flow)
+		delete(f.holdErr, flowKey(flow))
 		return
 	}
-	f.holdErr[flow] = err
+	f.holdErr[flowKey(flow)] = err
 }
+
+// flowKey is what the fake tells flows apart by.
+func flowKey(fl Flow) Flow { return Flow{Protocol: fl.Protocol, ID: fl.ID} }
 
 // HoldFlows implements FlowHolder: it holds flows except those SetHoldErr
 // made fail, and returns their errors.
@@ -126,8 +130,8 @@ func (f *Fake) HoldFlows(flows []Flow) error {
 	f.wanted, f.refused = slices.Clone(flows), map[Flow]error{}
 	var errs []error
 	for _, fl := range flows {
-		if err := f.holdErr[fl]; err != nil {
-			f.refused[fl] = err
+		if err := f.holdErr[flowKey(fl)]; err != nil {
+			f.refused[flowKey(fl)] = err
 			errs = append(errs, err)
 		}
 	}
@@ -140,7 +144,7 @@ func (f *Fake) Held() []Flow {
 	defer f.mu.Unlock()
 	var out []Flow
 	for _, fl := range f.wanted {
-		if _, refused := f.refused[fl]; !refused {
+		if _, refused := f.refused[flowKey(fl)]; !refused {
 			out = append(out, fl)
 		}
 	}

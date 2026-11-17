@@ -209,13 +209,8 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 				b += uint16(ttl - 1) //nolint:gosec // classic traceroute port walk; wraps like it does
 			}
 		case TCP:
-			// The destination port is the service being reached, so
-			// classic mode walks the source port instead.
 			p.proto = protoTCP
-			a, b = req.FlowID, req.Port
-			if !req.Paris {
-				a += uint16(ttl - 1) //nolint:gosec // wraps like classic traceroute
-			}
+			a, b = tcpSourcePort(req.FlowID, req.Paris, ttl), req.Port
 		}
 		id, k, err := e.allocIDLocked(func(id uint16) probeKey {
 			return probeKey{dst: target, proto: p.proto, a: a, b: b, c: id}

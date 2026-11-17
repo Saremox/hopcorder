@@ -77,8 +77,22 @@ The section for a version is the text of its GitHub release.
   at 1% loss. A destination further away now counts only if a TTL from its
   old distance on answered as a router; behind silent TTLs it keeps its
   distance.
-
-<!-- round six: tcp flows -->
+- Agent: a local user could make a TCP target look down. A connection from
+  the TCP flow's source port to the target's port (`nc -p 33434 target
+  443`, or any local connection the kernel happened to give that port:
+  33434 lies in Linux's ephemeral range) made the target answer every
+  probe for that connection, so every cycle was recorded as not reaching
+  the target, with no error and no metric. The agent now holds its TCP
+  source ports (in classic mode every port it walks), as it holds ICMP echo
+  identifiers: nothing else on the host can use them while it runs. A port
+  that is already in use stops that flow's TCP targets, visibly (an error
+  in the log, `hopcorder_flow_in_use` 1, cycle errors), and they resume by
+  themselves once it is free. **Upgrading:** a TCP `flow_id` (default
+  33434) must be a port nothing else on the agent's host uses. A server
+  listening on it, or a second hopcorder on the same TCP flow (`--once`
+  next to the daemon), now stops those TCP targets: give them another
+  `flow_id`. A connection from the port that closed less than a minute
+  before the agent starts (TIME_WAIT) delays them by up to that minute.
 
 <!-- round six: spool volume -->
 

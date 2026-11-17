@@ -101,7 +101,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		}, tp),
 		flowInUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "hopcorder_flow_in_use",
-			Help: "Targets of this host and protocol not probed because another process holds their flow's identifier (ICMP echo identifier = flow_id): 1 for a single target.",
+			Help: "Targets of this host and protocol not probed because another process holds their flow's identifier (ICMP echo identifier or TCP source port = flow_id): 1 for a single target.",
 		}, tp),
 		resolveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_resolve_errors_total", Help: "Failed DNS resolutions of a target.",

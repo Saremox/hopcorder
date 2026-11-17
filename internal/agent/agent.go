@@ -243,7 +243,8 @@ func (r *runner) logFailure(err error) {
 		return
 	}
 	r.flowInUse = true
-	r.log.Error("target not probed: another process holds its flow's identifier; retrying every cycle "+
+	r.log.Error("target not probed: another process holds its flow's identifier (the ICMP echo identifier "+
+		"or TCP source port); retrying every cycle "+
 		"(give this agent another flow_id if that process is meant to be there)", "flow_id", r.t.FlowID, "err", err)
 }
 
