@@ -43,7 +43,8 @@ clickhouse:                     # the HTTP interface
   # (LoadCredential= in deploy/hopcorder-server.service), then
   # password_file: /run/credentials/hopcorder-server.service/clickhouse-password
   # (password: "..." also works, only where no one else can read this file)
-  timeout: 30s
+  timeout: 30s                  # statements and inserts; for queries the wait for each part of the
+                                # answer (they run at most timeout - 5s), not reading the rows
   retention_days: 90            # like the prototype; 0 keeps data forever
 
 ingest:

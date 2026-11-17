@@ -27,13 +27,19 @@ type Config struct {
 	Database string
 	User     string
 	Password string
-	// Timeout bounds each request; default 30s.
+	// Timeout bounds each statement, insert and ping as a whole (default
+	// 30s). For a query it bounds the wait for ClickHouse's answer (which
+	// comes once the query has finished: wait_end_of_query) and every wait
+	// for more of its result, but not the time the caller takes to consume
+	// the result: the read API streams it to clients at their pace.
 	Timeout time.Duration
 	// MaxExecutionTime bounds each SELECT on the server (ClickHouse's
 	// max_execution_time), so a query outlives neither its caller nor the
 	// request timeout; default Timeout minus 5s, at least 1s.
 	MaxExecutionTime time.Duration
-	// HTTPClient overrides the transport (TLS, proxies); optional.
+	// HTTPClient overrides the transport (TLS, proxies); optional. Leave its
+	// Timeout 0: an http.Client's Timeout covers reading the body too, so it
+	// would cut every query result off that long after the query started.
 	HTTPClient *http.Client
 }
 
@@ -44,6 +50,7 @@ type Client struct {
 	user    string
 	pass    string
 	hc      *http.Client
+	timeout time.Duration
 	maxExec string // seconds
 }
 
@@ -83,16 +90,11 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Second
 	}
-	if hc.Timeout == 0 {
-		c := *hc
-		c.Timeout = cfg.Timeout
-		hc = &c
-	}
 	maxExec := cfg.MaxExecutionTime
 	if maxExec <= 0 {
 		maxExec = max(cfg.Timeout-5*time.Second, time.Second)
 	}
-	return &Client{base: *u, db: cfg.Database, user: cfg.User, pass: cfg.Password, hc: hc,
+	return &Client{base: *u, db: cfg.Database, user: cfg.User, pass: cfg.Password, hc: hc, timeout: cfg.Timeout,
 		maxExec: strconv.Itoa(max(int(maxExec/time.Second), 1))}, nil
 }
 
@@ -101,6 +103,8 @@ func (c *Client) Database() string { return c.db }
 
 // Ping checks that the server answers.
 func (c *Client) Ping(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	u := c.base
 	u.Path = strings.TrimRight(u.Path, "/") + "/ping"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -197,10 +201,12 @@ func SettingsFrom(ctx context.Context) Settings {
 // Query runs a SELECT and calls row for every result row (JSONEachRow,
 // 64-bit integers as numbers, date-times as ISO 8601 in UTC). It waits for
 // the end of the query before streaming, so a failure part-way is reported
-// as an error rather than as truncated output. row gets its own copy of
-// each row and may keep it. Queries run with readonly = 2: they cannot
-// write, and only read-only queries are cancelled when the connection
-// closes.
+// as an error rather than as truncated output; a result cut off later (a
+// read error, or the timeout while waiting for more) is an error too, and
+// a row cut off with it is not passed on. row gets its own copy of each
+// row and may keep it; the time it takes counts towards no timeout. Queries
+// run with readonly = 2: they cannot write, and only read-only queries are
+// cancelled when the connection closes.
 func (c *Client) Query(ctx context.Context, query string, params Params, row func(json.RawMessage) error) error {
 	q := url.Values{}
 	q.Set("wait_end_of_query", "1")
@@ -221,6 +227,7 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 	return c.do(ctx, true, q, params, strings.NewReader(query), func(r io.Reader) error {
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 64<<10), 64<<20)
+		sc.Split(scanRows)
 		for sc.Scan() {
 			line := bytes.TrimSpace(sc.Bytes())
 			if len(line) == 0 {
@@ -234,6 +241,28 @@ func (c *Client) Query(ctx context.Context, query string, params Params, row fun
 		}
 		return sc.Err()
 	})
+}
+
+// errCutRow is a result that ends inside a row.
+var errCutRow = errors.New("clickhouse: result ends inside a row")
+
+// scanRows splits JSONEachRow output into rows, like bufio.ScanLines, but
+// refuses a last row without its newline: ClickHouse ends every row with
+// one, so such a row was cut off. bufio.Scanner passes a cut-off last line
+// on as a token even after a read error (and only reports the error at the
+// next Scan); the scanner reports the read error, if there was one, rather
+// than errCutRow.
+func scanRows(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(bytes.TrimSpace(data)) > 0 {
+		return 0, nil, errCutRow
+	}
+	if atEOF {
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
 }
 
 // QueryInto decodes every row into a new T and returns them.
@@ -262,6 +291,18 @@ func (c *Client) do(ctx context.Context, useDB bool, q url.Values, params Params
 	}
 	u := c.base
 	u.RawQuery = q.Encode()
+	// Statements and inserts: the whole exchange within the timeout. Queries:
+	// the timeout bounds ClickHouse, not the caller, which may take as long
+	// as it likes over the rows (the read API streams them to its client):
+	// it covers sending the query and waiting for the answer, and then each
+	// wait for more of the result, but not the time between reads.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	if read == nil {
+		var stop context.CancelFunc
+		ctx, stop = context.WithTimeoutCause(ctx, c.timeout, fmt.Errorf("no answer within %s", c.timeout))
+		defer stop()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), body)
 	if err != nil {
 		return err
@@ -272,21 +313,67 @@ func (c *Client) do(ctx context.Context, useDB bool, q url.Values, params Params
 	if c.pass != "" {
 		req.Header.Set("X-ClickHouse-Key", c.pass)
 	}
+	var answer *time.Timer
+	if read != nil {
+		answer = time.AfterFunc(c.timeout, func() {
+			cancel(fmt.Errorf("no answer within %s", c.timeout))
+		})
+	}
 	resp, err := c.hc.Do(req)
+	if answer != nil {
+		answer.Stop()
+	}
 	if err != nil {
-		return fmt.Errorf("clickhouse: %w", err)
+		return fmt.Errorf("clickhouse: %w", withCause(ctx, err))
 	}
 	defer resp.Body.Close()
+	var rb io.Reader = resp.Body
+	if read != nil {
+		w := &waitReader{r: resp.Body, wait: c.timeout}
+		w.t = time.AfterFunc(c.timeout, func() {
+			cancel(fmt.Errorf("clickhouse: no more of the result within %s", c.timeout))
+		})
+		w.t.Stop()
+		rb = w
+	}
 	if resp.StatusCode != http.StatusOK {
-		text, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		text, _ := io.ReadAll(io.LimitReader(rb, 4<<10))
 		return &Error{Status: resp.StatusCode, Code: resp.Header.Get("X-ClickHouse-Exception-Code"),
 			Text: strings.TrimSpace(string(text))}
 	}
 	if read == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, rb)
 		return nil
 	}
-	return read(resp.Body)
+	return withCause(ctx, read(rb))
+}
+
+// waitReader bounds each wait for data, and only that: the timer runs while
+// a Read is waiting for the server, not while the caller handles what it
+// read.
+type waitReader struct {
+	r    io.Reader
+	t    *time.Timer // cancels the request
+	wait time.Duration
+}
+
+func (w *waitReader) Read(p []byte) (int, error) {
+	w.t.Reset(w.wait)
+	n, err := w.r.Read(p)
+	w.t.Stop()
+	return n, err
+}
+
+// withCause adds why ctx ended to an error that its end caused (a timeout
+// rather than a bare "context canceled").
+func withCause(ctx context.Context, err error) error {
+	if err == nil || ctx.Err() == nil {
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(err, cause) {
+		return fmt.Errorf("%w: %w", cause, err)
+	}
+	return err
 }
 
 // QuoteIdent backquotes an identifier.

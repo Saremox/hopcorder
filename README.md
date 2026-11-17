@@ -706,7 +706,9 @@ with a memory limit (a container, or a systemd unit with `MemoryMax=`), the
 server sets the Go memory limit to 90% of it unless `GOMEMLIMIT` is set.
 Read-API queries are limited to `query.max_concurrent` at once and to
 `query.max_memory_bytes` (1 GiB) each in ClickHouse, run read-only, and are
-stopped there after the client timeout or when the client goes away.
+stopped there after `max_execution_time` (the ClickHouse timeout less 5 s)
+or when the client goes away; a response streams for as long as its client
+keeps reading.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
 the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on

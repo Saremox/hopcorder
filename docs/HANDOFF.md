@@ -1835,8 +1835,11 @@ high-severity issue. Four fixes followed. The decisions:
     up there without bound.
   - Accepted: a client that keeps reading at least 64 KiB every 10 s holds
     its slot until its response is done or `WriteTimeout`, as a slow
-    download does; and clients can still take every slot by opening new
-    connections every 10 s, as they can with ordinary requests. Both are
+    download does (round four: until then, the ClickHouse client's 30 s
+    timeout, which also covered reading the result, cut a streamed response
+    30 s after its query started, however fast its client read); and
+    clients can still take every slot by opening new connections every
+    10 s, as they can with ordinary requests. Both are
     for a rate limit at the proxy (a buffering proxy, nginx's default,
     absorbs slow readers entirely).
   - Tests: `TestNonReadingClientLosesQuerySlot` (one slot, small socket
@@ -2483,7 +2486,38 @@ decisions:
 
 **Read API**
 
-<!-- round four: read API -->
+- **A streamed response lasts as long as its client reads.** The ClickHouse
+  client's `http.Client.Timeout` (`clickhouse.timeout`, 30 s) also covered
+  reading the result, so a streamed read-API response was cut off 30 s after
+  its query started, however fast its client read: `cycles?limit=1000` of
+  MPLS-heavy cycles (33 MB) read at 500 KB/s ended after 17.9 MB, aborted,
+  with an ERROR logged and a query error counted, and no client below about
+  1.1 MB/s could fetch a full-size response. `bufio.Scanner` also passed the
+  line the timeout cut on as a last row (the review's "unexpected end of
+  JSON input"; unreshaped, the partial row went into the response). Now:
+  - No `http.Client.Timeout`. Statements, inserts and pings keep the
+    timeout for the whole exchange (a context deadline; unchanged). A query
+    has it for sending and for ClickHouse's answer, which comes once the
+    query has finished (`wait_end_of_query`; ClickHouse stops it at the
+    timeout less 5 s), and then for each wait for more of the result,
+    timed only while a read waits for ClickHouse, not while the caller
+    handles rows.
+  - A result that ends inside a row is an error, and the row is not passed
+    on: a split function refuses a last line without its newline
+    (JSONEachRow ends every row with one); the scanner reports the read
+    error, if there was one.
+  - Accepted: a caller can take as long as it likes over a result; the read
+    API bounds its clients (each part within `writeProgress`, all of it
+    within `WriteTimeout`), and ClickHouse keeps the finished result in a
+    temporary file meanwhile (round three).
+  - Tests: `TestQueryResultOutlastsTimeout` (300 ms timeout; a fake
+    ClickHouse sending two rows every 100 ms for 1.5 s, and 8 MB at once
+    to a caller taking 1.6 s: every row; before, 6 of 30 and 705 of 8000,
+    the last of them cut), `TestQueryCutRowIsAnError` (a broken connection,
+    a stall past the timeout and a clean end, each inside the second row:
+    the first row and an error; before, the cut row was passed on),
+    `TestTimeouts` (queries, inserts and statements without an answer in
+    time still fail).
 
 **Ingest and storage**
 

@@ -143,7 +143,10 @@ The section for a version is the text of its GitHub release.
   1,200 queries/s, about 0.45 MB/s with the chart's logging: keep untrusted
   users away from Grafana, or rate-limit it.
 
-<!-- round four: read API -->
+- Streamed read-API responses are no longer cut off 30 s after their query
+  started (the ClickHouse timeout also covered reading the result): slow
+  clients get them whole. A result cut off inside a row is an error, not a
+  row.
 
 **Security: agent**
 
