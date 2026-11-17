@@ -2459,6 +2459,24 @@ decisions:
     the heap bound on both starts) and TestRecordSizeIsBounded (a value
     just over the bound is skipped, a 2 MiB record still decodes; before,
     the value was delivered).
+- **Targets with the same host and protocol share their series, and the
+  flow-in-use gauge counts them.** Configs may list one host twice with
+  another `port` or `af` (dual-stack, or two TCP ports), and the dedup key
+  allows it, but per-target metrics are labelled with the configured host
+  and protocol only. So both targets write the same series: counters add
+  up, the RTT histogram mixes them, `hopcorder_path_length` is the last
+  cycle's, and `hopcorder_flow_in_use`, set to 0 or 1 by each cycle,
+  flapped when only one of them was refused (with two `flow_id`s), so an
+  alert on it with a `for:` never fired. Not refused in the config:
+  dual-stack and several ports to one name are what operators want to
+  record, and giving them apart labels (port, af) would change every
+  per-target series for everyone. Instead the gauge is the number of the
+  series' targets refused (1 for one target, as before), the agent warns
+  at start about targets that share series, and README says so; the labels
+  stay as bounded as they were.
+  - Tests: TestFlowInUseCountsTheSeriesTargets (two targets on one series:
+    one refused, the other's cycle leaves the gauge at 1; before, 0) and
+    TestWarnSharedSeries.
 
 **CI, release and deployment**
 

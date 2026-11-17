@@ -33,7 +33,10 @@ type SpoolStats interface {
 //
 // Labels are bounded by configuration: agent_id (constant), target (the
 // configured host), protocol, result and output. No hop address or other
-// per-probe value is ever a label; that detail lives in the records.
+// per-probe value is ever a label; that detail lives in the records. So two
+// targets with the same host and protocol (another port or address family)
+// share every per-target series: counters count both, and gauges are kept
+// meaningful for both where that matters (hopcorder_flow_in_use).
 type Metrics struct {
 	reg *prometheus.Registry
 
@@ -50,7 +53,11 @@ type Metrics struct {
 
 	mu    sync.Mutex
 	paths map[*agent.Target]*record.PathTracker
+	inUse map[series]map[*agent.Target]bool // targets refused for their flow, by series
 }
+
+// series names the per-target series a target's metrics go to.
+type series struct{ target, protocol string }
 
 // MetricsOptions wires the metrics output to the rest of the agent.
 type MetricsOptions struct {
@@ -94,7 +101,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		}, tp),
 		flowInUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "hopcorder_flow_in_use",
-			Help: "1 while the target is not probed because another process holds its flow's identifier (ICMP echo identifier = flow_id).",
+			Help: "Targets of this host and protocol not probed because another process holds their flow's identifier (ICMP echo identifier = flow_id): 1 for a single target.",
 		}, tp),
 		resolveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_resolve_errors_total", Help: "Failed DNS resolutions of a target.",
@@ -103,6 +110,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			Name: "hopcorder_output_errors_total", Help: "Failed deliveries by output.",
 		}, []string{"output"}),
 		paths: map[*agent.Target]*record.PathTracker{},
+		inUse: map[series]map[*agent.Target]bool{},
 	}
 	r.MustRegister(m.cycles, m.rtt, m.pathLen, m.pathChanges, m.loops, m.overruns,
 		m.cycleErrors, m.flowInUse, m.resolveErrors, m.outputErrors)
@@ -280,7 +288,7 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 		}
 	}
 	m.cycles.WithLabelValues(host, proto, result).Inc()
-	m.flowInUse.WithLabelValues(host, proto).Set(0)
+	m.setInUse(t, false)
 	m.pathLen.WithLabelValues(host, proto).Set(float64(rec.PathLen))
 	if len(rec.Loops) > 0 {
 		m.loops.WithLabelValues(host, proto).Inc()
@@ -302,8 +310,29 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 func (m *Metrics) CycleFailed(t *agent.Target, err error) {
 	m.cycleErrors.WithLabelValues(t.Host, string(t.Protocol)).Inc()
 	if errors.Is(err, probe.ErrFlowInUse) {
-		m.flowInUse.WithLabelValues(t.Host, string(t.Protocol)).Set(1)
+		m.setInUse(t, true)
 	}
+}
+
+// setInUse records whether t is refused for its flow, and sets its series'
+// gauge to how many of the series' targets are. (Set to 0 or 1 by each
+// target's cycles, a series shared by two targets flapped while only one
+// was refused.)
+func (m *Metrics) setInUse(t *agent.Target, in bool) {
+	k := series{t.Host, string(t.Protocol)}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	refused := m.inUse[k]
+	if in {
+		if refused == nil {
+			refused = map[*agent.Target]bool{}
+			m.inUse[k] = refused
+		}
+		refused[t] = true
+	} else {
+		delete(refused, t)
+	}
+	m.flowInUse.WithLabelValues(k.target, k.protocol).Set(float64(len(refused)))
 }
 
 // CycleOverrun implements agent.Observer.

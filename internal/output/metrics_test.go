@@ -110,6 +110,47 @@ func TestMetrics(t *testing.T) {
 	}
 }
 
+// Two targets with the same host and protocol (here IPv4 and IPv6 to one
+// name, on two flows) share every per-target series. The flow-in-use gauge
+// counts the series' targets not probed: as a 0/1 set by each cycle it
+// flapped when only one of them was, hiding it from an alert (round four).
+func TestFlowInUseCountsTheSeriesTargets(t *testing.T) {
+	targets := []agent.Target{
+		{Host: "dc1.example", Protocol: probe.ICMP, AF: 4, FlowID: 4242},
+		{Host: "dc1.example", Protocol: probe.ICMP, AF: 6, FlowID: 4243},
+	}
+	m := NewMetrics(MetricsOptions{AgentID: "lab", Targets: targets})
+	v4, v6 := &targets[0], &targets[1]
+	gauge := func() string {
+		t.Helper()
+		for _, l := range strings.Split(scrape(t, m.Handler()), "\n") {
+			if strings.HasPrefix(l, `hopcorder_flow_in_use{agent_id="lab",protocol="icmp",target="dc1.example"} `) {
+				return l[strings.LastIndexByte(l, ' ')+1:]
+			}
+		}
+		t.Fatal("no flow_in_use series")
+		return ""
+	}
+	inUse := fmt.Errorf("trace: %w", probe.ErrFlowInUse)
+	for i, step := range []struct {
+		do   func()
+		want string
+	}{
+		{func() { m.CycleFailed(v4, inUse) }, "1"},
+		{func() { m.CycleDone(v6, mkRecord("10.0.0.1")) }, "1"}, // the other target's cycle
+		{func() { m.CycleFailed(v4, inUse) }, "1"},
+		{func() { m.CycleFailed(v6, inUse) }, "2"},
+		{func() { m.CycleFailed(v6, errors.New("no route")) }, "2"},
+		{func() { m.CycleDone(v4, mkRecord("10.0.0.1")) }, "1"},
+		{func() { m.CycleDone(v6, mkRecord("10.0.0.1")) }, "0"},
+	} {
+		step.do()
+		if got := gauge(); got != step.want {
+			t.Errorf("step %d: hopcorder_flow_in_use %s, want %s", i, got, step.want)
+		}
+	}
+}
+
 func TestMetricsServer(t *testing.T) {
 	// Find a free port, then serve on it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

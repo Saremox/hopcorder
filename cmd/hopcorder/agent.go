@@ -548,6 +548,7 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	var observer agent.Observer
 	var metrics *output.Metrics
 	if mc := cfg.Outputs.Metrics; mc != nil {
+		warnSharedSeries(cfg.Targets, logger)
 		stats, _ := prober.(probe.StatsProvider)
 		metrics = output.NewMetrics(output.MetricsOptions{
 			AgentID: cfg.AgentID, Version: versionString(), Targets: targets, Outputs: names,
@@ -600,6 +601,25 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	// waits for it longer.
 	drains.Stop(shutdownGrace, logger)
 	return err
+}
+
+// warnSharedSeries logs the targets whose metrics share their series with
+// an earlier target's: those with the same host and protocol (another port
+// or address family), since labels are only ever the configured host and
+// protocol. Their counters count both, the RTT histogram mixes them, and
+// hopcorder_path_length is whichever cycle ended last.
+func warnSharedSeries(targets []config.Target, logger *slog.Logger) {
+	first := map[[2]string]int{}
+	for i, t := range targets {
+		k := [2]string{t.Host, t.Protocol}
+		if j, ok := first[k]; ok {
+			logger.Warn("targets share their metrics series (same host and protocol); "+
+				"give one an address or another name for the host to tell them apart",
+				"target", t.Host, "protocol", t.Protocol, "targets", []int{j, i})
+			continue
+		}
+		first[k] = i
+	}
 }
 
 // waitIdle waits up to d for every consumer to catch up with the spool.

@@ -942,3 +942,18 @@ func TestDaemonFlowInUseStopsOnlyItsTargets(t *testing.T) {
 	}
 	stop()
 }
+
+// Targets whose metrics share series are named at start.
+func TestWarnSharedSeries(t *testing.T) {
+	var buf bytes.Buffer
+	warnSharedSeries([]config.Target{
+		{Host: "a.example", Protocol: "icmp", AF: 4},
+		{Host: "a.example", Protocol: "udp"},
+		{Host: "b.example", Protocol: "icmp"},
+		{Host: "a.example", Protocol: "icmp", AF: 6},
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+	if n := strings.Count(buf.String(), "share their metrics series"); n != 1 ||
+		!strings.Contains(buf.String(), `target=a.example protocol=icmp targets="[0 3]"`) {
+		t.Errorf("%d warnings:\n%s", n, buf.String())
+	}
+}

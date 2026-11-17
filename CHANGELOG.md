@@ -155,6 +155,11 @@ The section for a version is the text of its GitHub release.
   is about 220 KB). A 48 KiB stored value that decoded to 1.5 GiB got the
   agent OOM-killed on every start, and was never quarantined; such a record
   is now skipped like any undecodable one.
+- `hopcorder_flow_in_use` counts the targets of its series that are not
+  probed. Two targets with the same host and protocol (another `port` or
+  `af`) share every per-target series, and the gauge flapped between 0 and
+  1 when only one of them was refused; the agent now also warns at start
+  about targets that share series.
 
 **Security: CI, release and deployment**
 

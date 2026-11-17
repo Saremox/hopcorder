@@ -215,12 +215,13 @@ replies must echo a random nonce in its data, ICMP errors that quote the
 probe's payload must quote that nonce (on IPv6 they must quote it), and TCP
 replies must acknowledge the SYN's exact sequence number (32 random bits).
 Mismatches are dropped and counted in
-`hopcorder_probe_mismatched_replies_total`. The agent also holds its ICMP
-echo identifier (`flow_id`) with an unprivileged "ping" socket, so no other
-local process can claim it. That last part needs ping sockets
-for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
-every group); where other groups have them but the agent's does not, it
-logs so at startup. If another process (a second hopcorder, a `ping`, any
+`hopcorder_probe_mismatched_replies_total`.
+
+The agent also holds its ICMP echo identifier (`flow_id`) with an
+unprivileged "ping" socket, so no other local process can claim it. That
+needs ping sockets for the agent's group (`net.ipv4.ping_group_range`,
+which systemd opens to every group); where other groups have them but the
+agent's does not, it logs so at startup. If another process (a second hopcorder, a `ping`, any
 local user) holds the echo identifier first, the agent's ICMP targets of
 that flow are not probed: it logs an error, `hopcorder_flow_in_use` is 1 and
 their cycles count as errors. Every other target is probed, and the ICMP
@@ -433,7 +434,7 @@ hop addresses.
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
-| `hopcorder_flow_in_use` | target, protocol | 1 while the target is not probed because another process holds its ICMP echo identifier (`flow_id`) |
+| `hopcorder_flow_in_use` | target, protocol | Targets not probed because another process holds their ICMP echo identifier (`flow_id`): 1 while a single target is |
 | `hopcorder_resolve_errors_total` | target, protocol | Failed DNS lookups |
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
@@ -444,6 +445,13 @@ hop addresses.
 | `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number, dropped: answers to another process's packets, forgeries, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
+
+Two targets with the same `host` and `protocol` (another `port` or `af`)
+share their per-target series, as the labels are only configured values:
+counters count both, the RTT histogram mixes them, `hopcorder_path_length`
+is the last cycle's, and `hopcorder_flow_in_use` counts those not probed.
+The agent warns at start. To tell them apart, give one an address or
+another name of the host.
 
 ## Operations
 
