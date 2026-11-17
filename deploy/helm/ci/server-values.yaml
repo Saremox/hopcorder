@@ -26,3 +26,6 @@ clickhouse:
         memory: 1Gi
     readOnlyUser:
       enabled: true
+      # Scaled to the 1Gi above (smoke.sh checks they are in force).
+      maxMemoryUsage: 200000000
+      maxMemoryUsageForUser: 300000000

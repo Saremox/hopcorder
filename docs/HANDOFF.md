@@ -886,11 +886,13 @@ added in the commit that introduced it.
   - `readOnlyUser` (for Grafana) is defined in `users.d/readonly.xml`, its
     password read from the environment (`from_env`): `GRANT SELECT` on the
     hopcorder database only and the compose stack's bounded profile
-    (`readonly = 2`, time, memory and concurrency limits with `MIN 1`, the
-    cancel setting and, since round three, the spill settings const).
-    Checked on 25.8: it reads the tables, and writes, `system.users`,
-    `url()`, `max_execution_time = 0`, changing the cancel setting and
-    spilling to disk are refused.
+    (`readonly = 1` since round four, with only `max_execution_time`
+    changeable; time, memory and concurrency limits with `MIN 1`, the
+    memory limits from `readOnlyUser.maxMemoryUsage` and
+    `maxMemoryUsageForUser`; the cancel setting and, since round three, the
+    spill settings const). Checked on 25.8: it reads the tables, and
+    writes, `system.users`, `url()`, `max_execution_time = 0`, changing the
+    cancel setting and spilling to disk are refused.
   - Runs as the image's `clickhouse` user (uid 101, `fsGroup` 101) without
     capabilities or privilege escalation; the root file system stays
     writable because the entrypoint writes its user file into
@@ -2319,7 +2321,8 @@ decisions:
 **Grafana's ClickHouse user**
 
 - **Grafana's ClickHouse user has `readonly = 1`, an allowlist**
-  (`grafana_limits` in `deploy/compose/clickhouse-init.sql`). With `readonly = 2`
+  (`grafana_limits` in `deploy/compose/clickhouse-init.sql`,
+  `hopcorder_readonly` in the chart's `readonly.xml`). With `readonly = 2`
   and a list of constrained settings, every setting off the list was the
   viewer's to change, and some of them were not harmless (ClickHouse 25.8,
   2 GiB containers, the review's measurements):
@@ -2365,13 +2368,16 @@ decisions:
     exactly `client_protocol_version=54460&database=hopcorder&default_format=Native&max_execution_time=64`
     (14 for the health check), the health check passed and all 17
     dashboard queries returned rows (`go test -tags grafana ./dashboards/`).
+    The review's attack queries, run against the chart's rendered
+    `readonly.xml`, were refused before they ran.
   - Upgrade: the compose user is `OR REPLACE` now. A user's own settings
     win over its profile's, so the old user's `readonly = 2` would have
     survived a re-run of the script (checked: the old script, then the new
     one, gives `readonly = 1` and keeps the grant).
 - **Grafana's memory limits fit the bundled ClickHouse**: 400 MB per query
-  and 600 MB for all of the user's queries, were 1 GB and 2 GB, sized for
-  the server chart's bundled ClickHouse. 2 GB was more than the chart's ClickHouse may use at
+  and 600 MB for all of the user's queries, were 1 GB and 2 GB (the chart's
+  `readOnlyUser.maxMemoryUsage` and `maxMemoryUsageForUser`, the compose
+  script the same). 2 GB was more than the chart's ClickHouse may use at
   all (0.8 × 2Gi, 1.6 GiB); 600 MB is 35% of it, and the rest is for the
   server's inserts and reads, ClickHouse's caches (at most 448 MiB) and
   ClickHouse itself (200–400 MiB measured). The dashboards need far less:
@@ -2381,7 +2387,10 @@ decisions:
   queries holding what the old limits allowed (three of 255 MiB) got the
   server's 600 MB query killed in 3 of 3 runs (ClickHouse's overcommit
   tracker picks the query using the most); with the new limits (four of
-  128 MiB, near the 600 MB cap) it succeeded 3 of 3 times.
+  128 MiB, near the 600 MB cap) it succeeded 3 of 3 times. The values are
+  sized for the default `resources.limits.memory` and must be scaled with
+  it; the chart refuses a `maxMemoryUsage` below 1 (or not a number) or
+  above `maxMemoryUsageForUser`.
   - Not taken: `memory_overcommit_ratio_denominator = 1` for the user, so
     that ClickHouse cancels Grafana's queries first when it runs out of
     memory as a whole. It did pick them, but cancelling them did not free
@@ -2417,6 +2426,16 @@ decisions:
     and the spill settings) are refused in the query and 6 as request
     parameters. With the old profile, 23 of the settings and 5 of the
     parameters were accepted.
+  - `deploy/helm/ci/smoke.sh` (CI job `helm`, kind) checks that the chart's
+    user has `readonly = 1` and the memory limits of
+    `deploy/helm/ci/server-values.yaml`, and runs 24 of the settings as that
+    user; the `helm` job's lint step checks the rendered `readonly.xml`
+    (`readonly` 1 and CONST, `max_execution_time` the only
+    `changeable_in_readonly`, the CONSTs, the limits from the values, the
+    defaults under half of what a 2Gi ClickHouse may use) and refuses bad
+    memory values. Both fail on the old chart. kind cannot run in the
+    development container, so the smoke checks ran there against a
+    ClickHouse container with the chart-rendered configuration.
   - The CI `grafana` job runs every dashboard query through the real
     plugin, unchanged.
 

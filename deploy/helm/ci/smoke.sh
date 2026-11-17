@@ -52,11 +52,29 @@ for i in $(seq 90); do
         echo "ClickHouse's read-only user can write (or the check failed otherwise): $out"
         exit 1
       fi
-      # Nor can it make ClickHouse spill temporary data to its volume.
-      for s in "max_bytes_before_external_sort = 1000000" "max_bytes_ratio_before_external_group_by = 0.1" \
+      # readonly = 1 with the memory limits of server-values.yaml. Its
+      # queries may set max_execution_time (1 to 300 s), which the Grafana
+      # plugin sends, and nothing else: no setting that spills temporary
+      # data to the volume, turns off memory tracking (one query OOM-killed
+      # ClickHouse), pins memory in the query cache, makes ClickHouse write
+      # MB/s of its own logs or keeps a query out of query_log.
+      if [ "$(chq "SELECT getSetting('readonly'), getSetting('max_memory_usage'), getSetting('max_memory_usage_for_user')")" != \
+        "$(printf '1\t200000000\t300000000')" ]; then
+        echo "ClickHouse's read-only user does not have its profile"
+        exit 1
+      fi
+      chq "SELECT 1 SETTINGS max_execution_time = 65" >/dev/null
+      for s in "max_execution_time = 0" "max_execution_time = 301" "readonly = 2" "max_memory_usage = 400000000" \
+        "max_untracked_memory = 100000000000" "memory_profiler_step = 0" "max_threads = 1000" \
+        "use_concurrency_control = 0" "use_query_cache = 1" "query_cache_ttl = 100000000" \
+        "memory_profiler_sample_probability = 1" "trace_profile_events = 1" \
+        "query_profiler_real_time_period_ns = 1000000" "query_profiler_cpu_time_period_ns = 1000000" \
+        "log_processors_profiles = 0" "opentelemetry_start_trace_probability = 1" "log_query_threads = 1" \
+        "log_query_views = 0" "log_queries = 0" "log_queries_min_type = 'EXCEPTION_WHILE_PROCESSING'" \
+        "max_bytes_before_external_sort = 1000000" "max_bytes_ratio_before_external_group_by = 0.1" \
         "join_algorithm = 'grace_hash'" "join_algorithm = 'partial_merge'"; do
         if out=$(chq "SELECT count() FROM numbers(10) SETTINGS $s" 2>&1) ||
-          ! grep -q 'SETTING_CONSTRAINT_VIOLATION' <<<"$out"; then
+          ! grep -Eq 'READONLY|SETTING_CONSTRAINT_VIOLATION' <<<"$out"; then
           echo "ClickHouse's read-only user may set $s (or the check failed otherwise): $out"
           exit 1
         fi

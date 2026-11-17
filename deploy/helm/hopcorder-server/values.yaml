@@ -85,10 +85,12 @@ clickhouse:
     # Days ClickHouse keeps its own query, metric and trace logs.
     systemLogRetentionDays: 7
     # A read-only user for Grafana's ClickHouse data source: SELECT on the
-    # hopcorder database only, with bounded query time, memory and
-    # concurrency, and no temporary data on disk (like
-    # deploy/compose/clickhouse-init.sql). Its password
-    # comes from passwordSecret or a generated Secret
+    # hopcorder database only, readonly = 1 (its queries may set no setting
+    # but max_execution_time, up to 300 s: keep the data source's query
+    # timeout at 295 s or below, and add no custom settings or row limit),
+    # bounded memory and concurrency, and no temporary data on disk (like
+    # deploy/compose/clickhouse-init.sql).
+    # Its password comes from passwordSecret or a generated Secret
     # (<release>-hopcorder-server-clickhouse-readonly, key password).
     readOnlyUser:
       enabled: false
@@ -96,6 +98,14 @@ clickhouse:
       passwordSecret:
         name: ""
         key: password
+      # Bytes of memory per query, and for all of its queries together.
+      # Sized for resources.limits.memory above (2Gi, of which ClickHouse
+      # may use 80%): Grafana gets under 40%, the rest stays for the
+      # server's inserts and reads, ClickHouse's caches and itself. Scale
+      # them with the memory limit. The dashboards' largest query took
+      # 17 MiB on a week of eight streams.
+      maxMemoryUsage: 400000000
+      maxMemoryUsageForUser: 600000000
     # Only the hopcorder server may reach ClickHouse (with a CNI that
     # enforces NetworkPolicy); add other peers here, e.g. Grafana's namespace
     # by kubernetes.io/metadata.name.

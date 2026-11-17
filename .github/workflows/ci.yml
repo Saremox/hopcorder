@@ -296,13 +296,36 @@ jobs:
           refused deploy/helm/hopcorder-server "${ing[@]}" --set-json 'ingress.hosts=[{"host":"","paths":[{"path":"/","pathType":"Prefix"}]}]'
           refused deploy/helm/hopcorder-server --set 'allowedHosts={hopcorder.example.net:8080}'
           helm template a deploy/helm/hopcorder-server --set service.type=LoadBalancer --set 'allowedHosts={192.0.2.7}' >/dev/null
-          # The bundled ClickHouse's read-only user cannot change the
-          # settings that spill temporary data to disk (smoke.sh runs them).
+          # The bundled ClickHouse's read-only user: readonly = 1, under
+          # which its queries may change max_execution_time (what the Grafana
+          # plugin sends) and no other setting, the spill settings constant
+          # in case readonly is lifted (smoke.sh runs them as the user), and
+          # memory limits from the values, which by default leave the
+          # server more than half of what ClickHouse may use.
           ch=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --show-only templates/clickhouse.yaml)
-          for s in max_bytes_before_external_sort max_bytes_ratio_before_external_sort \
-            max_bytes_before_external_group_by max_bytes_ratio_before_external_group_by join_algorithm; do
+          grep -qF '<readonly>1</readonly>' <<<"$ch" || { echo "readonly.xml: not readonly = 1"; exit 1; }
+          if [ "$(grep -c '<changeable_in_readonly/>' <<<"$ch")" != 1 ] ||
+            ! grep -qF '<max_execution_time><min>1</min><max>300</max><changeable_in_readonly/></max_execution_time>' <<<"$ch"; then
+            echo "readonly.xml: a query may change settings other than max_execution_time (1 to 300 s)"; exit 1
+          fi
+          for s in readonly cancel_http_readonly_queries_on_client_close max_bytes_before_external_sort \
+            max_bytes_ratio_before_external_sort max_bytes_before_external_group_by \
+            max_bytes_ratio_before_external_group_by join_algorithm; do
             grep -qF "<$s><const/></$s>" <<<"$ch" || { echo "readonly.xml: $s is not constant"; exit 1; }
           done
+          for s in '<max_memory_usage>200000000<' '<max_memory_usage_for_user>300000000<' \
+            '<max_memory_usage><min>1</min><max>200000000<' '<max_memory_usage_for_user><min>1</min><max>300000000<'; do
+            grep -qF "$s" <<<"$ch" || { echo "readonly.xml lacks $s (server-values.yaml)"; exit 1; }
+          done
+          def=$(helm template a deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true \
+            --set clickhouse.deploy.readOnlyUser.enabled=true --show-only templates/clickhouse.yaml)
+          ro=$(sed -n 's|.*<max_memory_usage_for_user>\([0-9]*\)</max_memory_usage_for_user>.*|\1|p' <<<"$def")
+          gi=$(sed -n '/limits:/,/^ *[a-z]*:$/s/^ *memory: \([0-9]*\)Gi$/\1/p' <<<"$def")
+          echo "read-only user: $ro bytes of ClickHouse's ${gi}Gi"
+          test "$((ro * 2))" -lt "$((gi * 1024 * 1024 * 1024 * 8 / 10))"
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.readOnlyUser.maxMemoryUsage=0
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.readOnlyUser.maxMemoryUsage=1GB
+          refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.readOnlyUser.maxMemoryUsageForUser=100
       - name: build images
         run: |
           docker build --target server -t hopcorder-server:ci .

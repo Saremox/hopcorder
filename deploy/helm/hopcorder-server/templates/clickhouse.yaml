@@ -17,6 +17,12 @@ image, one replica, a persistent volume, no operator. See values.yaml.
 {{- if and $d.readOnlyUser.enabled (or (not (regexMatch $ident (toString $d.readOnlyUser.name))) (eq $d.readOnlyUser.name $d.user)) }}
 {{- fail "clickhouse.deploy.readOnlyUser.name: letters, digits and _ (not starting with a digit), other than clickhouse.deploy.user" }}
 {{- end }}
+{{- /* Bytes; int64 also turns a YAML number into digits (toString gives 5e+08). */}}
+{{- $roQuery := int64 $d.readOnlyUser.maxMemoryUsage }}
+{{- $roUser := int64 $d.readOnlyUser.maxMemoryUsageForUser }}
+{{- if and $d.readOnlyUser.enabled (or (lt $roQuery 1) (lt $roUser $roQuery)) }}
+{{- fail "clickhouse.deploy.readOnlyUser: maxMemoryUsage at least 1 (bytes), maxMemoryUsageForUser at least maxMemoryUsage" }}
+{{- end }}
 {{- $db := .Values.config.clickhouse.database | default "hopcorder" }}
 {{- if not (regexMatch $ident (toString $db)) }}
 {{- fail "config.clickhouse.database: letters, digits and _ (not starting with a digit) with clickhouse.deploy" }}
@@ -48,21 +54,25 @@ data:
         {{- end }}
     </clickhouse>
   {{- if $d.readOnlyUser.enabled }}
-  # The read-only user (for Grafana): SELECT on the hopcorder database only;
-  # readonly = 2 still lets a client set query settings, so the limits have
-  # constraints, with MIN 1 (0 means "unlimited"). The spill settings are
-  # constant: with one of them a query could write temporary data to the
-  # data volume until it was full (external sort or GROUP BY, grace_hash or
-  # partial_merge joins); a query that does not fit max_memory_usage fails
-  # instead.
+  # The read-only user (for Grafana): SELECT on the hopcorder database only,
+  # as in deploy/compose/clickhouse-init.sql, which explains each setting.
+  # readonly = 1: a query may change no setting but max_execution_time (1 to
+  # 300 s), which the Grafana plugin sends; others turned off memory
+  # tracking (one query OOM-killed ClickHouse), pinned memory in the query
+  # cache or made ClickHouse write MB/s of its own logs. Memory per query
+  # and for all of the user's queries: readOnlyUser.maxMemoryUsage and
+  # maxMemoryUsageForUser. The cancel setting needs readonly > 0. The
+  # constraints stay for readonly = 2: the spill settings constant (with
+  # one of them a query wrote temporary data to the data volume until it
+  # was full), the limits with MIN 1 (0 means "unlimited").
   readonly.xml: |
     <clickhouse>
         <profiles>
             <hopcorder_readonly>
-                <readonly>2</readonly>
+                <readonly>1</readonly>
                 <max_execution_time>60</max_execution_time>
-                <max_memory_usage>1000000000</max_memory_usage>
-                <max_memory_usage_for_user>2000000000</max_memory_usage_for_user>
+                <max_memory_usage>{{ $roQuery }}</max_memory_usage>
+                <max_memory_usage_for_user>{{ $roUser }}</max_memory_usage_for_user>
                 <max_concurrent_queries_for_user>16</max_concurrent_queries_for_user>
                 <cancel_http_readonly_queries_on_client_close>1</cancel_http_readonly_queries_on_client_close>
                 <max_bytes_before_external_sort>0</max_bytes_before_external_sort>
@@ -71,9 +81,10 @@ data:
                 <max_bytes_ratio_before_external_group_by>0</max_bytes_ratio_before_external_group_by>
                 <join_algorithm>direct,parallel_hash,hash</join_algorithm>
                 <constraints>
-                    <max_execution_time><min>1</min><max>300</max></max_execution_time>
-                    <max_memory_usage><min>1</min><max>1000000000</max></max_memory_usage>
-                    <max_memory_usage_for_user><min>1</min><max>2000000000</max></max_memory_usage_for_user>
+                    <readonly><const/></readonly>
+                    <max_execution_time><min>1</min><max>300</max><changeable_in_readonly/></max_execution_time>
+                    <max_memory_usage><min>1</min><max>{{ $roQuery }}</max></max_memory_usage>
+                    <max_memory_usage_for_user><min>1</min><max>{{ $roUser }}</max></max_memory_usage_for_user>
                     <max_concurrent_queries_for_user><min>1</min><max>16</max></max_concurrent_queries_for_user>
                     <cancel_http_readonly_queries_on_client_close><const/></cancel_http_readonly_queries_on_client_close>
                     <max_bytes_before_external_sort><const/></max_bytes_before_external_sort>
