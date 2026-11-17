@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -158,21 +160,30 @@ func TestHostAllowlist(t *testing.T) {
 			t.Errorf("listen %s, allowed_hosts %v: %v, want %v", tc.listen, tc.hosts, got, tc.want)
 		}
 	}
-	c, err := ParseServer([]byte(`allowed_hosts: ["hopcorder.example:8080", "http://x", "", "[::1]", "192.0.2.1", "*",
-  "*.lab.example", "*.", "*.*.example", "a.*.example", "*example"]`))
+	label63, label64 := strings.Repeat("a", 63), strings.Repeat("a", 64)
+	name253 := strings.Repeat(label63+".", 3) + strings.Repeat("a", 61)
+	bad := []string{"hopcorder.example:8080", "http://x", "", "*.", "*.*.example", "a.*.example", "*example",
+		// Round four: a wildcard on a top-level domain allows attackers'
+		// names too; and what the chart's template-time check let through
+		// before the server refused it (a pod crash-looping on its config).
+		"*.com", "*.lab.", "*.", "10.0.0.5:8080", "cafe:443", "::::", "1.2.3", "256.0.0.1", "-a.example",
+		"a-.example", "a..example", ".example", label64 + ".example", name253 + "a", strings.Repeat("a", 300)}
+	good := []string{"[::1]", "192.0.2.1", "*.lab.example", "*.co.uk", "hopcorder.example.", "a_b.example",
+		"xn--bcher-kva.example", label63 + ".example", name253, "::ffff:192.0.2.1"}
+	b, _ := json.Marshal(map[string][]string{"allowed_hosts": slices.Concat(bad, good)})
+	c, err := ParseServer(b)
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = c.Finalize()
-	for _, bad := range []string{`"hopcorder.example:8080"`, `"http://x"`, `""`, `"*."`, `"*.*.example"`,
-		`"a.*.example"`, `"*example"`} {
-		if err == nil || !strings.Contains(err.Error(), "allowed_hosts "+bad) {
-			t.Errorf("%s accepted: %v", bad, err)
+	for _, h := range bad {
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("allowed_hosts %q", h)) {
+			t.Errorf("%q accepted", h)
 		}
 	}
-	for _, good := range []string{`"[::1]"`, `"192.0.2.1"`, `"*.lab.example"`} {
-		if err != nil && strings.Contains(err.Error(), good) {
-			t.Errorf("%s refused: %v", good, err)
+	for _, h := range good {
+		if err != nil && strings.Contains(err.Error(), fmt.Sprintf("allowed_hosts %q", h)) {
+			t.Errorf("%q refused", h)
 		}
 	}
 }

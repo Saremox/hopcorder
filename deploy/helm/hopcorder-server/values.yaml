@@ -20,9 +20,12 @@ fullnameOverride: ""
 # key; unknown keys are rejected). The chart sets listen, the ASN cache file,
 # allowed_hosts unless set here (see allowedHosts below), with
 # clickhouse.passwordSecret or clickhouse.deploy clickhouse.password_file,
-# and with clickhouse.deploy clickhouse.url and clickhouse.user; it refuses
-# clickhouse.password (it would land in a ConfigMap, readable with the
-# built-in view role).
+# and with clickhouse.deploy clickhouse.url and clickhouse.user, and
+# query.max_concurrent and query.max_memory_bytes unless set here (see
+# clickhouse.deploy.resources); it refuses clickhouse.password (it would
+# land in a ConfigMap, readable with the built-in view role). For an
+# external ClickHouse, keep query.max_concurrent x query.max_memory_bytes
+# (by default 8 x 1GiB) to about a third of what it may use.
 config:
   log:
     level: info
@@ -83,7 +86,11 @@ clickhouse:
       storageClass: ""
       accessModes: [ReadWriteOnce]
     # Caches are sized for a small instance, and the server may use 80% of
-    # the memory limit.
+    # the memory limit. The read API's queries get a third of that, two at a
+    # time: config.query.max_concurrent 2 and max_memory_bytes 80% x limit /
+    # 3 / max_concurrent (273MiB for 2Gi), unless config.query sets them.
+    # Planted data costs a read query up to about 200MiB; one that needs
+    # more than its budget fails rather than taking memory from ingest.
     resources:
       requests:
         cpu: 100m
@@ -163,8 +170,13 @@ service:
 # the other names clients use: another Ingress, a Gateway or a proxy that
 # passes the client's Host on, a NodePort or LoadBalancer address (the chart
 # refuses those Service types, and an ingress rule without host, until you
-# do). "*.example.net" allows one label below example.net. ["*"] turns the
-# check off. config.allowed_hosts, if set, replaces all of this.
+# do). "*.example.net" allows one label below example.net: only for a domain
+# whose names you alone can create, not a shared one (*.github.io, a hosting
+# or dynamic-DNS domain), and not a top-level domain ("*.com" is refused).
+# Entries are host names (labels of letters, digits, - and _, at most 253
+# characters), *.domain or IP addresses, without port; others fail the
+# install. ["*"] turns the check off. config.allowed_hosts, if set (checked
+# the same way), replaces all of this.
 allowedHosts: []
 clusterDomain: cluster.local
 

@@ -145,16 +145,27 @@ func TestCyclesOrder(t *testing.T) {
 	base := ts.URL + "/api/v1/query/cycles?agent=lab&target=dc1.example"
 	var body map[string]any
 	for _, c := range []struct {
-		query string
-		code  int
-		order string
-	}{{"", 200, "ORDER BY ts DESC"}, {"&order=asc", 200, "ORDER BY ts ASC"}, {"&order=up", 400, ""}} {
+		query   string
+		code    int
+		order   string
+		queries int
+	}{
+		{"&protocol=icmp", 200, "ORDER BY ts DESC", 1}, {"&protocol=icmp&order=asc", 200, "ORDER BY ts ASC", 1},
+		// Without a protocol, the cycles' times first.
+		{"", 200, "ORDER BY ts DESC", 2}, {"&order=asc", 200, "ORDER BY ts ASC", 2},
+		{"&order=up", 400, "", 0},
+	} {
 		got = nil
 		if code := getJSON(t, base+c.query, &body); code != c.code {
 			t.Errorf("%q: status %d", c.query, code)
 		}
-		if c.order != "" && (len(got) != 1 || !strings.Contains(got[0], c.order)) {
+		if len(got) != c.queries {
 			t.Errorf("%q: queries %v", c.query, got)
+		}
+		for _, q := range got {
+			if !strings.Contains(q, c.order) {
+				t.Errorf("%q: query without %s: %s", c.query, c.order, q)
+			}
 		}
 	}
 }

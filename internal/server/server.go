@@ -200,7 +200,9 @@ func acquire(ctx context.Context, sem chan struct{}) bool {
 // cannot crowd out ingest in ClickHouse, and the memory and result size of
 // each of their queries there. max_result_bytes is a backstop at twice the
 // response budget (it counts ClickHouse's in-memory columns, not JSON, and
-// stops only between blocks); the response budget is what truncates.
+// stops only between blocks, hence the small blocks); the response budget
+// is what truncates. The other settings keep a query's memory to what it
+// needs rather than what the machine has (see readQuerySettings).
 //
 // A request keeps its slot until its response is sent, and each part of
 // the response must reach the client within writeProgress, so a client
@@ -210,6 +212,12 @@ func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
 		"max_memory_usage":     strconv.FormatInt(s.opts.MaxQueryMemory, 10),
 		"max_result_bytes":     strconv.FormatInt(2*s.opts.MaxResponseBytes, 10),
 		"result_overflow_mode": "break",
+		// A sort with LIMIT keeps only its top rows once it holds this
+		// much (ClickHouse waits for 1 GB by default).
+		"max_bytes_before_remerge_sort": strconv.FormatInt(s.opts.MaxQueryMemory/4, 10),
+	}
+	for k, v := range readQuerySettings {
+		settings[k] = v
 	}
 	progress := s.writeProgress
 	if progress <= 0 {
@@ -218,6 +226,9 @@ func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		pw := newProgressWriter(w, progress, WriteTimeout)
 		defer pw.done()
+		// Responses hold stored data: never cached, never sniffed.
+		pw.Header().Set("Cache-Control", "no-store")
+		pw.Header().Set("X-Content-Type-Options", "nosniff")
 		if !acquire(r.Context(), s.querySem) {
 			writeJSON(pw, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
 			return
@@ -611,8 +622,18 @@ type queryParams struct {
 	from, to time.Time
 }
 
+// The time range a read query may ask for: the range of a record's ts
+// (record.Validate), and at most maxQuerySpan of it.
+var (
+	minQueryTime = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxQueryTime = time.Date(2262, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+const maxQuerySpan = topologyMaxBuckets * 24 * time.Hour
+
 // parseQuery reads agent, target, protocol, from, to (RFC 3339 or Unix
-// milliseconds; default the last 24 hours) and limit.
+// milliseconds; default the last 24 hours, at most 400 days, within
+// 1970-2262) and limit.
 func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	q := r.URL.Query()
 	now := time.Now()
@@ -626,6 +647,16 @@ func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	}
 	if !from.Before(to) {
 		return queryParams{}, errors.New("from must be before to")
+	}
+	// Times outside what records may hold failed in ClickHouse (502, an
+	// error logged and counted); a longer span cannot be drawn either (the
+	// timeline's largest buckets are a day, at most 400 of them).
+	if from.Before(minQueryTime) || to.After(maxQueryTime) {
+		return queryParams{}, fmt.Errorf("from and to must lie within %s and %s",
+			minQueryTime.Format(time.DateOnly), maxQueryTime.Format(time.DateOnly))
+	}
+	if to.Sub(from) > maxQuerySpan {
+		return queryParams{}, fmt.Errorf("from and to may be at most %d days apart", maxQuerySpan/(24*time.Hour))
 	}
 	limit := 1000
 	if v := q.Get("limit"); v != "" {
@@ -705,13 +736,21 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
 		return
 	}
+	// A stream is a group of about 800 bytes in each of ClickHouse's
+	// threads: 660,000 planted streams took 494 MiB. So at most as many as
+	// the ingester tracks (ingest.max_streams) are aggregated, or limit if
+	// that is more; beyond, the rows are among the streams ClickHouse came
+	// across first, and there are limit of them, as when there are more
+	// streams than limit.
+	groups := max(s.ingester.maxStreams, qp.limit+1)
 	s.runQuery(w, r, `SELECT agent_id, target, protocol, flow_id, max(ts) AS last_ts, count() AS cycles,
 		countIf(reached) / count() AS reach_ratio, argMax(reached, ts) AS last_reached,
 		argMax(path_len, ts) AS last_path_len, argMax(target_ip, ts) AS last_target_ip,
 		argMax(path_hash, ts) AS last_path_hash
 		FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
 		GROUP BY agent_id, target, protocol, flow_id ORDER BY agent_id, target, protocol, flow_id
-		LIMIT {limit:UInt32}`, qp, nil)
+		LIMIT {limit:UInt32}
+		SETTINGS max_rows_to_group_by = `+strconv.Itoa(groups)+`, group_by_overflow_mode = 'any'`, qp, nil)
 }
 
 // apiHop is a hop as the read API returns it: the wire hop plus enrichment.
@@ -730,7 +769,8 @@ type apiHop struct {
 // maxCycles bounds limit for cycles, the widest rows: a cycle can be
 // 230 KB of JSON (255 hops with 16 MPLS labels each), and ClickHouse formats
 // a result like this as one block, so 1000 of them took about 650 MiB in
-// ClickHouse and 10000 failed the default query.max_memory_bytes.
+// ClickHouse and 10000 failed the default query.max_memory_bytes (most of it
+// for formatting the block in parallel, which read queries no longer do).
 const maxCycles = 1000
 
 // handleCycles returns full cycles of one stream, newest first, or oldest
@@ -781,10 +821,34 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 		IP   string `json:"ip"`
 		TTLs []int  `json:"ttls"`
 	}
+	// With the stream given as equalities (agent and target are required),
+	// ClickHouse reads the cycles in the order of the sort key (agent_id,
+	// target, protocol, ts) and stops after limit, rather than sorting every
+	// cycle of the window, whole (streamFilter's form defeats that). Without
+	// a protocol, streams of several protocols are merged, which needs a
+	// sort: a first query finds the times of the cycles to return, so that
+	// the sort gets only those. 1000 of 10,000 maximal cycles took 765 MiB
+	// (round four); now 52 MiB, 82 MiB without a protocol.
+	const window = `FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)}
+		AND agent_id = {agent:String} AND target = {target:String}`
+	stream, cut := ` AND protocol = {protocol:String}`, ""
+	if qp.params["protocol"] == "" {
+		n, last, err := s.rowsThatFit(r.Context(), `SELECT ts, 0 AS bytes `+window+`
+			ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp.params)
+		if err != nil {
+			s.queryFailed(r, newJSONStream(w, 0, 0), "", err)
+			return
+		}
+		qp.params["limit"], qp.params["last"] = strconv.Itoa(n), last
+		stream, cut = "", ` AND ts >= {last:DateTime64(3)}`
+		if order == "ASC" {
+			cut = ` AND ts <= {last:DateTime64(3)}`
+		}
+	}
 	s.runQuery(w, r, `SELECT agent_id, seq, ts, target, target_ip, af, protocol, flow_id, reached, path_len,
 		path_hash, loops.ip, loops.ttls, hops.ttl, hops.status, hops.ip, hops.rtt_us, hops.code, hops.asn,
 		hops.as_name, hops.name, hops.mpls
-		FROM cycles WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
+		`+window+stream+cut+`
 		ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp, func(m json.RawMessage) (any, error) {
 		var c row
 		if err := json.Unmarshal(m, &c); err != nil {
@@ -811,16 +875,72 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// pathChangeBytes is a lower bound of the JSON of a path_changes row as the
+// read API sends it (ClickHouse's, HTML-escaped): its strings and arrays
+// with their quotes and separators, and less than the rest (226 bytes with
+// every string and array empty).
+const pathChangeBytes = `200 + length(agent_id) + length(target) + length(protocol) + length(prev_path_hash)
+	+ length(path_hash) + 2 * length(ttls) + arraySum(arrayMap(x -> length(x) + 2, from_ips))
+	+ arraySum(arrayMap(x -> length(x) + 2, to_ips))`
+
+// handlePathChanges returns route changes, newest first. A change lists
+// every TTL that changed, so a row can be several KB (255 TTLs: 9 KB), and
+// ClickHouse sorted whole rows: 10,000 of them (the UI's limit) took
+// 537 MiB, for a response cut at 32 MiB. So the query is split: the first
+// part sorts only the rows' times and sizes, which tell how many of the
+// newest rows can fit the response; the second reads just those whole.
 func (s *Server) handlePathChanges(w http.ResponseWriter, r *http.Request) {
 	qp, err := parseQuery(r, false)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error()})
 		return
 	}
+	const from = `FROM path_changes FINAL WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND ` + streamFilter
+	n, oldest, err := s.rowsThatFit(r.Context(), `SELECT ts, `+pathChangeBytes+` AS bytes `+from+`
+		ORDER BY ts DESC LIMIT {limit:UInt32}
+		SETTINGS query_plan_execute_functions_after_sorting = 0`, qp.params)
+	if err != nil {
+		s.queryFailed(r, newJSONStream(w, 0, 0), "", err)
+		return
+	}
+	qp.params["limit"], qp.params["oldest"] = strconv.Itoa(n), oldest
 	s.runQuery(w, r, `SELECT ts, agent_id, target, protocol, flow_id, seq, reason, ttls, from_ips, to_ips,
 		prev_seq, prev_path_hash, path_hash, prev_path_len, path_len
-		FROM path_changes FINAL WHERE ts >= {from:DateTime64(3)} AND ts < {to:DateTime64(3)} AND `+streamFilter+`
+		`+from+` AND ts >= {oldest:DateTime64(3)}
 		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, nil)
+}
+
+// rowsThatFit runs q, which returns the ts and a lower bound of the JSON
+// size (bytes) of the rows a query would return, in its order, and returns
+// how many of those rows to read and the ts of the last: the rows up to
+// and including the first one past the response budget (which cuts the
+// response there at the latest, since it counts at least as many bytes).
+// The query that then reads them whole sorts only the rows from that ts on.
+// Without rows, last is the start of the window.
+func (s *Server) rowsThatFit(ctx context.Context, q string, params clickhouse.Params) (n int, last string, err error) {
+	var total int64
+	var ts time.Time
+	err = s.opts.Store.Query(ctx, q, params, func(m json.RawMessage) error {
+		var row struct {
+			TS    time.Time `json:"ts"`
+			Bytes int64     `json:"bytes"`
+		}
+		if err := json.Unmarshal(m, &row); err != nil {
+			return fmt.Errorf("decode row: %w", err)
+		}
+		n, ts, total = n+1, row.TS, total+row.Bytes+1
+		if total > s.opts.MaxResponseBytes {
+			return errResponseFull
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errResponseFull) {
+		return 0, "", err
+	}
+	if n == 0 {
+		return 0, params["from"], nil
+	}
+	return n, clickhouse.Time(ts), nil
 }
 
 func (s *Server) handleLoops(w http.ResponseWriter, r *http.Request) {

@@ -1128,7 +1128,8 @@ decisions:
 - **`cycles` takes `limit` up to 1000** (other endpoints keep 10000).
   ClickHouse formats such a result as one block: 3000 maximal cycles needed
   1.64 GiB in ClickHouse and failed the 1 GiB limit, 1000 need about
-  650 MiB. The UI asks for one cycle at a time.
+  650 MiB (round four: most of it for formatting the block's text in
+  parallel, now off; 52 MiB). The UI asks for one cycle at a time.
 - **Rows passed to `Query` callbacks are copies**: `bufio.Scanner` reuses
   its buffer, and the read API kept rows across callbacks. A result above
   the scanner's first 64 KiB came back with earlier rows overwritten.
@@ -1808,10 +1809,16 @@ high-severity issue. Four fixes followed. The decisions:
     label below the domain, as Kubernetes routes them (not `example.net`
     itself, not `a.b.example.net`). Safe for the same reason as a listed
     name: a rebinding page sends its own name, which an attacker cannot put
-    under the operator's domain.
+    under the operator's domain. (Round four: that holds only for a domain
+    whose names the operator alone can create. `*.com` allowed
+    `attacker.com`, and on a shared domain such as `github.io` anyone gets
+    names; a single label after `*.` is refused now, and the docs warn about
+    shared domains.)
   - NOTES print the list (or warn when it is `*`). Entries are checked at
     template time (host name, `*.domain` or address, no port), so a bad one
-    fails the install instead of crash-looping the server.
+    fails the install instead of crash-looping the server. (Round four: the
+    check was looser than the server's, so `10.0.0.5:8080`, `cafe:443`,
+    `::::` and a 300-character name still crash-looped it; fixed there.)
   - Tests: `TestHostCheck` and `TestHostAllowlist` cover `*.domain`; the CI
     `helm` job renders the list (service names, ingress host, extra names,
     `*`, `config.allowed_hosts`) and the refusals; smoke.sh as above.
@@ -1835,8 +1842,11 @@ high-severity issue. Four fixes followed. The decisions:
     up there without bound.
   - Accepted: a client that keeps reading at least 64 KiB every 10 s holds
     its slot until its response is done or `WriteTimeout`, as a slow
-    download does; and clients can still take every slot by opening new
-    connections every 10 s, as they can with ordinary requests. Both are
+    download does (round four: until then, the ClickHouse client's 30 s
+    timeout, which also covered reading the result, cut a streamed response
+    30 s after its query started, however fast its client read); and
+    clients can still take every slot by opening new connections every
+    10 s, as they can with ordinary requests. Both are
     for a rate limit at the proxy (a buffering proxy, nginx's default,
     absorbs slow readers entirely).
   - Tests: `TestNonReadingClientLosesQuerySlot` (one slot, small socket
@@ -2483,7 +2493,143 @@ decisions:
 
 **Read API**
 
-<!-- round four: read API -->
+- **Read views of planted data stay within a read budget that fits
+  ClickHouse.** Data posted through ingest made the common read views cost
+  ClickHouse about 1 GiB each (25.8, configured like the chart's, 2 GiB):
+  20,000 cycles of 255 new addresses (26 s to post) took topology's nodes
+  793 MiB and its edges 681 MiB (the number of groups, not round three's
+  lambda), their 10,000 newest path changes (the UI's limit) 537 MiB for a
+  response cut at 32 MiB (a 144 MB result block, which `max_result_bytes`
+  with `break` cannot cut), 1000 of 10,000 maximal cycles 765 MiB, and the
+  stream list over 660,000 planted streams 494 MiB. `query.max_memory_bytes`
+  (1 GiB) times `max_concurrent` (8) was far more than the chart's
+  ClickHouse may use (1.6 GiB): two simulated UI viewers of such a stream got
+  502 for 9 of 12 topology and path-change requests, four for 15 of 16
+  (ClickHouse's overcommit killed readers; ingest stayed at 200). Now, on the
+  same data, no read query of the stream view or the stream list takes more
+  than 117 MiB, and both runs got 200 throughout (ingest 80 of 80):
+  - Topology's nodes and edges and the stream list have a group limit
+    (`max_rows_to_group_by`, `group_by_overflow_mode = 'any'`: ClickHouse
+    keeps aggregating the groups it has and skips new ones): 20,000
+    distinct nodes and edges, 10 and 4 times the caps, so that a response
+    it cuts has more rows than the cap and says `truncated`; and
+    `ingest.max_streams` streams (or `limit`, if more), about 800 bytes each
+    per thread. Nodes now 64 MiB, edges 117 MiB, targets 74 MiB.
+  - `path-changes` runs in two parts: the newest rows' times and a lower
+    bound of their JSON (computed before the sort:
+    `query_plan_execute_functions_after_sorting = 0`; otherwise ClickHouse
+    carries the arrays through it), then whole rows only from the time of
+    the first row past the response budget, which cuts the response there at
+    the latest. 54 and 96 MiB, the same response.
+  - `cycles` with a protocol filters the stream by equalities, so ClickHouse
+    reads in the sort key's order and stops after `limit` (the `'' OR` form
+    of the stream filter defeated that; the primary key was used either
+    way): 52 MiB. Without a protocol (streams merged, so sorted) a first
+    query finds the times of the cycles to return, and the sort gets only
+    those: 82 MiB.
+  - Every read query: `max_threads = 4` (memory for reading and aggregating
+    grows with the threads, which default to the node's cores; reading 255
+    new addresses per cycle costs about 40 MiB a thread),
+    `max_block_size = 1024` (the result backstop stops only between blocks,
+    and a group limit is exceeded by up to a block of new keys per thread),
+    `output_format_parallel_formatting = 0` (it keeps the text of whole
+    blocks: 1000 maximal cycles were one 200 MB block, 522 MiB for the query,
+    106 MiB without) and `max_bytes_before_remerge_sort` a quarter of the
+    budget (a sort with LIMIT keeps only its top rows once it holds that
+    much; ClickHouse's default waits for 1 GB).
+  - **Budget**: with `clickhouse.deploy` the chart sets
+    `query.max_concurrent` to 2 and `query.max_memory_bytes` to 80% of the
+    memory limit / 3 / `max_concurrent` (273 MiB for the default 2Gi; it
+    fails on a limit it cannot read), unless `config.query` sets them:
+    reads get a third of what ClickHouse may use, the rest is for its
+    caches (up to 448 MiB), inserts, merges and the read-only user. Two at
+    a time with more each rather than four with less: a query over its
+    budget fails, a request beyond the slots only waits (up to 10 s), and
+    the stream view's five requests take milliseconds on real data. The
+    rule for an external ClickHouse, in the docs: their product at most
+    about a third of its `max_server_memory_usage`. The server's defaults
+    stay (8 x 1 GiB, for a large ClickHouse).
+  - Accepted: planted data still fills the views of its own streams, now
+    cut by the caps and the budget (the cost of ingest without
+    authentication, §2). A node's median keeps up to 8192 samples, so a
+    stream with some 20,000 distinct nodes of thousands of cycles each
+    (several hundred thousand planted cycles) can still exceed the budget;
+    that view then fails (502) at the budget, not at ClickHouse's limit.
+    The test's layout of parts made the edges 190 MiB; with a smaller
+    ClickHouse than 2Gi (the CI's 1Gi: 136 MiB a query) that view of
+    planted addresses fails the same way.
+  - Tests: `TestReadViewsOfPlantedDataClickHouse` (`clickhouse` tag) plants
+    the review's data by SQL (20,000 cycles of new addresses with their
+    path changes, 1500 maximal cycles, 660,000 streams) and runs every view
+    with 273 MiB a query: before, each got 502; now each answers within it,
+    truncated where it should be and newest first. `TestReadQuerySettings`,
+    `TestReadGroupLimits`, `TestPathChangesReadOnlyWhatFits` and
+    `TestCyclesOrder` check the settings, the limits and the two-part
+    queries; the CI `helm` job checks the chart's budget.
+- **A streamed response lasts as long as its client reads.** The ClickHouse
+  client's `http.Client.Timeout` (`clickhouse.timeout`, 30 s) also covered
+  reading the result, so a streamed read-API response was cut off 30 s after
+  its query started, however fast its client read: `cycles?limit=1000` of
+  MPLS-heavy cycles (33 MB) read at 500 KB/s ended after 17.9 MB, aborted,
+  with an ERROR logged and a query error counted, and no client below about
+  1.1 MB/s could fetch a full-size response. `bufio.Scanner` also passed the
+  line the timeout cut on as a last row (the review's "unexpected end of
+  JSON input"; unreshaped, the partial row went into the response). Now:
+  - No `http.Client.Timeout`. Statements, inserts and pings keep the
+    timeout for the whole exchange (a context deadline; unchanged). A query
+    has it for sending and for ClickHouse's answer, which comes once the
+    query has finished (`wait_end_of_query`; ClickHouse stops it at the
+    timeout less 5 s), and then for each wait for more of the result,
+    timed only while a read waits for ClickHouse, not while the caller
+    handles rows.
+  - A result that ends inside a row is an error, and the row is not passed
+    on: a split function refuses a last line without its newline
+    (JSONEachRow ends every row with one); the scanner reports the read
+    error, if there was one.
+  - Accepted: a caller can take as long as it likes over a result; the read
+    API bounds its clients (each part within `writeProgress`, all of it
+    within `WriteTimeout`), and ClickHouse keeps the finished result in a
+    temporary file meanwhile (round three).
+  - Tests: `TestQueryResultOutlastsTimeout` (300 ms timeout; a fake
+    ClickHouse sending two rows every 100 ms for 1.5 s, and 8 MB at once
+    to a caller taking 1.6 s: every row; before, 6 of 30 and 705 of 8000,
+    the last of them cut), `TestQueryCutRowIsAnError` (a broken connection,
+    a stall past the timeout and a clean end, each inside the second row:
+    the first row and an error; before, the cut row was passed on),
+    `TestTimeouts` (queries, inserts and statements without an answer in
+    time still fail).
+- **The chart's Host check matches the server's.** Its regular expression
+  took `10.0.0.5:8080`, `cafe:443`, `::::` and 300-character names, which the
+  server refuses at start: the pod crash-looped instead of the install
+  failing. Both now take host names by label rules (labels of 1 to 63
+  letters, digits, `-` and `_`, not starting or ending with `-`; at most 253
+  characters and a trailing dot; the last label not all digits, which
+  would be a malformed IPv4 address), IPv4 as a dotted quad (0-255, no
+  leading zeros), IPv6 in RFC 3986's forms, bare or in brackets, and
+  `*.domain` of two labels at least; no ports. The chart may refuse what the
+  server takes (an IPv6 zone, an IPv4 address in brackets), never the
+  reverse, and it checks `config.allowed_hosts` the same way now.
+  - Checked: 600,000 random host-like strings through the chart's
+    expressions (rebuilt in Go): 35,877 accepted, every one by the server
+    too; 51 chosen entries through `helm template`, the same.
+  - Tests: `TestHostAllowlist`; the CI `helm` job's refusal checks (both
+    values, and that IPv6, wildcards and a 253-character name pass).
+- **Wildcards on a top-level domain are refused.** `*.com` allowed
+  `attacker.com`: round three's argument holds only for a domain whose names
+  the operator alone can create. A single label after `*.` is refused, in
+  the config and the chart. Accepted: shared domains (`*.github.io`, hosting
+  or dynamic-DNS domains, `*.co.uk`) cannot be told apart without a public
+  suffix list; the docs warn about them. Tests: `TestHostAllowlist`, the
+  `helm` job.
+- **Out-of-range times are the client's error.** `from`/`to` outside
+  1970-2262 (a record's ts range), e.g. `to=9223372036854775807` or negative
+  milliseconds, gave 502, an ERROR log line and a query error per request
+  from any client; now 400, and so does a span of more than 400 days (the
+  timeline's largest buckets are a day, at most 400 of them; longer ranges
+  take several requests). Test: `TestReadTimeRange` (no query runs).
+- **Read-API responses carry `Cache-Control: no-store` and
+  `X-Content-Type-Options: nosniff`**, errors included (the UI's had
+  nosniff already). Test: `TestReadAPIHeaders`.
 
 **Ingest and storage**
 

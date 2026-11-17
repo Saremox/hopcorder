@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,7 +15,18 @@ const (
 	topologyMaxEdges     = 5000
 	topologyMaxBuckets   = 400
 	topologyMinBucketSec = 5
+	// topologyMaxGroups bounds the distinct nodes and the distinct edges
+	// ClickHouse aggregates (max_rows_to_group_by with overflow mode any:
+	// beyond it, rows of new keys are skipped, the others still counted).
+	// Without it, 20,000 planted cycles of 255 new addresses each cost
+	// 793 MiB (nodes) and 681 MiB (edges). It must exceed the caps above, so
+	// that a response cut by it has more rows than the cap and says
+	// truncated.
+	topologyMaxGroups = 20000
 )
+
+// groupLimit is the SETTINGS clause of the nodes and edges queries.
+var groupLimit = fmt.Sprintf(" SETTINGS max_rows_to_group_by = %d, group_by_overflow_mode = 'any'", topologyMaxGroups)
 
 // bucketSteps are the timeline bucket sizes, so bucket edges fall on round
 // times.
@@ -43,8 +55,10 @@ func timelineBucket(from, to time.Time) time.Duration {
 // or streams of several protocols are merged. limit is ignored: nodes and
 // edges are capped, and so are the bytes of the whole response
 // (MaxResponseBytes; parts after the one that filled it stay empty);
-// truncated: true says so. The bucket size keeps the timeline to at most
-// topologyMaxBuckets points.
+// truncated: true says so. Beyond topologyMaxGroups distinct nodes (or
+// edges) in the window, they are the busiest of the first ones ClickHouse
+// came across, and truncated is true as well. The bucket size keeps the
+// timeline to at most topologyMaxBuckets points.
 //
 // The edges pair each answering hop with the next by zipping the hop
 // arrays with themselves shifted by one, not with a lambda over the
@@ -78,7 +92,7 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 			toBool(countIf(status = 'reply') > 0) AS destination, countIf(is_loop) AS loop_cycles,
 			min(ts) AS first_ts, max(ts) AS last_ts
 			FROM hops WHERE ` + window + ` AND status != 'no-reply'
-			GROUP BY ttl, hop_ip ORDER BY ttl, cycles DESC, ip LIMIT {nodes:UInt32}`, topologyMaxNodes},
+			GROUP BY ttl, hop_ip ORDER BY ttl, cycles DESC, ip LIMIT {nodes:UInt32}` + groupLimit, topologyMaxNodes},
 		{"edges", `SELECT e.1 AS from_ttl, e.2 AS from_ip, e.3 AS to_ttl, e.4 AS to_ip, count() AS cycles,
 			max(ts) AS last_ts
 			FROM
@@ -89,7 +103,7 @@ func (s *Server) handleTopology(w http.ResponseWriter, r *http.Request) {
 			)
 			ARRAY JOIN arrayZip(arrayPopBack(rt), arrayPopBack(ri), arrayPopFront(rt), arrayPopFront(ri)) AS e
 			GROUP BY from_ttl, from_ip, to_ttl, to_ip ORDER BY cycles DESC, from_ttl, from_ip, to_ip
-			LIMIT {edges:UInt32}`, topologyMaxEdges},
+			LIMIT {edges:UInt32}` + groupLimit, topologyMaxEdges},
 	}
 	// The timeline first: it is small and the UI needs it whole. The response
 	// is kept until all three parts are in (at most the byte budget), so a

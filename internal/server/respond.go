@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/saremox/hopcorder/internal/clickhouse"
 )
 
 // Read-API response bounds.
@@ -19,6 +21,30 @@ const (
 	// streamFlushBytes is how much a streamed response buffers before it
 	// is written to the client.
 	streamFlushBytes = 64 << 10
+)
+
+// readQuerySettings keep what one read query costs ClickHouse independent
+// of the machine it runs on and close to what the response needs (each
+// measured on data planted through ingest, ClickHouse 25.8):
+//   - max_threads: the memory for reading and aggregating grows with the
+//     threads, which default to the node's cores; 4 are plenty for one
+//     stream's data;
+//   - max_block_size: max_result_bytes stops only between blocks, and a
+//     group limit (topology) is exceeded by up to a block of new keys per
+//     thread;
+//   - output_format_parallel_formatting: formatting in parallel holds the
+//     text of whole blocks in memory: cycles?limit=1000 of maximal cycles
+//     (one block, 200 MB of ClickHouse's JSON) took 522 MiB, 106 MiB
+//     without.
+var readQuerySettings = clickhouse.Settings{
+	"max_threads":                       strconv.Itoa(readThreads),
+	"max_block_size":                    strconv.Itoa(readBlockRows),
+	"output_format_parallel_formatting": "0",
+}
+
+const (
+	readThreads   = 4
+	readBlockRows = 1024
 )
 
 // Writing to read-API clients.

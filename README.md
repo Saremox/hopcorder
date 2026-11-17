@@ -639,7 +639,11 @@ loopback address answers `localhost`, `127.0.0.1`, `::1` and its listen host;
 on any other address it checks nothing, since it is reached under service
 names, pod IPs and ingress hosts it cannot know: list them to get the check
 (the Helm chart lists its own). `*.example.net` allows the names one label
-below `example.net`, as an Ingress host of that form routes them.
+below `example.net`, as an Ingress host of that form routes them; use it only
+for a domain whose names you alone can create: not one where others get names
+too (`*.github.io`, a hosting provider's or a dynamic-DNS domain), whose
+names a rebinding page could have. A wildcard on a top-level domain
+(`*.com`) is refused.
 A reverse proxy on the same host that passes the client's `Host` on (Caddy,
 Traefik; nginx sends the upstream's by default) needs its public names in
 the list. `"*"` turns the check off; `/healthz`, `/readyz` and `/metrics`
@@ -658,15 +662,20 @@ answer every host.
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
 Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
-ms; default the last 24h), `limit` (default 1000, max 10000; for `cycles`
+ms; default the last 24h; within 1970 to 2262 and at most 400 days apart,
+else 400), `limit` (default 1000, max 10000; for `cycles`
 max 1000). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
 address that answered at each TTL (`nodes`), every pair of consecutive
 answering hops within a cycle (`edges`, which skip silent TTLs), and
 reachability per time bucket (`timeline`, at most 400 buckets); nodes and
-edges are capped. Every response is bounded by `query.max_response_bytes`
+edges are capped (and so are the distinct ones ClickHouse aggregates, 20,000
+of each: beyond, they are the busiest of those it came across first). Every
+response is bounded by `query.max_response_bytes`
 (32 MiB, streamed as the rows arrive): rows beyond it are left out, and
 `truncated: true` says so (`false` otherwise); `topology` fills its
-`timeline` first.
+`timeline` first. `targets` aggregates at most `ingest.max_streams` streams
+(or `limit`, if more). Responses carry `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`.
 
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the
@@ -704,9 +713,17 @@ stream without state derive no events and are counted in
 `hopcorder_server_unrestored_cycles_total`. Running in a cgroup
 with a memory limit (a container, or a systemd unit with `MemoryMax=`), the
 server sets the Go memory limit to 90% of it unless `GOMEMLIMIT` is set.
-Read-API queries are limited to `query.max_concurrent` at once and to
-`query.max_memory_bytes` (1 GiB) each in ClickHouse, run read-only, and are
-stopped there after the client timeout or when the client goes away.
+Read-API queries are limited to `query.max_concurrent` (8) at once and to
+`query.max_memory_bytes` (1 GiB) each in ClickHouse, with at most 4 threads,
+run read-only, and are stopped there after `max_execution_time` (the
+ClickHouse timeout less 5 s) or when the client goes away; a response
+streams for as long as its client keeps reading. Size the two so that their
+product is at most about a third of what ClickHouse may use
+(`max_server_memory_usage`, by default 90% of its RAM; less if others, such
+as Grafana, query it too): the rest is for its caches, inserts and merges.
+The defaults (8 GiB) are for a large ClickHouse; the Helm chart sets them
+for the ClickHouse it deploys (273 MiB and 2 for its 2Gi). A query that
+would need more fails (502) instead of taking that memory from ingest.
 
 **Enrichment.** Every hop gets its origin AS (`hop_asn`, `hop_as_name`) from
 the [iptoasn](https://iptoasn.com) database, downloaded daily and cached on

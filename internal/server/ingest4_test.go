@@ -178,14 +178,14 @@ func (c *commitFailStore) InsertJSON(ctx context.Context, table string, rows [][
 	return nil
 }
 
-// paramStore is a fakeStore that keeps the parameters of its queries.
-type paramStore struct {
+// outageParamStore is a fakeStore that keeps the parameters of its queries.
+type outageParamStore struct {
 	*fakeStore
 	mu     sync.Mutex
 	params map[string][]clickhouse.Params // by query
 }
 
-func (p *paramStore) Query(ctx context.Context, q string, params clickhouse.Params, row func(json.RawMessage) error) error {
+func (p *outageParamStore) Query(ctx context.Context, q string, params clickhouse.Params, row func(json.RawMessage) error) error {
 	p.mu.Lock()
 	p.params[q] = append(p.params[q], params)
 	p.mu.Unlock()
@@ -197,7 +197,7 @@ func (p *paramStore) Query(ctx context.Context, q string, params clickhouse.Para
 // The lookup used to read every outage of the stream, one per two cycles
 // for a stream that flaps (or that someone makes flap).
 func TestRestoreOutageLookupBounded(t *testing.T) {
-	st := &paramStore{fakeStore: newFakeStore(), params: map[string][]clickhouse.Params{}}
+	st := &outageParamStore{fakeStore: newFakeStore(), params: map[string][]clickhouse.Params{}}
 	in := NewIngester(st, nil, quietLogger(), nil)
 	ingestOK := func(recs ...*record.Record) {
 		t.Helper()

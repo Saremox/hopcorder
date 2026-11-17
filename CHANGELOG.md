@@ -142,8 +142,32 @@ The section for a version is the text of its GitHub release.
   own logs. Through the compose stack's Grafana one anonymous viewer sent
   1,200 queries/s, about 0.45 MB/s with the chart's logging: keep untrusted
   users away from Grafana, or rate-limit it.
-
-<!-- round four: read API -->
+- The read API's views no longer cost ClickHouse up to about 1 GiB a query
+  on data posted to that end: topology, path changes, cycles and the
+  stream list of planted data took 494 to 793 MiB each, and two UI viewers
+  of such a stream got 502 from the chart's ClickHouse; now at most about
+  120 MiB, cut to the views' caps. Topology aggregates at most 20,000
+  distinct nodes and edges and the stream list at most `ingest.max_streams`
+  streams (beyond, the busiest of those ClickHouse came across first), and
+  read queries use at most 4 threads.
+- Helm: with `clickhouse.deploy`, the chart sets `query.max_concurrent` to 2
+  and `query.max_memory_bytes` so that reads get a third of what the bundled
+  ClickHouse may use (273 MiB a query for its 2Gi; they were 8 x 1 GiB),
+  unless `config.query` sets them. With your own ClickHouse, keep their
+  product to about a third of its memory: the defaults are for a large one.
+- Streamed read-API responses are no longer cut off 30 s after their query
+  started (the ClickHouse timeout also covered reading the result): slow
+  clients get them whole. A result cut off inside a row is an error, not a
+  row.
+- Helm: `allowedHosts` and `config.allowed_hosts` are checked as the server
+  checks them, so `10.0.0.5:8080`, `cafe:443` or a 300-character name fail
+  the install instead of crash-looping the server.
+- `allowed_hosts` refuses a wildcard on a top-level domain (`*.com` allowed
+  every `.com` name, an attacker's too). Use `*.domain` only for a domain
+  whose names only you can create, not a shared one such as `*.github.io`.
+- The read API answers 400 to `from`/`to` outside 1970 to 2262 or more than
+  400 days apart (they gave 502 and an error in the log), and its responses
+  carry `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
 **Security: agent**
 
