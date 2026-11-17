@@ -84,7 +84,6 @@ The section for a version is the text of its GitHub release.
   path's hops, not to their square: 20,000 cycles of 255 answering hops
   took 3.1 GiB and 29 s, more than a read query may use (1 GiB), so long
   paths, real or sent to that end, broke the view; now 49 MiB and 0.4 s.
-
 - Grafana's read-only ClickHouse user (the compose stack's, and the server
   chart's `clickhouse.deploy.readOnlyUser`) has `readonly = 1`: its queries
   may change `max_execution_time` (up to 300 s; the Grafana plugin sends it)
