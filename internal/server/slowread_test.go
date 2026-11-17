@@ -17,15 +17,28 @@ import (
 // smallSendBuffers gives accepted connections small kernel send buffers, so
 // a response stalls after some KiB on a client that does not read, rather
 // than after megabytes.
-type smallSendBuffers struct{ net.Listener }
+type smallSendBuffers struct {
+	net.Listener
+	size int
+}
 
 func (l smallSendBuffers) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetWriteBuffer(16 << 10)
+		_ = tc.SetWriteBuffer(l.size)
 	}
 	return c, err
 }
+
+// Socket buffer sizes. stallBuffers makes a client that does not read stall
+// the server after a few KiB. A client that reads needs flowBuffers: above
+// the loopback MSS (64 KiB), since with a receive window below one segment
+// TCP sends only when its persist or retransmission timer fires (hundreds of
+// milliseconds, depending on the kernel), which stalls even a steady reader.
+const (
+	stallBuffers = 16 << 10
+	flowBuffers  = 128 << 10
+)
 
 // bigRows answers queries matching match with n rows of about size bytes
 // of JSON each, and other queries with one small row.
@@ -48,22 +61,22 @@ func bigRows(match string, n, size int) Store {
 	}}
 }
 
-func slowReadServer(t *testing.T, st Store, progress time.Duration) (*Server, *httptest.Server) {
+func slowReadServer(t *testing.T, st Store, progress time.Duration, sendBuf int) (*Server, *httptest.Server) {
 	t.Helper()
 	s := New(Options{Store: st, Logger: quietLogger(), MaxConcurrentQueries: 1})
 	s.writeProgress = progress
 	s.SetReady()
 	ts := httptest.NewUnstartedServer(s.Handler())
-	ts.Listener = smallSendBuffers{ts.Listener}
+	ts.Listener = smallSendBuffers{ts.Listener, sendBuf}
 	ts.Start()
 	t.Cleanup(ts.Close)
 	return s, ts
 }
 
-// dialSmall connects with a small receive buffer (which also stops the
-// kernel from growing it), so what the client does not read stays on the
+// dialSmall connects with a receive buffer of size bytes (which also stops
+// the kernel from growing it), so what the client does not read stays on the
 // server's side.
-func dialSmall(t *testing.T, ts *httptest.Server) *net.TCPConn {
+func dialSmall(t *testing.T, ts *httptest.Server, size int) *net.TCPConn {
 	t.Helper()
 	c, err := net.Dial("tcp", ts.Listener.Addr().String())
 	if err != nil {
@@ -71,7 +84,7 @@ func dialSmall(t *testing.T, ts *httptest.Server) *net.TCPConn {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	tc := c.(*net.TCPConn)
-	if err := tc.SetReadBuffer(16 << 10); err != nil {
+	if err := tc.SetReadBuffer(size); err != nil {
 		t.Fatal(err)
 	}
 	return tc
@@ -82,8 +95,8 @@ func dialSmall(t *testing.T, ts *httptest.Server) *net.TCPConn {
 // writeProgress, instead of holding it for the server's WriteTimeout (with
 // query.max_concurrent such clients kept the read API and the UI at 503).
 func TestNonReadingClientLosesQuerySlot(t *testing.T) {
-	s, ts := slowReadServer(t, bigRows("loop_events", 4000, 1000), 500*time.Millisecond)
-	c := dialSmall(t, ts)
+	s, ts := slowReadServer(t, bigRows("loop_events", 4000, 1000), 500*time.Millisecond, stallBuffers)
+	c := dialSmall(t, ts, stallBuffers)
 	if _, err := io.WriteString(c, "GET /api/v1/query/loops HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -110,8 +123,12 @@ func TestNonReadingClientLosesQuerySlot(t *testing.T) {
 // that takes far longer than writeProgress, also when the server writes it
 // at once (topology): each part has the deadline, not the response.
 func TestSlowReaderGetsWholeResponse(t *testing.T) {
-	_, ts := slowReadServer(t, bigRows("FROM hops", topologyMaxNodes, 1200), 500*time.Millisecond)
-	c := dialSmall(t, ts)
+	// The buffers (a few hundred KiB with the kernel's overhead) hold far less
+	// than the response, so the server's writes wait for the reader for
+	// about a second: longer than writeProgress, which cuts the response off
+	// if it is the deadline of the whole response rather than of each part.
+	_, ts := slowReadServer(t, bigRows("FROM hops", topologyMaxNodes, 1200), 500*time.Millisecond, flowBuffers)
+	c := dialSmall(t, ts, flowBuffers)
 	if _, err := io.WriteString(c, "GET /api/v1/query/topology?agent=lab&target=dc1.example HTTP/1.1\r\n"+
 		"Host: localhost\r\nConnection: close\r\n\r\n"); err != nil {
 		t.Fatal(err)
