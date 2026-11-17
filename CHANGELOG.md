@@ -75,6 +75,11 @@ The section for a version is the text of its GitHub release.
   can), or the server stays unready and says so. Rolling back below this
   release: recreate `agent_seq_mv` first (the statement is in migration
   0004).
+- The server refuses to become ready while `hops_mv` or `loop_events_mv` is
+  missing, naming the migration to recreate it from: a migration that
+  stopped between dropping and recreating a view, followed by a rollback,
+  stored every cycle without hop rows from then on. Later view changes use
+  `ALTER TABLE ... MODIFY QUERY`.
 
 <!-- round four: ingest -->
 

@@ -2623,6 +2623,17 @@ decisions:
     `TestRetryAfterCommittedFailure` (default run: an insert that stores
     and fails; before, the batch's route change and outage were lost),
     `TestWriteSettings`.
+- **Views change with `ALTER TABLE … MODIFY QUERY`, never DROP and CREATE.**
+  Migrations 0002 and 0003 drop and recreate `hops_mv`, assuming no insert
+  can come between: another server can (a rolling upgrade), and stores
+  cycles without hop rows; a migration that dies between the two
+  statements, followed by a rollback to a version that has it recorded as
+  applied, leaves no view, and every cycle from then on has no hop rows,
+  silently. Their comments are corrected; the rule is in `Migrate`'s
+  comment, and `fillViews`' queries change with the views. Migrate also
+  checks at every start that `hops_mv` and `loop_events_mv` exist and
+  `agent_seq_mv` does not, and keeps the server unready otherwise, naming
+  the migration to recreate a view from. Test: `TestMigrateChecksViews`.
 
 <!-- round four: ingest -->
 

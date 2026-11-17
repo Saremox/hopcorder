@@ -3,8 +3,11 @@
 package server
 
 import (
+	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/saremox/hopcorder/internal/record"
 )
 
 // fillViews writes what hops_mv and loop_events_mv would have, and only
@@ -76,5 +79,47 @@ func TestPartFailureMidBatchClickHouse(t *testing.T) {
 	ingestOK(t, in, richRecords("v", 60, 120))
 	for _, d := range agentDiff(t, c, "v", "ref") {
 		t.Error(d)
+	}
+}
+
+// Migrate refuses to call the schema ready while a view that ingest needs
+// is missing (a migration that died between DROP VIEW and CREATE, then a
+// rollback, stored cycles without hop rows from then on) or agent_seq_mv is
+// back.
+func TestMigrateChecksViews(t *testing.T) {
+	c := testClickHouse(t)
+	log := slog.New(slog.DiscardHandler)
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var createHops string
+	for _, m := range migs {
+		for _, s := range m.stmts {
+			if strings.HasPrefix(s, "CREATE MATERIALIZED VIEW IF NOT EXISTS hops_mv") {
+				createHops = s
+			}
+		}
+	}
+	for _, step := range []struct{ sql, want string }{
+		{"DROP VIEW hops_mv", "hops_mv"},
+		{createHops, ""},
+		{"CREATE MATERIALIZED VIEW agent_seq_mv TO agent_seq AS SELECT agent_id, max(seq) AS max_seq FROM cycles GROUP BY agent_id",
+			"agent_seq_mv"},
+		{"DROP VIEW agent_seq_mv", ""},
+	} {
+		if err := c.Exec(t.Context(), step.sql, nil); err != nil {
+			t.Fatal(err)
+		}
+		err := Migrate(t.Context(), c, log)
+		if step.want == "" && err != nil || step.want != "" && (err == nil || !strings.Contains(err.Error(), step.want)) {
+			t.Errorf("after %.40q: Migrate: %v", step.sql, err)
+		}
+	}
+	// And the views work again.
+	in := clickhouseIngester(c)
+	ingestOK(t, in, []*record.Record{mk("lab", 1, pathA...)})
+	if n := count(t, c, "SELECT count() AS n FROM hops"); n != len(pathA) {
+		t.Errorf("%d hop rows", n)
 	}
 }

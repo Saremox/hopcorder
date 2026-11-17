@@ -82,6 +82,13 @@ func splitStatements(sql string) []string {
 // is not recorded in schema_migrations yet, in order. Statements use IF NOT
 // EXISTS, so a migration interrupted half-way is safe to re-run. It then
 // checks what ingest relies on and no migration can restore (checkSchema).
+//
+// A migration that changes a materialized view uses ALTER TABLE ... MODIFY
+// QUERY, never DROP VIEW and CREATE: between those two, inserts of another
+// server (a rolling upgrade) succeed without the view's rows, and a
+// migration that dies there, followed by a rollback to a version that has
+// it recorded as applied, leaves no view at all (0002 and 0003 still did).
+// The ingester's fillViews queries change with the views.
 func Migrate(ctx context.Context, c *clickhouse.Client, log *slog.Logger) error {
 	migs, err := loadMigrations()
 	if err != nil {
@@ -124,12 +131,19 @@ func Migrate(ctx context.Context, c *clickhouse.Client, log *slog.Logger) error 
 	return checkSchema(ctx, c)
 }
 
+// viewsOfCycles are the materialized views ingest needs on cycles, with the
+// migration that defines each: a cycle's hop and loop rows are written only
+// by them (and by the ingester's fillViews after a failed insert).
+var viewsOfCycles = []struct{ name, migration string }{
+	{"hops_mv", "0003_hop_loop_ttls.sql"}, {"loop_events_mv", "0001_init.sql"},
+}
+
 // checkSchema refuses (the server then stays unready, and says why) what
-// would make ingest lose rows without an error: agent_seq_mv back (it moved
-// the mark past cycles whose hop rows a later view failed to write; the
-// server writes agent_seq since 0004), or a ClickHouse user that cannot
-// stop its own queries (the ingester stops a timed-out insert before it
-// looks at what the insert stored).
+// would make ingest lose rows without an error: a view of cycles missing,
+// agent_seq_mv back (it moved the mark past cycles whose hop rows a later
+// view failed to write; the server writes agent_seq since 0004), or a
+// ClickHouse user that cannot stop its own queries (the ingester stops a
+// timed-out insert before it looks at what the insert stored).
 func checkSchema(ctx context.Context, c *clickhouse.Client) error {
 	type row struct {
 		Views []string `json:"dependencies_table"`
@@ -142,6 +156,13 @@ func checkSchema(ctx context.Context, c *clickhouse.Client) error {
 	var views []string
 	if len(rows) == 1 {
 		views = rows[0].Views
+	}
+	for _, v := range viewsOfCycles {
+		if !slices.Contains(views, v.name) {
+			return fmt.Errorf("materialized view %s of cycles is missing, so cycles would be stored without its rows "+
+				"(did a migration stop half-way, and a version that skips it run since?): create it as "+
+				"internal/server/migrations/%s does, then restart", v.name, v.migration)
+		}
 	}
 	if slices.Contains(views, "agent_seq_mv") {
 		return errors.New("materialized view agent_seq_mv exists again (recreated for a rollback?): " +
