@@ -3,6 +3,8 @@
 // loop. AS numbers and addresses are documentation values; e2e/asn.tsv maps
 // them to AS names.
 
+import { createHash } from 'node:crypto'
+
 export const TARGET = 'demo.example'
 export const DEST = '203.0.113.10'
 export const STEP_MS = 5000
@@ -46,7 +48,13 @@ export function record(agent: string, seq: number, ts: number, spec: Spec) {
   const seen = new Map<string, number[]>()
   for (const h of hops) if (h.status === 'ttl-expired' && h.ip) seen.set(h.ip, [...(seen.get(h.ip) ?? []), h.ttl])
   const loops = [...seen].filter(([, t]) => t.length > 1).map(([ip, ttls]) => ({ ip, ttls }))
-  const answered = hops.filter((h) => h.ip).map((h) => h.ip)
+  // As the agent computes it (record.PathHash), which the server checks: the
+  // first 16 hex digits of the SHA-1 of the hops' addresses, "*" for a hop
+  // without a reply, joined by "|".
+  const pathHash = createHash('sha1')
+    .update(hops.map((h) => h.ip ?? '*').join('|'))
+    .digest('hex')
+    .slice(0, 16)
   return {
     schema: 1,
     agent_id: agent,
@@ -59,7 +67,7 @@ export function record(agent: string, seq: number, ts: number, spec: Spec) {
     flow_id: 33434,
     reached: hops.some((h) => h.status === 'reply'),
     path_len: hops.length,
-    path_hash: answered.join('>').slice(0, 16).padEnd(16, '0'),
+    path_hash: pathHash,
     loops,
     hops,
   }
