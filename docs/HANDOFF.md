@@ -843,8 +843,9 @@ added in the commit that introduced it.
   stream-sticky routing first. The chart owns `listen`, the ASN cache path
   (an emptyDir, or a PVC with `persistence.enabled`), `password_file` (with
   `clickhouse.passwordSecret` or `clickhouse.deploy`) and, with
-  `clickhouse.deploy`, `clickhouse.url` and `clickhouse.user`; everything else
-  in `values.config` is the server's config file as-is.
+  `clickhouse.deploy`, `clickhouse.url` and `clickhouse.user`, and, unless
+  `config.allowed_hosts` is set, `allowed_hosts` (round three); everything
+  else in `values.config` is the server's config file as-is.
 - **Bundled ClickHouse (opt-in, `clickhouse.deploy.enabled`)**, added after
   v0.1.1 for deployments where hopcorder is a monitoring aid: a one-replica
   StatefulSet of the official `clickhouse/clickhouse-server` image (25.8, the
@@ -1111,8 +1112,8 @@ decisions:
   most once a minute). Default without the option: on a loopback listen
   address, `localhost`, `127.0.0.1`, `::1` and the listen host; on any other
   address no check, because the server is reached under service names, pod
-  IPs and ingress hosts it cannot know (Helm, containers). `"*"` turns it
-  off. `/healthz`, `/readyz` and `/metrics` answer every host (probes and
+  IPs and ingress hosts it cannot know (Helm, containers; the server chart
+  sets the list since round three). `"*"` turns it off. `/healthz`, `/readyz` and `/metrics` answer every host (probes and
   scrapers use addresses). A proxy on the same host that passes the client's
   Host on (Caddy, Traefik; nginx sends the upstream's by default) needs its
   public names listed. The compose stack's server listens on 0.0.0.0 in its
@@ -1585,6 +1586,47 @@ high-severity issue. Four fixes followed. The decisions:
     `deploy/helm/ci/smoke.sh` runs spill settings as the chart's user in
     kind, and the CI `helm` job checks that the rendered `readonly.xml`
     makes them constant.
+- **The server chart sets `allowed_hosts`.** The chart listens on 0.0.0.0,
+  where the server's default is no Host check, and its NOTES send the
+  operator to `kubectl port-forward` and `http://127.0.0.1:8080/ui/`; port
+  forwarding passes the Host header through, so a page whose name was
+  rebound to 127.0.0.1 read the read API and posted records (reproduced:
+  `{"accepted":1}` for seq 2^64-1 under a real agent_id, which 409s that
+  agent for good). Round two's fix did not cover the documented Helm path.
+  The chart now renders `allowed_hosts`: `localhost`, `127.0.0.1`, `::1`
+  (the port-forward), `<fullname>`, `<fullname>.<ns>`, `<fullname>.<ns>.svc`
+  and `<fullname>.<ns>.svc.<clusterDomain>` (the agents; `clusterDomain`,
+  default `cluster.local`, is a new value), the ingress hosts, and the new
+  `allowedHosts` value for other names; `"*"` in it renders `["*"]`, no
+  check. A `config.allowed_hosts` of the operator's own is used as it is.
+  The list matches names without port, so every Service port works.
+  - Nothing that worked stops: kubelet probes (Host = pod IP) and Prometheus
+    (pod IP) only use `/healthz`, `/readyz` and `/metrics`, which round two
+    already exempted; agents use the Service's names; the smoke test uses
+    the port-forward. In kind the smoke test checks that a foreign Host gets
+    421 while `/readyz` and `/metrics` answer under a pod-IP Host, and that
+    exactly that one request was refused
+    (`hopcorder_server_host_refused_total`).
+  - Names the chart cannot know: a NodePort or LoadBalancer Service (node
+    and load-balancer addresses, external DNS names) and an ingress rule
+    without host (any name). For those the chart fails at template time
+    until `allowedHosts` lists something: an upgrade stops with the
+    instructions instead of agents getting 421 at run time. Other ways in
+    that the chart does not render (a second Ingress, a Gateway, a proxy
+    that passes the client's Host on, pod IPs) are refused with 421 and
+    logged with the Host, once a minute; they go into `allowedHosts`.
+  - Wildcard ingress hosts (`*.example.net`) would have made the server
+    refuse its config, so `allowed_hosts` now accepts `*.domain`: names one
+    label below the domain, as Kubernetes routes them (not `example.net`
+    itself, not `a.b.example.net`). Safe for the same reason as a listed
+    name: a rebinding page sends its own name, which an attacker cannot put
+    under the operator's domain.
+  - NOTES print the list (or warn when it is `*`). Entries are checked at
+    template time (host name, `*.domain` or address, no port), so a bad one
+    fails the install instead of crash-looping the server.
+  - Tests: `TestHostCheck` and `TestHostAllowlist` cover `*.domain`; the CI
+    `helm` job renders the list (service names, ingress host, extra names,
+    `*`, `config.allowed_hosts`) and the refusals; smoke.sh as above.
 
 **Agent**
 

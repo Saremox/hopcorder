@@ -14,11 +14,15 @@ import (
 // internal address through DNS rebinding (its own name resolving to the
 // server's address): the browser still sends the page's host name. Health
 // and metrics endpoints answer any host (probes and scrapers use addresses).
+//
+// An entry "*.example.net" allows the names one label below example.net,
+// as an Ingress host of that form routes them.
 type hostCheck struct {
-	allowed map[string]bool
-	next    http.Handler
-	s       *Server
-	warned  atomic.Int64 // unix seconds of the last warning
+	allowed  map[string]bool
+	wildcard []string // ".example.net" for "*.example.net"
+	next     http.Handler
+	s        *Server
+	warned   atomic.Int64 // unix seconds of the last warning
 }
 
 // hostExempt are the paths served whatever the Host header says.
@@ -30,13 +34,32 @@ func newHostCheck(s *Server, hosts []string, next http.Handler) http.Handler {
 	}
 	h := &hostCheck{allowed: map[string]bool{}, next: next, s: s}
 	for _, name := range hosts {
-		h.allowed[hostName(name)] = true
+		name = hostName(name)
+		if domain, ok := strings.CutPrefix(name, "*."); ok {
+			h.wildcard = append(h.wildcard, "."+domain)
+			continue
+		}
+		h.allowed[name] = true
 	}
 	return h
 }
 
+// allows reports whether host (a Host header) is allowed.
+func (h *hostCheck) allows(host string) bool {
+	name := hostName(host)
+	if h.allowed[name] {
+		return true
+	}
+	for _, domain := range h.wildcard {
+		if label, ok := strings.CutSuffix(name, domain); ok && label != "" && !strings.Contains(label, ".") {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *hostCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if hostExempt[r.URL.Path] || h.allowed[hostName(r.Host)] {
+	if hostExempt[r.URL.Path] || h.allows(r.Host) {
 		h.next.ServeHTTP(w, r)
 		return
 	}

@@ -29,6 +29,19 @@ The section for a version is the text of its GitHub release.
   a query fails at the memory limit instead. Compose: re-run
   `deploy/compose/clickhouse-init.sql` on an existing volume (it now replaces
   the profile).
+- Helm: the server is protected against DNS rebinding. While `kubectl
+  port-forward` ran, as the chart's notes suggest, a web page whose name
+  resolved to 127.0.0.1 could read the read API and post records (a seq of
+  2^64-1 locked its agent out with 409). The chart now sets `allowed_hosts`
+  to `localhost`, `127.0.0.1`, `::1`, the Service's names and the ingress
+  hosts; other Host names get 421, `/healthz`, `/readyz` and `/metrics`
+  still answer any. Upgrading: list the other names clients use (another
+  ingress or gateway, a NodePort or LoadBalancer address) in the new
+  `allowedHosts` value; the chart refuses NodePort and LoadBalancer Services
+  and ingress rules without host until you do (`["*"]` turns the check off).
+  A `config.allowed_hosts` of your own replaces the chart's list.
+- `allowed_hosts` takes `*.example.net` (one label below `example.net`, as
+  an Ingress host of that form), so wildcard ingress hosts work.
 
 **Security: agent**
 

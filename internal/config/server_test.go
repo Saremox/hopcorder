@@ -131,18 +131,22 @@ func TestHostAllowlist(t *testing.T) {
 			t.Errorf("listen %s, allowed_hosts %v: %v, want %v", tc.listen, tc.hosts, got, tc.want)
 		}
 	}
-	c, err := ParseServer([]byte(`allowed_hosts: ["hopcorder.example:8080", "http://x", "", "[::1]", "192.0.2.1", "*"]`))
+	c, err := ParseServer([]byte(`allowed_hosts: ["hopcorder.example:8080", "http://x", "", "[::1]", "192.0.2.1", "*",
+  "*.lab.example", "*.", "*.*.example", "a.*.example", "*example"]`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = c.Finalize()
-	for _, bad := range []string{`"hopcorder.example:8080"`, `"http://x"`, `""`} {
+	for _, bad := range []string{`"hopcorder.example:8080"`, `"http://x"`, `""`, `"*."`, `"*.*.example"`,
+		`"a.*.example"`, `"*example"`} {
 		if err == nil || !strings.Contains(err.Error(), "allowed_hosts "+bad) {
 			t.Errorf("%s accepted: %v", bad, err)
 		}
 	}
-	if err != nil && (strings.Contains(err.Error(), `"[::1]"`) || strings.Contains(err.Error(), `"192.0.2.1"`)) {
-		t.Errorf("addresses refused: %v", err)
+	for _, good := range []string{`"[::1]"`, `"192.0.2.1"`, `"*.lab.example"`} {
+		if err != nil && strings.Contains(err.Error(), good) {
+			t.Errorf("%s refused: %v", good, err)
+		}
 	}
 }
 

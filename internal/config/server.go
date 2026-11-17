@@ -56,10 +56,11 @@ type ServerConfig struct {
 
 	// AllowedHosts are the host names that requests may carry in their
 	// Host header (any port), against DNS rebinding: a web page whose own
-	// name resolves to the server's address still sends that name. Empty:
-	// localhost, 127.0.0.1, ::1 and the listen host when listening on a
-	// loopback address, else no check (see HostAllowlist). "*" turns the
-	// check off.
+	// name resolves to the server's address still sends that name.
+	// "*.example.net" allows the names one label below example.net (like an
+	// Ingress host). Empty: localhost, 127.0.0.1, ::1 and the listen host
+	// when listening on a loopback address, else no check (see
+	// HostAllowlist). "*" turns the check off.
 	AllowedHosts []string `yaml:"allowed_hosts"`
 }
 
@@ -228,7 +229,7 @@ func (c *ServerConfig) Finalize() error {
 	}
 	for _, h := range c.AllowedHosts {
 		if !validAllowedHost(h) {
-			fail("allowed_hosts %q: want a host name or IP address without port, or \"*\"", h)
+			fail("allowed_hosts %q: want a host name (or *.domain) or IP address without port, or \"*\"", h)
 		}
 	}
 	switch c.Log.Level {
@@ -325,7 +326,7 @@ func (c *ServerConfig) HostAllowlist() []string {
 }
 
 // validAllowedHost accepts "*", an IP address (IPv6 with or without
-// brackets) or a host name.
+// brackets), a host name or "*." and a host name.
 func validAllowedHost(h string) bool {
 	if h == "*" {
 		return true
@@ -333,6 +334,7 @@ func validAllowedHost(h string) bool {
 	if _, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")); err == nil {
 		return true
 	}
+	h = strings.TrimPrefix(h, "*.")
 	return h != "" && len(h) <= 253 && !strings.ContainsFunc(h, func(c rune) bool {
 		alnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 		return !alnum && c != '.' && c != '-' && c != '_'

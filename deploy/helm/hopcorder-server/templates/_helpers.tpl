@@ -75,6 +75,43 @@ upgrade keeps it), else a new random one. Takes (list $ secretName).
 {{- end }}
 {{- end }}
 
+{{/*
+The Host names the server answers, against DNS rebinding (allowedHosts in
+values.yaml), as a YAML list: the localhost names (kubectl port-forward), the
+Service's names, the ingress hosts and allowedHosts; or ["*"] (no check) if
+allowedHosts has "*". With an ingress rule without host, or a NodePort or
+LoadBalancer Service, the chart cannot know the names clients use, so
+allowedHosts must list them.
+*/}}
+{{- define "hopcorder-server.allowedHosts" -}}
+{{- $extra := .Values.allowedHosts | default list }}
+{{- if has "*" $extra }}
+{{- list "*" | toYaml }}
+{{- else }}
+{{- $full := include "hopcorder-server.fullname" . }}
+{{- $ns := .Release.Namespace }}
+{{- $hosts := list "localhost" "127.0.0.1" "::1" $full (printf "%s.%s" $full $ns) (printf "%s.%s.svc" $full $ns) (printf "%s.%s.svc.%s" $full $ns (.Values.clusterDomain | default "cluster.local")) }}
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+{{- if .host }}
+{{- $hosts = append $hosts .host }}
+{{- else if not $extra }}
+{{- fail "ingress.hosts: a rule without host answers any name: list the names clients use in allowedHosts (the server answers only the names it knows, against DNS rebinding), or set allowedHosts to [\"*\"] to turn that check off" }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and (has .Values.service.type (list "NodePort" "LoadBalancer")) (not $extra) }}
+{{- fail (printf "service.type %s: list the names and addresses clients use for it in allowedHosts (the server answers only the names it knows, against DNS rebinding), or set allowedHosts to [\"*\"] to turn that check off" .Values.service.type) }}
+{{- end }}
+{{- range $h := concat $hosts $extra }}
+{{- if not (regexMatch "^((\\*\\.)?[A-Za-z0-9_-][A-Za-z0-9._-]*|\\[?[0-9A-Fa-f:.]+\\]?)$" (toString $h)) }}
+{{- fail (printf "allowedHosts: %q is not a host name (or *.domain) or IP address without port" (toString $h)) }}
+{{- end }}
+{{- end }}
+{{- concat $hosts $extra | uniq | toYaml }}
+{{- end }}
+{{- end }}
+
 {{/* The configuration file: the user's config plus what the chart owns. */}}
 {{- define "hopcorder-server.config" -}}
 {{- if (default dict .Values.config.clickhouse).password }}
@@ -82,6 +119,9 @@ upgrade keeps it), else a new random one. Takes (list $ secretName).
 {{- end }}
 {{- $cfg := deepCopy .Values.config }}
 {{- $_ := set $cfg "listen" (printf "0.0.0.0:%d" (int .Values.service.port)) }}
+{{- if not $cfg.allowed_hosts }}
+{{- $_ := set $cfg "allowed_hosts" (include "hopcorder-server.allowedHosts" . | fromYamlArray) }}
+{{- end }}
 {{- $ch := default dict $cfg.clickhouse }}
 {{- if .Values.clickhouse.deploy.enabled }}
 {{- $_ := set $ch "url" (printf "http://%s:8123" (include "hopcorder-server.clickhouseName" .)) }}

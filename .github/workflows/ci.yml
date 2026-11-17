@@ -278,6 +278,24 @@ jobs:
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.user=a-b
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'clickhouse.deploy.readOnlyUser.name=x</y'
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'config.clickhouse.database=x;y'
+          # DNS rebinding: the server answers the localhost names (kubectl
+          # port-forward), the Service's names and the ingress hosts, or
+          # what config.allowed_hosts says; names it cannot know must be
+          # listed (smoke.sh checks a foreign Host gets 421).
+          hosts() { helm template a deploy/helm/hopcorder-server -n mon --show-only templates/configmap.yaml "$@" |
+            sed -n '/^    allowed_hosts:/,/^    [a-z]/p'; }
+          ing=(--set ingress.enabled=true) # values.yaml's example host, hopcorder.example.net
+          for h in localhost 127.0.0.1 ::1 a-hopcorder-server a-hopcorder-server.mon a-hopcorder-server.mon.svc \
+            a-hopcorder-server.mon.svc.cluster.local hopcorder.example.net extra.example; do
+            hosts "${ing[@]}" --set 'allowedHosts={extra.example}' | grep -qxF -- "    - $h" || { echo "allowed_hosts lacks $h"; exit 1; }
+          done
+          test "$(hosts --set 'allowedHosts={*}' | grep -c -- '^    - ')" = 1
+          test "$(hosts --set 'config.allowed_hosts={only.example}' | grep -- '^    - ')" = "    - only.example"
+          refused deploy/helm/hopcorder-server --set service.type=LoadBalancer
+          refused deploy/helm/hopcorder-server --set service.type=NodePort
+          refused deploy/helm/hopcorder-server "${ing[@]}" --set-json 'ingress.hosts=[{"host":"","paths":[{"path":"/","pathType":"Prefix"}]}]'
+          refused deploy/helm/hopcorder-server --set 'allowedHosts={hopcorder.example.net:8080}'
+          helm template a deploy/helm/hopcorder-server --set service.type=LoadBalancer --set 'allowedHosts={192.0.2.7}' >/dev/null
           # The bundled ClickHouse's read-only user cannot change the
           # settings that spill temporary data to disk (smoke.sh runs them).
           ch=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --show-only templates/clickhouse.yaml)

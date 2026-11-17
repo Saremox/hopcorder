@@ -13,6 +13,20 @@ Point agents at http://{{ include "hopcorder-server.fullname" . }}.{{ .Release.N
 
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "hopcorder-server.fullname" . }} 8080:{{ .Values.service.port }}
   open http://127.0.0.1:8080/ui/
+{{- $hosts := (include "hopcorder-server.config" . | fromYaml).allowed_hosts }}
+{{- if has "*" $hosts }}
+
+The server answers requests for any Host name (allowedHosts or config.allowed_hosts
+has "*"): a web page you visit can reach it through DNS rebinding, e.g. while the
+port-forward runs.
+{{- else }}
+
+Against DNS rebinding, the server answers only these Host names (any port; others
+get 421, but /healthz, /readyz and /metrics answer any); add the other names
+clients use to allowedHosts:
+
+  {{ join " " $hosts }}
+{{- end }}
 
 hopcorder does no authentication: secure ingest and the UI at your ingress.
 Clients inside the cluster reach the Service directly, around the ingress:

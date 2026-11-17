@@ -12,7 +12,8 @@ fullnameOverride: ""
 
 # The server's configuration file (see deploy/server.example.yaml for every
 # key; unknown keys are rejected). The chart sets listen, the ASN cache file,
-# with clickhouse.passwordSecret or clickhouse.deploy clickhouse.password_file,
+# allowed_hosts unless set here (see allowedHosts below), with
+# clickhouse.passwordSecret or clickhouse.deploy clickhouse.password_file,
 # and with clickhouse.deploy clickhouse.url and clickhouse.user; it refuses
 # clickhouse.password (it would land in a ConfigMap, readable with the
 # built-in view role).
@@ -131,6 +132,22 @@ service:
   type: ClusterIP
   port: 8080
   annotations: {}
+
+# The Host names the server answers (config allowed_hosts, any port), so a
+# web page cannot reach it through DNS rebinding, e.g. while you run
+# `kubectl port-forward` and open the UI on 127.0.0.1: the page's name
+# resolves to 127.0.0.1, but the browser still sends that name. By default
+# the server answers localhost, 127.0.0.1 and ::1, the Service's names
+# (<fullname>, <fullname>.<namespace>, .svc and .svc.<clusterDomain>) and
+# the ingress hosts; other requests get 421. /healthz, /readyz and /metrics
+# answer any name (probes and Prometheus use the pod's address). List here
+# the other names clients use: another Ingress, a Gateway or a proxy that
+# passes the client's Host on, a NodePort or LoadBalancer address (the chart
+# refuses those Service types, and an ingress rule without host, until you
+# do). "*.example.net" allows one label below example.net. ["*"] turns the
+# check off. config.allowed_hosts, if set, replaces all of this.
+allowedHosts: []
+clusterDomain: cluster.local
 
 # hopcorder does no authentication. Secure /api/v1/ingest (agents) and
 # /api/v1/query/ and /ui/ (readers) at the ingress or proxy, e.g. with
