@@ -143,26 +143,38 @@ capabilities to root; give it `NET_RAW` and nothing else. `docker build --target
 ### Kubernetes
 
 Helm charts for both live in [`deploy/helm`](deploy/helm); each release
-publishes them to `oci://ghcr.io/saremox/charts` (and attaches them to the
-GitHub release):
+attaches the packages to the GitHub release and pushes them to
+`oci://ghcr.io/saremox/charts`. Install the release's file: a release
+published with immutable releases on (after v0.1.1) keeps its files, while
+anyone with write access to the repository can replace a chart in ghcr.
+Releases after v0.1.1 have charts that run their images by digest, and that
+`verify` (above) checks like any file:
+
+```bash
+v=0.1.1
+for c in hopcorder-server hopcorder-agent; do
+  curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/$c-$v.tgz"
+done
+sha256sum --ignore-missing -c SHA256SUMS  # from the release, as above
+```
 
 With a ClickHouse of its own (a single pod next to the server, see below):
 
 ```bash
-helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
+helm install hopcorder-server ./hopcorder-server-0.1.1.tgz \
   --set clickhouse.deploy.enabled=true
 ```
 
 Or with an existing ClickHouse:
 
 ```bash
-helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
+helm install hopcorder-server ./hopcorder-server-0.1.1.tgz \
   --set config.clickhouse.url=http://clickhouse.db:8123 \
   --set clickhouse.passwordSecret.name=clickhouse-password
 ```
 
 ```bash
-helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --version 0.1.1 \
+helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   --set server.url=http://hopcorder-server:8080 \
   --set 'config.targets[0].host=example.net' \
   --set 'config.targets[1].host=192.0.2.10' --set 'config.targets[1].protocol=tcp'
@@ -215,13 +227,15 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
   create a pod anywhere can give it any label.
 
 Every value is documented in the charts' `values.yaml`. A chart runs the
-image of its own version; `--set image.tag=main` follows `main` instead (or
-install from `deploy/helm` in a checkout), and `--set
-image.tag=X.Y.Z@sha256:…` pins the digest from the release notes. To check a
-chart first, `helm pull` it, run `gh attestation verify` on the `.tgz` (as
-above) and install that file. CI installs both charts into a
-kind cluster, the server with its own ClickHouse, and checks that records
-arrive.
+image of its own version: a release's chart (after v0.1.1) by the digest it
+was released with (`image.digest`), so moving the image's tag changes
+nothing; a chart from `deploy/helm` in a checkout, by tag. `--set
+image.tag=main` follows `main` instead (a tag of your own replaces the
+digest; `image.tag=X.Y.Z@sha256:…` pins one). The same charts are at
+`oci://ghcr.io/saremox/charts/hopcorder-server` (`--version X.Y.Z`); check
+what `helm pull` downloads with `verify` before you install it. CI installs
+both charts into a kind cluster, the server with its own ClickHouse, and
+checks that records arrive.
 
 ### Privileges: `CAP_NET_RAW`, not root
 
@@ -844,7 +858,8 @@ commit of `main` whose `ci` run succeeded (it waits for one still running),
 above the latest release, and not released before. It then builds, all
 without caches, the images (pushed only as `:sha-<commit>`, by a job that
 may write packages and nothing else) and, in a job without write tokens, the
-Linux binaries, chart packages and checksums. The `publish` job, in the
+Linux binaries, chart packages (which run those images by digest) and
+checksums. The `publish` job, in the
 `release` environment (where required reviewers approve it), checks again,
 attests every release file and both image digests (signed build provenance),
 tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as

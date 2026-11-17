@@ -165,11 +165,13 @@ jobs:
         run: echo "$TARGET=$DIGEST" >> "$GITHUB_OUTPUT"
 
   # The binaries, chart packages, SHA256SUMS and notes. Pull requests and
-  # main: a dry run, nothing is published. A tag: handed to publish as an
-  # artifact. No write token, no caches either way.
+  # main: a dry run with made-up image digests, nothing is published. A tag:
+  # the charts pin the digests the image job pushed, and everything goes to
+  # publish as an artifact. No write token, no caches either way.
+  # It waits for image (skipped on pull requests), whose digests a tag needs.
   release-assets:
-    needs: verify-tag
-    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    needs: [verify-tag, image]
+    if: ${{ !cancelled() && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') && (github.ref_type != 'tag' || needs.image.result == 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -184,17 +186,21 @@ jobs:
         with:
           version: v3.22.1
       - name: build
+        env:
+          AGENT_DIGEST: ${{ needs.image.outputs.agent }}
+          SERVER_DIGEST: ${{ needs.image.outputs.server }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            scripts/release-build.sh "${GITHUB_REF_NAME#v}"
+            scripts/release-build.sh "${GITHUB_REF_NAME#v}" "$AGENT_DIGEST" "$SERVER_DIGEST"
             if [ ! -s notes.md ]; then
               echo "CHANGELOG.md has no section '## ${GITHUB_REF_NAME}'" >&2
               exit 1
             fi
           else
-            scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}"
-            # What publish adds to the notes, with made-up digests.
+            # Made-up digests: these images are not released. Then what
+            # publish adds to the notes.
             zero=sha256:$(printf '%064d' 0)
+            scripts/release-build.sh "0.0.0-dev+${GITHUB_SHA::7}" "$zero" "$zero"
             scripts/release-notes.sh v0.0.0 "$zero" "$zero" >/dev/null
           fi
       - if: github.ref_type == 'tag'

@@ -232,6 +232,10 @@ The section for a version is the text of its GitHub release.
   left uid 1001 owning the binary, and nothing was kept to check. v0.1.1
   has no attestations: its `SHA256SUMS` shows the download is intact, not
   who built it.
+- Helm: a release's charts run its images by digest (`image.digest`), so
+  repointing `:X.Y.Z` in ghcr no longer changes what a verified chart runs.
+  Install the chart `.tgz` from the GitHub release. Charts from a checkout,
+  and `image.tag` set by you, work as before.
 
 ## v0.1.1
 

@@ -39,7 +39,7 @@ cat <<EOF
 **Verify**
 
 Built from commit \`$GITHUB_SHA\` by the \`images\` workflow for \`$tag\`.
-The images, by digest (multi-arch indexes):
+The images, by digest (multi-arch indexes), which the charts below run:
 
 - \`ghcr.io/saremox/hopcorder-agent:$version@$agent\`
 - \`ghcr.io/saremox/hopcorder-server:$version@$server\`
@@ -57,6 +57,5 @@ gh attestation verify oci://ghcr.io/saremox/hopcorder-server@$server $flags
 \`\`\`
 
 Charts: verify \`hopcorder-server-$version.tgz\` or \`hopcorder-agent-$version.tgz\`
-below the same way and install that file. \`--set image.tag=$version@<digest>\`
-pins a chart's image to the digest above.
+below the same way and install that file; it runs the images above by digest.
 EOF

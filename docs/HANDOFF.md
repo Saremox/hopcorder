@@ -836,7 +836,8 @@ added in the commit that introduced it.
   `:latest` (a pre-release only `:<version>`) and pushes the charts with
   that version and appVersion to `oci://ghcr.io/saremox/charts`. Charts
   default to their appVersion as the image tag, so a chart runs the images
-  of its own release.
+  of its own release (since round four by digest: `image.digest`, written
+  into the packages).
 - **Releases**: `release-assets` builds the static Linux binaries (amd64,
   arm64; with the license, README, example configs and systemd units), the
   chart packages and `SHA256SUMS`, with the tag's section of `CHANGELOG.md`
@@ -2138,7 +2139,9 @@ high-severity issue. Four fixes followed. The decisions:
   - Charts: `helm pull`, `gh attestation verify` on the `.tgz` (an OCI
     chart's content layer is that file), then install from the file.
     `--set image.tag=X.Y.Z@sha256:…` pins the image in both charts without
-    a template change.
+    a template change. (Round four: a verified chart still pulled the
+    mutable tag unless one did; a release's charts now carry their images'
+    digests, and README installs the release's `.tgz`.)
   - **No environment-only credential.** Considered: an environment secret
     (a bot's classic PAT, as ghcr takes nothing finer) with a fallback to
     `GITHUB_TOKEN`. It only helps once no other workflow can write the
@@ -2681,3 +2684,23 @@ decisions:
   releases, then `tar --no-same-owner -xzf`; `TestReadmeInstall` fails if a
   README block pipes into tar, unpacks without `--no-same-owner` or before
   a check. Move the examples to v0.1.2 once it is out.
+- **A release's charts run its images by digest.** A verified chart still
+  pulled `:X.Y.Z` (`IfNotPresent`), which any workflow with `packages:
+  write` can repoint, so new nodes would run a replaced root agent.
+  - `release-assets` needs the `image` job and, for a tag, its success; on
+    pull requests (`image` skipped) and main (its result ignored) it runs
+    as before, as the dry run, with made-up digests. A tag's binaries and
+    charts are now built after its images, not alongside.
+  - `release-build.sh` takes both digests, writes them into the packaged
+    charts' `image.digest` and checks that each package renders
+    `ghcr.io/saremox/<chart>:<version>@<digest>`.
+  - Both charts render `repository:appVersion@digest` while `image.tag` is
+    empty, and the tag alone without a digest (a checkout, as before). A
+    tag of your own replaces both: otherwise `--set image.tag=main` with a
+    released chart would run the release by digest while claiming `main`
+    (a reference with both resolves by digest); `tag: X.Y.Z@sha256:…` still
+    pins. A digest that is not `sha256:<64 hex digits>` is refused. ci's
+    helm job checks all four renderings for both charts (the agent in both
+    modes) and the refusal; the dry run renders the packages.
+  - README installs the chart `.tgz` from the release (immutable once
+    published) rather than from ghcr, and checks it with `verify`.

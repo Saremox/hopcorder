@@ -38,7 +38,20 @@ spec:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: server
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- /* The chart's own version by digest (released charts carry
+          it), or the tag given. */}}
+          {{- $digest := .Values.image.digest | default "" }}
+          {{- if and $digest (not (regexMatch "^sha256:[0-9a-f]{64}$" $digest)) }}
+          {{- fail (printf "image.digest: %q is not sha256:<64 hex digits>" $digest) }}
+          {{- end }}
+          {{- $tag := .Values.image.tag }}
+          {{- if not $tag }}
+          {{- $tag = .Chart.AppVersion }}
+          {{- if $digest }}
+          {{- $tag = printf "%s@%s" $tag $digest }}
+          {{- end }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ $tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --config
