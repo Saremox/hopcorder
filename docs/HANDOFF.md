@@ -546,14 +546,17 @@ added in the commit that introduced it.
 - **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
   and the original command-line flags and positional targets are re-applied.
   Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
-  metrics server, schedulers) shuts down as on SIGTERM and starts again with
-  the new config; only the prober and its raw sockets survive. A full
+  metrics, schedulers) shuts down as on SIGTERM and starts again with
+  the new config; only the prober and its raw sockets survive (and, since
+  round three of the security review, the metrics listener while its
+  address is unchanged). A full
   in-process restart was chosen over diffing configs because it applies every
   setting the same way and has one code path; the cost is a pause of about
   one shutdown (≤3s) and Prometheus counters restarting from zero, which
   `rate()` handles. If the new config fails to start, the previous one is
-  started again. Every reload reopens the JSONL file, which makes
-  rename-and-HUP log rotation work.
+  started again (and retried until it starts, since round three). Every
+  reload reopens the JSONL file, which makes rename-and-HUP log rotation
+  work.
 - **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
   outputs get up to 3s to drain what is spooled; whatever is left stays in the
   spool for the next start.
@@ -1914,6 +1917,46 @@ high-severity issue. Four fixes followed. The decisions:
   still not held: round two's reasons stand (TIME_WAIT makes the bind fail
   at random on busy hosts, and with `SO_REUSEADDR` the hold can be shared),
   and against a 1-in-2^32 guess a hold would add little.
+- **A reload never stops the agent, and never frees the metrics port.**
+  `runDaemon` closed the metrics listener on SIGHUP and bound it again only
+  after the outputs and `spool.Open` (whose full read of the spool widens
+  the window). A local user polling `bind()` took the port: the new
+  configuration failed, the revert failed the same way, `superviseDaemon`
+  returned, and the agent exited; with `Restart=always` every restart
+  failed while the port was held, and scrapes got the squatter's numbers
+  (the review won on the first SIGHUP as uid 65534; README tells operators
+  to reload daily from logrotate). Now:
+  - The supervisor owns the listener (`output.MetricsServer`), like the
+    prober. A configuration with the same `metrics.listen` gets the same
+    listener and only swaps what it serves (`Serve(path, metrics)`); while
+    no configuration runs it answers 503, so Prometheus sees `up == 0`.
+  - A new address is bound before the configuration starts, and the old
+    listener is closed only once the new configuration runs; if it fails,
+    the revert finds the old listener still bound. Cost: moving to an
+    address that overlaps the old one on the same port (`127.0.0.1:9469` to
+    `:9469`) fails the bind and is reverted; that needs a restart (README).
+  - Only the first start can end the supervisor. When the revert fails too
+    (anything else that can fail at start: a JSONL directory gone, the
+    spool locked, a certificate unreadable), the previous configuration is
+    retried with a wait doubling from `restartBackoffMin` (1 s) to
+    `restartBackoffMax` (1 min), logging an error each time, until it
+    starts or a reload brings one that does. Nothing is probed meanwhile;
+    retrying rather than probing without outputs, because every record
+    must go through the spool. `runDaemon` returning on its own (it does
+    not today) restarts the configuration the same way.
+  - Accepted: a local user who binds the port before the agent's first
+    start still fails that start (exit 1, systemd retries), as for any
+    service on an unprivileged port; the first start failing loudly is
+    §5.4's rule ("validate the whole config at startup and fail loudly").
+  - Tests (fake prober): TestReloadKeepsTheMetricsPort (a goroutine polls
+    `net.Listen` on the port during the reload; it never binds, the new
+    configuration runs and the port serves the agent's metrics),
+    TestReloadRetriesWhenTheRevertFails (the reload fails, the previous
+    configuration's JSONL directory is gone: the supervisor keeps running,
+    holds the port and answers 503, and resumes once the directory is
+    back), TestReloadMovesTheMetricsAddress, TestMetricsServer. The first
+    two fail against the previous supervisor ("address already in use",
+    and the supervisor exits).
 - **An echo identifier in use stops only its ICMP targets.** Where
   `ping_group_range` admits everyone (systemd's default), a local user who
   bound a ping socket to identifier 33434 before the agent started made

@@ -180,7 +180,7 @@ func startDaemon(t *testing.T, cfg *config.Config, f *probe.Fake) (stop func()) 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	logger := slog.New(slog.DiscardHandler)
-	go func() { done <- runDaemon(ctx, cfg, f, logger) }()
+	go func() { done <- runDaemon(ctx, cfg, f, logger, daemonEnv{}) }()
 	var once sync.Once
 	stop = func() {
 		once.Do(func() {
@@ -515,6 +515,171 @@ func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("supervisor did not stop")
 	}
+}
+
+// supervised runs superviseDaemon with cfg, reloading to whatever next
+// returns, until the returned stop is called (it also is a cleanup).
+func supervised(t *testing.T, cfg *config.Config, next func() *config.Config) (reload chan os.Signal, done chan error, stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	reload = make(chan os.Signal, 1)
+	done = make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() {
+		done <- superviseDaemon(ctx, cfg, fakeNetwork(), reload, func() (*config.Config, error) { return next(), nil }, quiet)
+	}()
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("supervisor: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Error("supervisor did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return reload, done, stop
+}
+
+func running(t *testing.T, done chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		done <- err // for stop
+		t.Fatalf("supervisor exited: %v", err)
+	default:
+	}
+}
+
+// A reload keeps the metrics listener when its address stays the same, so a
+// local process polling bind() on the port finds no moment to take it.
+// Before, the listener was closed for the reload: the squatter won, the new
+// configuration and then the previous one failed to bind, and the agent
+// exited (and served the squatter's numbers on its port).
+func TestReloadKeepsTheMetricsPort(t *testing.T) {
+	dir := t.TempDir()
+	addr := freeAddr(t)
+	a := daemonConfigJSONL(t, dir+"/spool", dir+"/a.jsonl", addr)
+	b := daemonConfigJSONL(t, dir+"/spool", dir+"/b.jsonl", addr)
+	shutdownGrace = time.Second
+	reload, done, stop := supervised(t, a, func() *config.Config { return b })
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/a.jsonl")) >= 2 }, "records")
+
+	var squatter sync.WaitGroup
+	quit := make(chan struct{})
+	var squatted net.Listener
+	squatter.Go(func() {
+		for {
+			select {
+			case <-quit:
+				return
+			default:
+			}
+			if ln, err := net.Listen("tcp", addr); err == nil {
+				squatted = ln
+				return
+			}
+		}
+	})
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool { return len(readRecords(t, dir+"/b.jsonl")) >= 2 }, "records after the reload")
+	close(quit)
+	squatter.Wait()
+	if squatted != nil {
+		_ = squatted.Close()
+		t.Fatal("another process bound the metrics port during the reload")
+	}
+	if m := getMetrics(t, addr); !strings.Contains(m, `hopcorder_build_info{agent_id="r"`) {
+		t.Errorf("the port does not serve the agent's metrics:\n%.300s", m)
+	}
+	running(t, done)
+	stop()
+}
+
+// When a new configuration fails to start and the previous one then fails
+// too (here its JSONL directory went away), the agent keeps running: it
+// retries the previous configuration until it starts, holding the metrics
+// port meanwhile and answering 503. Before, the supervisor returned and the
+// agent exited.
+func TestReloadRetriesWhenTheRevertFails(t *testing.T) {
+	defer func(d time.Duration) { restartBackoffMin = d }(restartBackoffMin)
+	restartBackoffMin = 20 * time.Millisecond
+	dir := t.TempDir()
+	if err := os.Mkdir(dir+"/a", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	addr := freeAddr(t)
+	good := daemonConfigJSONL(t, dir+"/spool", dir+"/a/out.jsonl", addr)
+	bad := daemonConfigJSONL(t, dir+"/spool", dir+"/missing/out.jsonl", addr)
+	shutdownGrace = time.Second
+	reload, done, stop := supervised(t, good, func() *config.Config { return bad })
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/a/out.jsonl")) >= 2 }, "records")
+
+	if err := os.Rename(dir+"/a", dir+"/a.old"); err != nil {
+		t.Fatal(err)
+	}
+	reload <- syscall.SIGHUP
+	time.Sleep(time.Second) // the reload, the revert and several retries fail
+	running(t, done)
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		t.Fatalf("metrics port while retrying: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("metrics while no configuration runs: status %d, want 503", resp.StatusCode)
+	}
+	if ln, err := net.Listen("tcp", addr); err == nil {
+		_ = ln.Close()
+		t.Error("the metrics port was free while retrying")
+	}
+
+	if err := os.Mkdir(dir+"/a", 0o750); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(readRecords(t, dir+"/a/out.jsonl")) >= 2 },
+		"records once the previous configuration can start again")
+	if m := getMetrics(t, addr); !strings.Contains(m, `hopcorder_build_info{agent_id="r"`) {
+		t.Errorf("metrics after the retry:\n%.300s", m)
+	}
+	running(t, done)
+	stop()
+}
+
+// A reload to another metrics address binds the new one before releasing
+// the old, which is free once the new configuration runs.
+func TestReloadMovesTheMetricsAddress(t *testing.T) {
+	dir := t.TempDir()
+	addrA, addrB := freeAddr(t), freeAddr(t)
+	a := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", addrA)
+	b := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", addrB)
+	b.AgentID = "moved"
+	shutdownGrace = time.Second
+	reload, done, stop := supervised(t, a, func() *config.Config { return b })
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/out.jsonl")) >= 2 }, "records")
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool {
+		resp, err := http.Get("http://" + addrB + "/metrics")
+		if err != nil {
+			return false
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return strings.Contains(string(body), `hopcorder_build_info{agent_id="moved"`)
+	}, "metrics on the new address")
+	ln, err := net.Listen("tcp", addrA)
+	if err != nil {
+		t.Errorf("the old metrics address is still bound: %v", err)
+	} else {
+		_ = ln.Close()
+	}
+	running(t, done)
+	stop()
 }
 
 func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Config {

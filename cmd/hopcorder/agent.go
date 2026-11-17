@@ -120,32 +120,76 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// Waits between attempts to start a configuration that ran before but now
+// fails to start (doubling from the first to the second).
+var restartBackoffMin, restartBackoffMax = time.Second, time.Minute
+
 // superviseDaemon runs the daemon and restarts it with a freshly loaded
 // configuration whenever reload fires (SIGHUP). An invalid configuration is
 // logged and the running one is kept. A valid one replaces everything except
-// the prober (raw sockets stay open); the spool persists, so seq continues.
-// If the new configuration then fails to start (say its metrics address is
-// taken), the previous one is started again.
+// the prober (raw sockets stay open) and the metrics listener while its
+// address stays the same; the spool persists, so seq continues.
+//
+// Only the first start can end the supervisor (returning its error); a
+// running agent is never stopped by a reload. If a new configuration fails
+// to start, the previous one is started again, and if that fails too (say
+// its JSONL directory went away), it is retried with a growing wait, until
+// it starts or a reload brings one that does.
 func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, reload <-chan os.Signal,
 	load func() (*config.Config, error), mkLogger func(*config.Config) *slog.Logger) error {
-	var previous *config.Config // set while a reloaded config is being tried
+	s := &supervisor{prober: prober}
+	defer s.closeMetrics()
+	var (
+		good    *config.Config // the configuration that started last; nil before the first start
+		next    = cfg          // the configuration to start
+		backoff time.Duration  // wait before the next start; 0: at once
+	)
 	for {
-		logger := mkLogger(cfg)
-		runCtx, cancel := context.WithCancel(ctx)
-		done := make(chan error, 1)
-		go func() { done <- runDaemon(runCtx, cfg, prober, logger) }()
-
-		var next *config.Config
-		for next == nil {
+		logger := mkLogger(next)
+		if backoff > 0 {
 			select {
-			case err := <-done:
-				cancel()
-				if err != nil && previous != nil && ctx.Err() == nil {
-					logger.Error("new configuration failed to start; reverting to the previous one", "err", err)
-					next, previous = previous, nil
-					continue
+			case <-ctx.Done():
+				return nil
+			case <-reload:
+				if c, err := load(); err != nil {
+					logger.Error("reload: invalid configuration", "err", err)
+				} else {
+					logger.Info("reloading configuration")
+					next, logger = c, mkLogger(c)
 				}
-				return err
+			case <-time.After(backoff):
+			}
+		}
+		r, err := s.start(ctx, next, logger)
+		switch {
+		case ctx.Err() != nil && r != nil:
+			return r.stop() // SIGTERM arrived as it started
+		case ctx.Err() != nil:
+			return nil // SIGTERM arrived during the start
+		case err != nil && good == nil:
+			return err // the first start fails loudly
+		case err != nil && next != good:
+			logger.Error("new configuration failed to start; reverting to the previous one", "err", err)
+			next, backoff = good, 0
+			continue
+		case err != nil:
+			backoff = min(max(2*backoff, restartBackoffMin), restartBackoffMax)
+			logger.Error("cannot start the configuration again; retrying", "err", err, "in", backoff)
+			continue
+		}
+		good, backoff = next, 0
+
+		for r != nil {
+			select {
+			case err := <-r.done:
+				if ctx.Err() != nil {
+					return err
+				}
+				// runDaemon returns on its own only after a failure;
+				// start the configuration again.
+				logger.Error("agent stopped unexpectedly; restarting it", "err", err)
+				backoff = restartBackoffMin
+				r = nil
 			case <-reload:
 				c, err := load()
 				if err != nil {
@@ -153,20 +197,81 @@ func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Probe
 					continue
 				}
 				logger.Info("reloading configuration")
-				cancel()
-				if err := <-done; err != nil {
-					return err
+				if err := r.stop(); err != nil {
+					logger.Error("agent stopped with an error for the reload", "err", err)
 				}
-				next, previous = c, cfg
+				next, r = c, nil
+			case <-ctx.Done():
+				return r.stop()
 			}
 		}
-		cancel()
-		select {
-		case <-ctx.Done():
-			return nil // SIGTERM arrived during the reload
-		default:
+	}
+}
+
+// supervisor owns what superviseDaemon keeps across configurations besides
+// the prober: the metrics listener.
+type supervisor struct {
+	prober  probe.Prober
+	metrics *output.MetricsServer // bound for the running configuration; nil: it has no metrics
+}
+
+// daemonRun is a started runDaemon.
+type daemonRun struct {
+	cancel context.CancelFunc
+	done   chan error
+}
+
+// stop cancels the daemon and returns its error once it has stopped.
+func (r *daemonRun) stop() error {
+	r.cancel()
+	return <-r.done
+}
+
+// start starts runDaemon with cfg and returns once it runs, or its error if
+// it cannot start. cfg's metrics address is bound unless the running
+// configuration's listener has it; a new one is bound before the old one is
+// released, which happens only once cfg runs, so the port is never free
+// and going back to the previous configuration finds its listener.
+func (s *supervisor) start(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*daemonRun, error) {
+	var ms *output.MetricsServer
+	if mc := cfg.Outputs.Metrics; mc != nil {
+		if s.metrics != nil && s.metrics.Addr() == mc.Listen {
+			ms = s.metrics
+		} else {
+			var err error
+			if ms, err = output.ListenMetrics(ctx, mc.Listen, logger); err != nil {
+				return nil, err
+			}
 		}
-		cfg = next
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	r := &daemonRun{cancel: cancel, done: make(chan error, 1)}
+	started := make(chan struct{})
+	go func() {
+		r.done <- runDaemon(runCtx, cfg, s.prober, logger, daemonEnv{metrics: ms, started: func() { close(started) }})
+	}()
+	select {
+	case <-started:
+	case err := <-r.done:
+		cancel()
+		if ms != nil && ms != s.metrics {
+			ms.Close()
+		}
+		if err == nil {
+			err = errors.New("stopped while starting")
+		}
+		return nil, err
+	}
+	if s.metrics != nil && s.metrics != ms {
+		s.metrics.Close()
+	}
+	s.metrics = ms
+	return r, nil
+}
+
+func (s *supervisor) closeMetrics() {
+	if s.metrics != nil {
+		s.metrics.Close()
 	}
 }
 
@@ -329,7 +434,19 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 // stay in the spool.
 var shutdownGrace = 3 * time.Second
 
-func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger) error {
+// daemonEnv is what runDaemon gets from its supervisor.
+type daemonEnv struct {
+	// metrics is the listener for cfg's metrics address, which runDaemon
+	// serves its metrics on (and 503 once it stops) but never closes. If
+	// nil, runDaemon binds the address itself, for as long as it runs.
+	metrics *output.MetricsServer
+	// started, if set, is called once the daemon runs.
+	started func()
+}
+
+// runDaemon runs the agent with cfg until ctx is cancelled. An error means
+// it could not start.
+func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, logger *slog.Logger, env daemonEnv) error {
 	// A flow another process holds stops only its own targets.
 	targets := agentTargets(cfg)
 	holdFlows(prober, targets, logger)
@@ -392,21 +509,17 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	}()
 
 	var observer agent.Observer
+	var metrics *output.Metrics
 	if mc := cfg.Outputs.Metrics; mc != nil {
 		stats, _ := prober.(probe.StatsProvider)
-		m := output.NewMetrics(output.MetricsOptions{
+		metrics = output.NewMetrics(output.MetricsOptions{
 			AgentID: cfg.AgentID, Version: versionString(), Targets: targets, Outputs: names,
 			Spool: sp, Prober: stats,
 		})
-		stopMetrics, err := m.Serve(ctx, mc.Listen, mc.Path, logger)
-		if err != nil {
-			return err
-		}
-		defer stopMetrics()
 		for i := range drainOpts {
-			drainOpts[i].OnError = m.OutputError(names[i])
+			drainOpts[i].OnError = metrics.OutputError(names[i])
 		}
-		observer = m
+		observer = metrics
 	}
 
 	a, err := agent.New(agent.Options{
@@ -415,6 +528,20 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 	})
 	if err != nil {
 		return err
+	}
+	if mc := cfg.Outputs.Metrics; mc != nil {
+		ms := env.metrics
+		if ms == nil {
+			if ms, err = output.ListenMetrics(ctx, mc.Listen, logger); err != nil {
+				return err
+			}
+			defer ms.Close()
+		}
+		ms.Serve(mc.Path, metrics)
+		defer ms.Serve(mc.Path, nil) // 503 until the next configuration runs
+	}
+	if env.started != nil {
+		env.started()
 	}
 
 	// Outputs drain on their own context so they can be stopped after the

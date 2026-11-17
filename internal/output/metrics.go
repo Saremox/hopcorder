@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -173,10 +174,21 @@ func (m *Metrics) Handler() http.Handler {
 // maxMetricsConns caps concurrent connections to the metrics endpoint.
 const maxMetricsConns = 64
 
-// Serve listens on addr and serves the metrics at path. The returned stop
-// function shuts the server down and returns once the listener is closed,
-// so the address can be bound again right away (as a config reload does).
-func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger) (stop func(), err error) {
+// MetricsServer is the metrics endpoint's HTTP server. Its listener
+// outlives configurations: a reload swaps what it serves (Serve), never the
+// socket, so the port is never free for another local process to take
+// (which would make the new configuration, and going back to the old one,
+// fail to bind it, and could serve made-up metrics).
+type MetricsServer struct {
+	addr string
+	srv  *http.Server
+	done chan struct{}
+	mux  atomic.Pointer[http.ServeMux] // nil: no configuration is running
+}
+
+// ListenMetrics binds addr and serves on it. Until Serve installs metrics
+// it answers 503.
+func ListenMetrics(ctx context.Context, addr string, log *slog.Logger) (*MetricsServer, error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -186,24 +198,50 @@ func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger
 	// clients cannot pin goroutines and file descriptors the agent needs
 	// for probing.
 	ln = netutil.LimitListener(ln, maxMetricsConns)
-	mux := http.NewServeMux()
-	mux.Handle(path, m.Handler())
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
+	s := &MetricsServer{addr: addr, done: make(chan struct{})}
+	s.srv = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10}
-	log.Info("serving metrics", "addr", ln.Addr().String(), "path", path)
-	done := make(chan struct{})
+	log.Info("serving metrics", "addr", ln.Addr().String())
 	go func() {
-		defer close(done)
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		defer close(s.done)
+		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server failed", "err", err)
 		}
 	}()
-	return func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-		<-done
-	}, nil
+	return s, nil
+}
+
+// Addr returns the address the server was asked to listen on.
+func (s *MetricsServer) Addr() string { return s.addr }
+
+// Serve makes the server serve m's metrics at path. With m nil it answers
+// 503 instead, while no configuration is running.
+func (s *MetricsServer) Serve(path string, m *Metrics) {
+	if m == nil {
+		s.mux.Store(nil)
+		return
+	}
+	mux := http.NewServeMux()
+	mux.Handle(path, m.Handler())
+	s.mux.Store(mux)
+}
+
+// ServeHTTP implements http.Handler.
+func (s *MetricsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mux := s.mux.Load()
+	if mux == nil {
+		http.Error(w, "the agent is (re)starting", http.StatusServiceUnavailable)
+		return
+	}
+	mux.ServeHTTP(w, r)
+}
+
+// Close shuts the server down and returns once the listener is closed.
+func (s *MetricsServer) Close() {
+	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.srv.Shutdown(sctx)
+	<-s.done
 }
 
 // OutputError counts a failed delivery; pass it as DrainOptions.OnError.

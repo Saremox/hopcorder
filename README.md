@@ -450,9 +450,16 @@ hop addresses.
 - **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent
-  restarts in-process with it (raw sockets stay open, seq continues); if the
-  new configuration cannot start, for example because its metrics address is
-  taken, the previous one is started again. Every reload reopens the JSONL
+  restarts in-process with it (raw sockets stay open, seq continues, and so
+  does the metrics listener while its address is unchanged; a new address is
+  bound before the old one is released). If the new configuration cannot
+  start, for example because its new metrics address is taken, the previous
+  one is started again; if that fails too, it is retried (from 1 s, doubling
+  to a minute) until it starts or another reload brings one that does, with
+  errors in the log and the metrics endpoint answering 503 meanwhile. A
+  reload never stops the agent. Moving the endpoint to another address with
+  the same port (`127.0.0.1:9469` to `:9469`) needs a restart: the new
+  address cannot be bound while the old one is. Every reload reopens the JSONL
   file, so log rotation can rename it and send SIGHUP instead of using
   `copytruncate`:
 

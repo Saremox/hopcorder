@@ -94,6 +94,12 @@ The section for a version is the text of its GitHub release.
   processes from forging TCP replies with `connect()`. IPv6 routers must
   quote the whole probe, as RFC 4443 requires; one that quotes only 8 bytes
   now shows `no-reply`.
+- A reload (SIGHUP) keeps the metrics listener when its address is
+  unchanged, and binds a new address before releasing the old one, so a
+  local user can no longer take the port during a reload, make the agent
+  exit and serve their own metrics. A reload never stops the agent: if the
+  previous configuration cannot start again either, it is retried until it
+  does, while the endpoint answers 503.
 - A local user holding the agent's ICMP echo identifier (one ping socket)
   no longer stops the agent: only the ICMP targets of that `flow_id` wait,
   with an error in the log and `hopcorder_flow_in_use` at 1, and they

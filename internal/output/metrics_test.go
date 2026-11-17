@@ -110,8 +110,7 @@ func TestMetrics(t *testing.T) {
 	}
 }
 
-func TestMetricsServe(t *testing.T) {
-	m := NewMetrics(MetricsOptions{AgentID: "lab"})
+func TestMetricsServer(t *testing.T) {
 	// Find a free port, then serve on it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -119,27 +118,47 @@ func TestMetricsServe(t *testing.T) {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	stop, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler))
+	quiet := slog.New(slog.DiscardHandler)
+	s, err := ListenMetrics(t.Context(), addr, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Get("http://" + addr + "/metrics")
-	if err != nil {
-		t.Fatal(err)
+	get := func(path string) (int, string) {
+		t.Helper()
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(body)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "hopcorder_build_info") {
-		t.Errorf("status %d body %.200s", resp.StatusCode, body)
+	if code, _ := get("/metrics"); code != http.StatusServiceUnavailable {
+		t.Errorf("without metrics: status %d, want 503", code)
 	}
-	if _, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler)); err == nil {
+	// What is served changes; the socket stays.
+	s.Serve("/metrics", NewMetrics(MetricsOptions{AgentID: "one"}))
+	if code, body := get("/metrics"); code != http.StatusOK || !strings.Contains(body, `hopcorder_build_info{agent_id="one"`) {
+		t.Errorf("status %d body %.200s", code, body)
+	}
+	s.Serve("/m2", NewMetrics(MetricsOptions{AgentID: "two"}))
+	if code, body := get("/m2"); code != http.StatusOK || !strings.Contains(body, `hopcorder_build_info{agent_id="two"`) {
+		t.Errorf("after the swap: status %d body %.200s", code, body)
+	}
+	if code, _ := get("/metrics"); code != http.StatusNotFound {
+		t.Errorf("old path after the swap: status %d", code)
+	}
+	if s.Addr() != addr {
+		t.Errorf("Addr() = %s", s.Addr())
+	}
+	if _, err := ListenMetrics(t.Context(), addr, quiet); err == nil {
 		t.Error("second listener on the same address succeeded")
 	}
-	stop()
-	// After stop the address is free again immediately.
-	stop2, err := m.Serve(t.Context(), addr, "/metrics", slog.New(slog.DiscardHandler))
+	s.Close()
+	// After Close the address is free again immediately.
+	s2, err := ListenMetrics(t.Context(), addr, quiet)
 	if err != nil {
-		t.Fatalf("rebind after stop: %v", err)
+		t.Fatalf("rebind after Close: %v", err)
 	}
-	stop2()
+	s2.Close()
 }
