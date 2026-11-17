@@ -232,11 +232,16 @@ func bindTCP(port int, v6 bool) error {
 // picks one) to dst:dport, like `nc -p <port> <dst> <dport>`, and returns
 // it with its local port.
 func connectTCP(port int, dst netip.Addr, dport int) (int, int, error) {
-	family := syscall.AF_INET
-	var local, remote syscall.Sockaddr = &syscall.SockaddrInet4{Port: port}, &syscall.SockaddrInet4{Port: dport, Addr: dst.As4()}
+	// Each family's addresses built in its own branch: As4 panics on an
+	// IPv6 address.
+	var family int
+	var local, remote syscall.Sockaddr
 	if dst.Is6() {
 		family = syscall.AF_INET6
 		local, remote = &syscall.SockaddrInet6{Port: port}, &syscall.SockaddrInet6{Port: dport, Addr: dst.As16()}
+	} else {
+		family = syscall.AF_INET
+		local, remote = &syscall.SockaddrInet4{Port: port}, &syscall.SockaddrInet4{Port: dport, Addr: dst.As4()}
 	}
 	fd, err := syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
