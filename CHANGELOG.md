@@ -142,7 +142,6 @@ The section for a version is the text of its GitHub release.
   own logs. Through the compose stack's Grafana one anonymous viewer sent
   1,200 queries/s, about 0.45 MB/s with the chart's logging: keep untrusted
   users away from Grafana, or rate-limit it.
-
 - The read API's views no longer cost ClickHouse up to about 1 GiB a query
   on data posted to that end: topology, path changes, cycles and the
   stream list of planted data took 494 to 793 MiB each, and two UI viewers
