@@ -1050,10 +1050,10 @@ fixes. The decisions:
   by three pull request jobs (the compose stack for Grafana and the kind test
   for amd64, `image-check` for both platforms). They run in parallel, and
   sharing one build would make two of them wait for it.
-- **Still to do in the repository settings** (not possible from here):
-  enforce the main ruleset (it is disabled), add a tag ruleset limiting who
-  may create `v*` tags, and add required reviewers to the `release`
-  environment.
+- **Repository settings** (not possible from here): enforce the main
+  ruleset, add a tag ruleset limiting who may create `v*` tags, and add
+  required reviewers to the `release` environment. All done; see round
+  three's list.
 - **Exposure in the docs**: the server's `docker run` example and the
   development ClickHouse publish on 127.0.0.1 only (the ClickHouse one had
   host networking with a passwordless default user); since round two the
@@ -1418,9 +1418,9 @@ decisions:
   image, not `:main`, which is built with the shared Actions cache. Chart
   version and appVersion in `Chart.yaml` are 0.1.1, so installs from a
   checkout run 0.1.1 images too.
-- **Still to do in the repository settings** (superseded by round three's
-  list, which makes immutable releases and the tag ruleset required: the
-  `release` environment alone gates nothing for a collaborator):
+- **Repository settings** (superseded by round three's list, which makes
+  immutable releases and the tag ruleset required: the `release`
+  environment alone gates nothing for a collaborator; all done since):
   - Add required reviewers to the `release` environment; until then
     `publish` runs without approval, though after all the checks. (Wrong
     as a gate, round three found: with reviewers too, a collaborator's own
@@ -2248,27 +2248,40 @@ high-severity issue. Four fixes followed. The decisions:
     (ci, `release-build.sh`) read only the `toolchain` line.
   - Only a tag ruleset (a repository setting) keeps stray `v*` tags out;
     nothing in the repository's files can.
-- **Still to do in the repository settings** (the owner; replaces round
+- **Repository settings** (set by the owner on 2026-11-17; replace round
   two's list):
-  - A tag ruleset for `refs/tags/v*` restricting creation, update and
-    deletion, with only the maintainers (the admin role) as bypass, not
-    GitHub Actions or an app. It keeps stray tags out of the Go module proxy
-    and the release workflow, and makes `--source-ref refs/tags/v…` mean a
-    maintainer's tag.
+  - A tag ruleset (`VersionTags`) for `refs/tags/v*` restricting creation,
+    update and deletion, bypassed only by the Repository admin role, not by
+    GitHub Actions or an app. It keeps stray tags out of the Go module
+    proxy and the release workflow, and makes `--source-ref refs/tags/v…`
+    mean a maintainer's tag.
   - Immutable releases: a published release's files and tag can no longer
     change (and `gh release verify` / `gh release verify-asset` check
     GitHub's attestation of the release).
-  - Required reviewers on the `release` environment, and its deployment
-    tag policy limited to `v*`. That gates `images.yml`'s publishing
-    against mistakes and a stray tag run, not against collaborators.
+  - Required reviewers on the `release` environment, whose deployment
+    branches and tags are limited to `v*` tags (no branches). That gates
+    `images.yml`'s publishing against mistakes and a stray tag run, not
+    against collaborators. A release's `publish` job waits for approval
+    under "Review deployments" in its run; with a single maintainer,
+    "Prevent self-review" must stay off.
   - The ghcr packages (`hopcorder-agent`, `hopcorder-server`,
-    `charts/hopcorder-server`, `charts/hopcorder-agent`): under Manage
-    Actions access, only this repository, with no other repository granted
-    write. Read for this repository needs main's images moved first (see
-    the first bullet).
-  - Enforce the main ruleset with `ci` as a required check (from round
-    two).
+    `charts/hopcorder-server`, `charts/hopcorder-agent`): Actions access
+    for this repository only, with the Write role, not Admin (the
+    workflows push, but never delete versions or change a package's
+    settings). Read for this repository needs main's images moved first
+    (see the first bullet).
+  - The main ruleset is enforced: force pushes are blocked, and these
+    checks are required: `test`, `lint`, `vuln`, `rawsock`, `clickhouse`,
+    `grafana`, `ui` and `helm` (ci.yml), `image-check (agent)`,
+    `image-check (server)` and `release-assets` (images.yml). Both
+    workflows run on every pull request without path filters, so each
+    required check reports on each one; the tag-only jobs (`verify-tag`,
+    `image`, `publish`) are skipped on pull requests and not required.
+    Rename a required job and the ruleset must follow, or every pull
+    request waits for a check that never comes. With `vuln` required, a
+    newly published advisory blocks merges until the dependency is
+    updated.
   - Give write access only to people you would let release.
   - Artifact attestations need a public repository (or GitHub Enterprise
-    Cloud): if the repository is private, `publish` fails at the first
-    attest step, before it publishes anything.
+    Cloud): if the repository were private, `publish` would fail at the
+    first attest step, before it publishes anything.
