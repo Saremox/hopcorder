@@ -44,6 +44,8 @@ The section for a version is the text of its GitHub release.
   stored; plan for `max_concurrent` of them. Decoded records no longer keep
   spare capacity, which made it up to 3.6 times.
 
+<!-- round four: ingest -->
+
 **Security: read side and Grafana**
 
 - Grafana's read-only ClickHouse user (the compose stack's, and the server
@@ -83,6 +85,10 @@ The section for a version is the text of its GitHub release.
   took 3.1 GiB and 29 s, more than a read query may use (1 GiB), so long
   paths, real or sent to that end, broke the view; now 49 MiB and 0.4 s.
 
+<!-- round four: grafana user -->
+
+<!-- round four: read API -->
+
 **Security: agent**
 
 - Spoofed packets from anywhere can no longer forge hops, loops or a
@@ -112,6 +118,8 @@ The section for a version is the text of its GitHub release.
   with an error in the log and `hopcorder_flow_in_use` at 1, and they
   resume by themselves once the identifier is free. Every other target is
   probed. `--once` prints the other targets' records and exits 1.
+
+<!-- round four: agent -->
 
 **Security: CI, release and deployment**
 
@@ -147,6 +155,8 @@ The section for a version is the text of its GitHub release.
 - Go: install a released version (`go install …@v0.1.1`), not `@latest`:
   the Go module proxy takes any `v*` tag as a version, released or not, and
   keeps it. `go.mod` retracts the withdrawn v0.1.0.
+
+<!-- round four: deployment -->
 
 ## v0.1.1
 

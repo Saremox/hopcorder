@@ -2285,3 +2285,32 @@ high-severity issue. Four fixes followed. The decisions:
   - Artifact attestations need a public repository (or GitHub Enterprise
     Cloud): if the repository were private, `publish` would fail at the
     first attest step, before it publishes anything.
+
+### Security review, round four
+
+A fourth review of the whole code base (the same four areas, with the
+code added in round three first; every finding reproduced or, where only
+GitHub could confirm it, marked as reasoned) found that Grafana's
+read-only ClickHouse user was not a boundary, and that a batch's events
+and its retries escaped the ingest bounds. Five fixes followed. The
+decisions:
+
+**Grafana's ClickHouse user**
+
+<!-- round four: grafana user -->
+
+**Read API**
+
+<!-- round four: read API -->
+
+**Ingest and storage**
+
+<!-- round four: ingest -->
+
+**Agent**
+
+<!-- round four: agent -->
+
+**CI, release and deployment**
+
+<!-- round four: deployment -->
