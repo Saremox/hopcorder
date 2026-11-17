@@ -846,7 +846,8 @@ added in the commit that introduced it.
   `main` that is a dry run; for a tag the files go to `publish`, which
   attests them and both image digests and creates the GitHub release from
   them, the notes followed by the digests and how to verify them (round
-  three). The binaries and images carry the
+  three; since round four `publish` creates the release as a draft and
+  checks it before publishing). The binaries and images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -2150,7 +2151,11 @@ high-severity issue. Four fixes followed. The decisions:
     packages with `GITHUB_TOKEN`, so that would break main's images, and
     keeping them would take a separate package for main. Release files are
     protected by immutable releases, not by a credential. Left to the
-    owner; not implemented.
+    owner; not implemented. (Round four: once published. Until then anyone
+    with write access can create a release of the pushed tag, or add files
+    to the draft that `gh release create` uploads into, and the release
+    attestation then vouches for those too; `publish` now checks a draft
+    and fails loudly, see round four.)
   - Accepted: whoever can push a workflow file can publish something. The
     defence is detection plus the repository settings.
 - **The tag is checked again once the release exists.** A release belongs
@@ -2160,7 +2165,10 @@ high-severity issue. Four fixes followed. The decisions:
   the release about a minute later. Now it resolves the tag through the API
   after creating the release, peeling an annotated tag. Unless the tag
   names `$GITHUB_SHA`, it deletes the release (the tag stays) and fails; an
-  API error counts as a mismatch. With immutable releases the tag cannot
+  API error counts as a mismatch. (Round four: it peeled one level, so a
+  genuine release of a tag of a tag was deleted, and so was one after any
+  API error. It now peels every level, retries, and deletes only on a
+  confirmed mismatch.) With immutable releases the tag cannot
   move once the release exists, so the check is final. Without them it can
   move later anyway, which only the tag ruleset prevents. The images,
   charts and files stay: they were built and attested from this commit.
@@ -2292,7 +2300,9 @@ high-severity issue. Four fixes followed. The decisions:
     ruleset on all tags is recommended.)
   - Immutable releases: a published release's files and tag can no longer
     change (and `gh release verify` / `gh release verify-asset` check
-    GitHub's attestation of the release).
+    GitHub's attestation of the release). (Round four: that attestation
+    shows a file is part of the release, not who built it; and nothing
+    protects a release before it is published.)
   - Required reviewers on the `release` environment, whose deployment
     branches and tags are limited to `v*` tags (no branches). That gates
     `images.yml`'s publishing against mistakes and a stray tag run, not
@@ -2675,6 +2685,66 @@ decisions:
     a `V` tag, `images.yml.evil.yml`, `imagesXyml.yml`, a branch, another
     commit and another repository fail; no verify runs without the commit;
     round three's flags accept the `V` certificate, as the review found.
+- **The release is published only once it is exactly this run's.**
+  Immutable releases protect a release once it is published, not before.
+  After the tag is pushed, `publish` waits for verify-tag (ci, up to 25
+  minutes), the builds and the approval; meanwhile anyone with write access
+  could create and publish a release of the tag (the tag ruleset is not
+  involved). And `gh release create` with files creates a draft, uploads,
+  then publishes, and a draft can be changed: an added file stays for good.
+  GitHub's attestation of the release then vouches for their files:
+  `gh release verify-asset` checks a SAN of `*.releases.github.com` only,
+  so it proves a file is part of the release, not who built it. Now
+  `scripts/release-publish.sh` (the last step of `publish`):
+  - creates the release with `--draft` and finds it again by its id (`gh
+    release view/edit <tag>` ask for the published release and a draft of
+    the tag at once and take whichever answers first; GitHub allows
+    several drafts of a tag, and a draft next to a published release). It
+    must be the only release of the tag, drafts included.
+  - compares its files with `dist/` by name and GitHub's SHA-256 digest of
+    each asset (uploaded ones; a digest not computed yet is asked for
+    again): none missing, none different, none added; and its tag, title,
+    notes and pre-release flag.
+  - checks the tag (below), publishes by id (`PATCH draft=false`, which is
+    what gh does after uploading; if the answer is lost, the release says
+    whether it was published), then checks the files and the tag again.
+    A warning if GitHub does not report the release as immutable.
+  - Before publishing, any difference deletes this run's draft and fails,
+    saying that someone else created or changed the release, with each
+    asset's uploader; someone else's release stays, to be looked at. After
+    publishing, a difference GitHub confirms deletes the release (the tag
+    stays), as a moved tag did.
+  - `release-verify.sh` says what "a release of vX.Y.Z exists already"
+    means: no run of this workflow published it, so someone else did; look
+    at it, point no one at it, release the next version. A draft (which
+    only `publish` sees) is a cancelled run's or someone else's: look at
+    it, delete it, run `publish` again.
+  - Accepted: someone else's release of a pushed tag, published first, stays
+    and is immutable; `publish` only refuses to add its own and says so.
+    The build provenance tells theirs apart (`verify` fails for files
+    `images.yml` did not build for the tag's commit). Fewer people with
+    write access is the only prevention.
+  - `scripts/publish_test.go` runs the script against a fake GitHub
+    (releases, refs and annotated tags kept between calls; failing calls;
+    someone else acting between the script's calls): a release of the tag
+    published or drafted by someone else, a file added to, replaced in or
+    removed from the draft, its notes changed, a file added and someone
+    else's release published right before publishing, digests computed
+    late, a missing tag. The step it replaces passes none of the
+    someone-else cases.
+- **The tag check peels every annotated tag and deletes only on a confirmed
+  mismatch.** It peeled one level, so a tag of a tag (`git tag -a v0.2.0
+  v0.2.0-rc.1`, about which git only prints a hint) passed every earlier
+  check (`^{commit}` peels fully) and then had its genuine release deleted,
+  after the images, charts and attestations were out; and any API error
+  counted as a mismatch. Now it follows annotated tags (up to 10 levels),
+  tries each API call up to 5 times, 10 s apart, and deletes the release
+  only when GitHub says the tag names something else; when GitHub cannot
+  tell, it fails without deleting and says what to check by hand. It runs
+  before publishing (a moved tag deletes the draft; nothing is published)
+  and after. Tested: lightweight, annotated and nested tags kept; a tag
+  moved before and while publishing; API errors that pass; errors that do
+  not, before (draft deleted) and after publishing (release kept).
 - **Install: download, check, unpack without owners.** README piped
   v0.1.1's archive into `tar -xz`. Its entries belong to 1001/1001 (round
   three's root-owned archives start with the next release), so unpacked as

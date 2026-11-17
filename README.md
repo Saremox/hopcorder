@@ -859,28 +859,41 @@ above the latest release, and not released before. It then builds, all
 without caches, the images (pushed only as `:sha-<commit>`, by a job that
 may write packages and nothing else) and, in a job without write tokens, the
 Linux binaries, chart packages (which run those images by digest) and
-checksums. The `publish` job, in the
-`release` environment (where required reviewers approve it), checks again,
-attests every release file and both image digests (signed build provenance),
-tags the images `:X.Y.Z`, `:X.Y` and `:latest` (a pre-release such as
-`vX.Y.Z-rc.1` only `:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and
-creates the GitHub release, whose notes get the image digests and the
-`gh attestation verify` commands
-([`scripts/release-notes.sh`](scripts/release-notes.sh)). If the tag no longer
-names the commit it built by then, it deletes the release again and fails.
-A version is released once; to fix a release, release the next version. Pull
-requests run all of it but the publishing.
+checksums. The `publish` job, in the `release` environment (where
+required reviewers approve it), checks again, attests every release file
+and both image digests (signed build provenance), tags the images `:X.Y.Z`,
+`:X.Y` and `:latest` (a pre-release such as `vX.Y.Z-rc.1` only
+`:X.Y.Z-rc.1`), pushes the charts with version X.Y.Z and creates the GitHub
+release, whose notes get the image digests and the `gh attestation verify`
+commands ([`scripts/release-notes.sh`](scripts/release-notes.sh)). It
+creates the release as a draft and publishes it only if the draft is the
+only release of the tag, has exactly the files the run built (by name and
+SHA-256: none missing, none changed, none added) and its notes, and the tag
+still names the commit it built, through any number of annotated tags (so
+promoting with `git tag -a v1.0.0 v1.0.0-rc.1` is fine); then it checks all
+that again, and deletes the release if GitHub confirms a difference
+([`scripts/release-publish.sh`](scripts/release-publish.sh)). A version is
+released once; to fix a release, release the next version. Pull requests
+run all of it but the publishing.
 
 What the `release` environment does not do: it gates this workflow's
 `publish` job, not the repository's packages and releases. Anyone with write
 access can push a workflow of their own that asks for `packages: write` and
-`contents: write` and leaves the environment out, and replace the images,
-charts and release files of any version. The attestations show that (a
-replaced file or digest no longer matches one made by `images.yml` for the
-tag), and the repository settings limit it: a tag ruleset for `v*` that only
-the maintainers may bypass (not GitHub Actions), immutable releases, and
-required reviewers on `release`. Give write access only to people you would
-let release.
+`contents: write` and leaves the environment out, and replace the images
+and charts of any version, and the files of a release that is not
+immutable. They can also create a release of a tag that has none yet, and
+change a draft: immutable releases protect a release only once it is
+published. GitHub's attestation of a release (`gh release verify` and
+`verify-asset`) then vouches for their files as well, since it shows that a
+file is part of the release, not who built it. The build provenance shows it
+(a file or digest that `images.yml` did not build for the tag's commit
+fails the `verify` above), and `publish` fails loudly: `a release of vX.Y.Z
+exists already` or `someone else created a release`/`changed the draft`
+means that release is someone else's. Look at it, point no one at it, and
+release the next version. The repository settings limit all this: a tag
+ruleset that only the maintainers may bypass (not GitHub Actions),
+immutable releases, and required reviewers on `release`. Give write access
+only to people you would let release.
 
 ## License
 

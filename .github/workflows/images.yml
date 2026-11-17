@@ -320,33 +320,16 @@ jobs:
           for chart in hopcorder-server hopcorder-agent; do
             helm push "dist/$chart-$version.tgz" oci://ghcr.io/saremox/charts
           done
+      # A draft first, published only once it has exactly this run's files
+      # and the tag still names this commit; checked again once published.
+      # Anyone with write access can create a release of the tag, or change
+      # a draft, before then (scripts/release-publish.sh).
       - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           AGENT_DIGEST: ${{ needs.image.outputs.agent }}
           SERVER_DIGEST: ${{ needs.image.outputs.server }}
         run: |
           scripts/release-notes.sh "$GITHUB_REF_NAME" "$AGENT_DIGEST" "$SERVER_DIGEST" >> notes.md
-          pre=()
-          case $GITHUB_REF_NAME in *-*) pre=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag "${pre[@]}" \
-            --title "hopcorder $GITHUB_REF_NAME" --notes-file notes.md
-          # A release belongs to a tag name, not a commit, and GitHub ignores
-          # --target for a tag that exists: if the tag was moved after this
-          # run checked it, the release now shows another commit. So check
-          # the tag again now that the release exists (with immutable
-          # releases it can no longer move), and take the release down if
-          # it has moved. Its images, charts and files are this commit's.
-          tag_commit() {
-            local obj
-            obj=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type + " " + .object.sha') || return
-            if [ "${obj%% *}" = tag ]; then # annotated: the commit it names
-              obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha') || return
-            fi
-            echo "$obj"
-          }
-          if ! tagged=$(tag_commit) || [ "$tagged" != "commit $GITHUB_SHA" ]; then
-            echo "::error::$GITHUB_REF_NAME is now '${tagged:-unknown}', not commit $GITHUB_SHA, which this run built: deleting the release $GITHUB_REF_NAME again (the tag stays)"
-            gh release delete "$GITHUB_REF_NAME" --yes
-            exit 1
-          fi
+          scripts/release-publish.sh "$GITHUB_REF_NAME"

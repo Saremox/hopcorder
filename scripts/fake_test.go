@@ -2,7 +2,8 @@ package scripts
 
 // A fake gh and git for the release scripts' tests: this test binary, run
 // under the name gh or git (symlinks in a directory put first on PATH).
-// gh only records its arguments ($FAKEGH_LOG), for the README's commands.
+// With $FAKEGH_STATE, gh is a fake GitHub (github_test.go); without, it
+// only records its arguments ($FAKEGH_LOG), for the README's commands.
 
 import (
 	"encoding/json"
@@ -65,6 +66,9 @@ const (
 )
 
 func fakeGH(args []string) int {
+	if path := os.Getenv("FAKEGH_STATE"); path != "" {
+		return githubGH(path, args)
+	}
 	// Record the call (one JSON array per line) and succeed.
 	f, err := os.OpenFile(os.Getenv("FAKEGH_LOG"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
