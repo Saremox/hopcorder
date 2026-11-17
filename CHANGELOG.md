@@ -218,7 +218,6 @@ The section for a version is the text of its GitHub release.
 - Go: install a released version (`go install …@v0.1.1`), not `@latest`:
   the Go module proxy takes any `v*` tag as a version, released or not, and
   keeps it. `go.mod` retracts the withdrawn v0.1.0.
-
 - Verify a release with `--cert-identity
   https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/vX.Y.Z`,
   `--source-ref refs/tags/vX.Y.Z` and `--source-digest` with the tag's
