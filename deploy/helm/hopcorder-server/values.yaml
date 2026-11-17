@@ -84,7 +84,8 @@ clickhouse:
     systemLogRetentionDays: 7
     # A read-only user for Grafana's ClickHouse data source: SELECT on the
     # hopcorder database only, with bounded query time, memory and
-    # concurrency (like deploy/compose/clickhouse-init.sql). Its password
+    # concurrency, and no temporary data on disk (like
+    # deploy/compose/clickhouse-init.sql). Its password
     # comes from passwordSecret or a generated Secret
     # (<release>-hopcorder-server-clickhouse-readonly, key password).
     readOnlyUser:

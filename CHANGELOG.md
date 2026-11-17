@@ -21,7 +21,14 @@ The section for a version is the text of its GitHub release.
 
 **Security: read side and Grafana**
 
-<!-- round three: read side -->
+- Grafana's read-only ClickHouse user (the compose stack's, and the server
+  chart's `clickhouse.deploy.readOnlyUser`) can no longer make ClickHouse
+  spill temporary data to disk: one viewer's query with an external sort or
+  GROUP BY, or a grace_hash or partial_merge join, filled ClickHouse's volume
+  until the server's inserts failed. The spill settings are constant now; such
+  a query fails at the memory limit instead. Compose: re-run
+  `deploy/compose/clickhouse-init.sql` on an existing volume (it now replaces
+  the profile).
 
 **Security: agent**
 

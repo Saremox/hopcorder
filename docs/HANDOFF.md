@@ -874,9 +874,10 @@ added in the commit that introduced it.
     password read from the environment (`from_env`): `GRANT SELECT` on the
     hopcorder database only and the compose stack's bounded profile
     (`readonly = 2`, time, memory and concurrency limits with `MIN 1`, the
-    cancel setting const). Checked on 25.8: it reads the tables, and writes,
-    `system.users`, `url()`, `max_execution_time = 0` and changing the cancel
-    setting are refused.
+    cancel setting and, since round three, the spill settings const).
+    Checked on 25.8: it reads the tables, and writes, `system.users`,
+    `url()`, `max_execution_time = 0`, changing the cancel setting and
+    spilling to disk are refused.
   - Runs as the image's `clickhouse` user (uid 101, `fsGroup` 101) without
     capabilities or privilege escalation; the root file system stays
     writable because the entrypoint writes its user file into
@@ -1543,8 +1544,47 @@ high-severity issue. Four fixes followed. The decisions:
 <!-- round three: ingest -->
 
 **Read side, enrichment and the browser**
-
-<!-- round three: read side -->
+- **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in
+  `deploy/compose/clickhouse-init.sql`, `hopcorder_readonly` in the chart's
+  `readonly.xml`). `readonly = 2` let a query set the spill settings, and
+  ClickHouse wrote the temporary data to its data volume: one
+  `ORDER BY rand()` over `numbers(1e10)` with
+  `max_bytes_before_external_sort` wrote about 100 MB/s, filled a 2 GB
+  volume in 20 s, and the server's inserts failed with NOT_ENOUGH_SPACE
+  (25.8). External GROUP BY and the grace_hash, partial_merge, auto and
+  prefer_partial_merge joins spill the same way.
+  `max_temporary_data_on_disk_size_for_user`/`_for_query` did not hold
+  (temporary data grew past 1.5 GB against a 500 MB cap). Now
+  `max_bytes_before_external_{sort,group_by}` and
+  `max_bytes_ratio_before_external_{sort,group_by}` are `0 CONST`, and
+  `join_algorithm` is `'direct,parallel_hash,hash' CONST` (25.8's default:
+  in-memory joins only). A query that does not fit `max_memory_usage` fails
+  instead, also without settings (the ratios default to 0.5, spilling at
+  half the memory limit). Setting a constant to its own value still works.
+  - Checked on 25.8, for the compose user and for the chart's rendered
+    `readonly.xml`: every variant (sort and GROUP BY by bytes and by ratio,
+    each spilling join algorithm, in the query and as URL parameters) fails
+    with SETTING_CONSTRAINT_VIOLATION and writes no temporary data; switching
+    to the `default` profile does not lift the constraints.
+  - The plugin sends none of these settings: 4.23.5 sends the data source's
+    custom settings (ours has none) and `limit` with a row limit, and
+    clickhouse-go 2.50.0 adds `max_execution_time` from the query's deadline
+    (read in their source). The CI `grafana` job runs every dashboard query
+    through the plugin.
+  - The server's own read queries use the server's user, which has no such
+    profile: unchanged.
+  - The compose profile is created with `OR REPLACE`, so re-running the
+    script on an existing volume applies it (`IF NOT EXISTS` kept the old
+    profile).
+  - Accepted: `system.query_log` keeps each query's text (at most what the
+    client sent; in the chart for `systemLogRetentionDays`), so a viewer can
+    still write to disk at the rate they upload SQL, without amplification.
+  - Tests: `TestGrafanaUserClickHouse` (`clickhouse` tag) creates the
+    compose user from the script, runs every dashboard query with it and
+    every spill variant, which it refused only with the fix;
+    `deploy/helm/ci/smoke.sh` runs spill settings as the chart's user in
+    kind, and the CI `helm` job checks that the rendered `readonly.xml`
+    makes them constant.
 
 **Agent**
 

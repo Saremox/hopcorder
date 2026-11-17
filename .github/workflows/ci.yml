@@ -278,6 +278,13 @@ jobs:
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set clickhouse.deploy.user=a-b
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'clickhouse.deploy.readOnlyUser.name=x</y'
           refused deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --set 'config.clickhouse.database=x;y'
+          # The bundled ClickHouse's read-only user cannot change the
+          # settings that spill temporary data to disk (smoke.sh runs them).
+          ch=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --show-only templates/clickhouse.yaml)
+          for s in max_bytes_before_external_sort max_bytes_ratio_before_external_sort \
+            max_bytes_before_external_group_by max_bytes_ratio_before_external_group_by join_algorithm; do
+            grep -qF "<$s><const/></$s>" <<<"$ch" || { echo "readonly.xml: $s is not constant"; exit 1; }
+          done
       - name: build images
         run: |
           docker build --target server -t hopcorder-server:ci .

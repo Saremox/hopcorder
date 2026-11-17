@@ -36,6 +36,15 @@ for i in $(seq 90); do
         echo "ClickHouse's read-only user can write (or the check failed otherwise): $out"
         exit 1
       fi
+      # Nor can it make ClickHouse spill temporary data to its volume.
+      for s in "max_bytes_before_external_sort = 1000000" "max_bytes_ratio_before_external_group_by = 0.1" \
+        "join_algorithm = 'grace_hash'" "join_algorithm = 'partial_merge'"; do
+        if out=$(chq "SELECT count() FROM numbers(10) SETTINGS $s" 2>&1) ||
+          ! grep -q 'SETTING_CONSTRAINT_VIOLATION' <<<"$out"; then
+          echo "ClickHouse's read-only user may set $s (or the check failed otherwise): $out"
+          exit 1
+        fi
+      done
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then
