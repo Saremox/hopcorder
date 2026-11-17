@@ -731,9 +731,11 @@ source and dashboard from [`deploy/grafana/provisioning`](deploy/grafana/provisi
 ClickHouse data source. Give Grafana a read-only ClickHouse user with bounded
 queries, as [`deploy/compose/clickhouse-init.sql`](deploy/compose/clickhouse-init.sql)
 does: anyone who can open a dashboard can send Grafana SQL, with any
-settings it allows (`max_execution_time = 0` included, unless a settings
-profile constrains it, and the spill settings, with which one query can fill
-ClickHouse's disk with temporary data). Set Grafana's `server.domain` and `enforce_domain`
+settings the user allows. Use `readonly = 1`, which allows none but those
+marked `CHANGEABLE_IN_READONLY` (the plugin sends `max_execution_time`):
+with `readonly = 2` one query could switch off ClickHouse's memory tracking
+and crash it, fill its disk with temporary data or its own logs, or pin
+memory in the query cache. Set Grafana's `server.domain` and `enforce_domain`
 when it runs on localhost, as the compose stack does, against DNS rebinding.
 
 ## Development

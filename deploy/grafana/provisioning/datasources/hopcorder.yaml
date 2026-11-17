@@ -4,7 +4,11 @@
 #
 # Grafana expands $VARIABLES from its environment here; the defaults below are
 # the docker-compose stack's (deploy/docker-compose.yml). Use a read-only
-# ClickHouse user in production.
+# ClickHouse user in production. The stack's (deploy/compose/clickhouse-init.sql,
+# and the server chart's readOnlyUser) has readonly = 1: queries may set
+# max_execution_time only, which the plugin sends from queryTimeout (60 s,
+# at most 295). customSettings or the row limit (enableRowLimit, which sends
+# `limit`) would need to be allowed there too.
 apiVersion: 1
 
 datasources:
