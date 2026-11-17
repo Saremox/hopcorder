@@ -44,7 +44,6 @@ The section for a version is the text of its GitHub release.
   stored (one part of it and its events at a time); plan for
   `max_concurrent` of them. Decoded records no longer keep spare capacity,
   which made it up to 3.6 times.
-
 - A batch's path changes and outages no longer go to ClickHouse in one
   unbounded insert: records whose target address and reached flag flipped
   every cycle made an event each, one 32 MiB request held 213 MiB on top of
