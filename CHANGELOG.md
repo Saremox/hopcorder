@@ -117,6 +117,18 @@ The section for a version is the text of its GitHub release.
   earlier chart, which carry its default `max_bytes: 1GiB`: add `--set
   config.spool.max_bytes=null` (or use `--reset-then-reuse-values`).
 
+**Fixed (review round seven)**
+
+- ClickHouse's `format_schema_path` (compose and the chart's bundled
+  ClickHouse) is now the same empty directory ClickHouse cannot write as
+  `user_files_path`, and Grafana's read-only user may no longer have
+  CapnProto or Protobuf schemas generated. A CapnProto or Protobuf output
+  without a schema (`SELECT formatRow('CapnProto', 1)`, `FORMAT
+  ProtobufList`) writes a generated schema to a temporary file there, and
+  one that fails to generate was never removed: about 1,000 empty files a
+  second from one viewer, kept across restarts, until the data volume ran
+  out of inodes and ingest failed.
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent

@@ -1,13 +1,19 @@
 <!--
-Merged into the image's config.xml (config.d). user_files_path points at an
-empty directory the clickhouse user cannot write: ClickHouse 25.8's sqlite()
-table function creates its database file there before it checks the
-caller's grant, so Grafana's read-only user, refused every time, still left
-one empty file per query, never removed, until the data volume ran out of
-inodes and ingest failed (review round six). No hopcorder query uses
-user_files. CLICKHOUSE_DO_NOT_CHOWN (docker-compose.yml) keeps the image's
-entrypoint from handing /srv to the clickhouse user.
+Merged into the image's config.xml (config.d). user_files_path and
+format_schema_path point at an empty directory the clickhouse user cannot
+write. ClickHouse 25.8's sqlite() table function creates its database file
+under user_files before it checks the caller's grant, so Grafana's
+read-only user, refused every time, still left one empty file per query,
+never removed, until the data volume ran out of inodes and ingest failed
+(review round six). A CapnProto or Protobuf output without a schema
+(formatRow('CapnProto', 1), FORMAT ProtobufList) writes a generated schema
+to a temporary file under format_schemas, and one that fails to generate
+leaves it there: the same, about 1,000 files a second (review round seven;
+the read-only user's profile also turns that generation off). No hopcorder
+query uses either directory. CLICKHOUSE_DO_NOT_CHOWN (docker-compose.yml)
+keeps the image's entrypoint from handing /srv to the clickhouse user.
 -->
 <clickhouse>
     <user_files_path>/srv/</user_files_path>
+    <format_schema_path>/srv/</format_schema_path>
 </clickhouse>

@@ -28,7 +28,8 @@ services:
       CLICKHOUSE_USER: hopcorder
       CLICKHOUSE_PASSWORD: hopcorder
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-      # Leave /srv (user_files_path, compose/clickhouse-config.xml) to root.
+      # Leave /srv (user_files_path and format_schema_path,
+      # compose/clickhouse-config.xml) to root.
       CLICKHOUSE_DO_NOT_CHOWN: "1"
     volumes:
       - clickhouse:/var/lib/clickhouse
