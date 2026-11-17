@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Installs ClickHouse, the server chart and the agent chart in both modes into
-# the current Kubernetes context (a throwaway kind cluster) and checks that
-# every agent's records arrive. Images: hopcorder-server:ci and
-# hopcorder-agent:ci, already loaded into the cluster.
+# Installs the server chart with its own ClickHouse pod (clickhouse.deploy)
+# and the agent chart in both modes into the current Kubernetes context (a
+# throwaway kind cluster), checks that every agent's records arrive, and that
+# ClickHouse's read-only user can read them but not write. Images:
+# hopcorder-server:ci and hopcorder-agent:ci, already loaded into the cluster.
 set -euo pipefail
 cd "$(dirname "$0")"
-
-kubectl apply -f clickhouse.yaml
-kubectl rollout status deploy/clickhouse --timeout=300s
 
 helm install hopcorder-server ../hopcorder-server -f server-values.yaml --wait --timeout 5m
 helm install hopcorder-agent ../hopcorder-agent -f agent-values.yaml --wait --timeout 3m
@@ -27,6 +25,23 @@ for i in $(seq 90); do
     if [ "$agents" -ge "$want" ] && [ "$reached" -ge 1 ]; then
       jq -c '.rows[] | {agent_id, target, protocol, cycles, last_reached, last_path_len}' <<<"$streams"
       curl -sf http://127.0.0.1:18080/ui/ | grep -q '<div id="app">'
+      ro=$(kubectl get secret hopcorder-server-clickhouse-readonly -o jsonpath='{.data.password}' | base64 -d)
+      chq() { kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user grafana --password "$ro" --query "$1"; }
+      if [ "$(chq 'SELECT count() > 0 FROM hopcorder.cycles')" != 1 ]; then
+        echo "ClickHouse's read-only user cannot read the cycles"
+        exit 1
+      fi
+      if out=$(chq "INSERT INTO hopcorder.agent_seq (agent_id, max_seq) VALUES ('smoke', 1)" 2>&1) ||
+        ! grep -q 'Not enough privileges' <<<"$out"; then
+        echo "ClickHouse's read-only user can write (or the check failed otherwise): $out"
+        exit 1
+      fi
+      # The image's passwordless default user is gone.
+      if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
+        ! grep -q 'Authentication failed' <<<"$out"; then
+        echo "ClickHouse's default user still logs in (or the check failed otherwise): $out"
+        exit 1
+      fi
       echo "smoke test passed"
       exit 0
     fi

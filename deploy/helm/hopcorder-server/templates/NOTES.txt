@@ -1,5 +1,10 @@
 hopcorder server {{ .Chart.AppVersion }} is starting. It is ready once it has
+{{- if .Values.clickhouse.deploy.enabled }}
+reached its ClickHouse ({{ include "hopcorder-server.clickhouseName" . }}, a single pod with a
+persistent volume) and applied the schema:
+{{- else }}
 reached ClickHouse at {{ .Values.config.clickhouse.url }} and applied the schema:
+{{- end }}
 
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "hopcorder-server.fullname" . }}
 
@@ -13,4 +18,15 @@ hopcorder does no authentication: secure ingest and the UI at your ingress.
 Clients inside the cluster reach the Service directly, around the ingress:
 {{- if .Values.networkPolicy.enabled }} the NetworkPolicy limits them to networkPolicy.from.
 {{- else }} set networkPolicy.enabled=true and networkPolicy.from to limit them (needs a CNI that enforces it).
+{{- end }}
+{{- if and .Values.clickhouse.deploy.enabled .Values.clickhouse.deploy.readOnlyUser.enabled }}
+
+ClickHouse's read-only user for Grafana is {{ .Values.clickhouse.deploy.readOnlyUser.name }} at
+http://{{ include "hopcorder-server.clickhouseName" . }}.{{ .Release.Namespace }}.svc:8123; its password:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "hopcorder-server.clickhouseReadOnlySecret" . }} -o jsonpath='{.data.{{ include "hopcorder-server.clickhouseReadOnlyKey" . }}}' | base64 -d
+{{- if .Values.clickhouse.deploy.networkPolicy.enabled }}
+
+Add Grafana's namespace to clickhouse.deploy.networkPolicy.from so it may connect.
+{{- end }}
 {{- end }}

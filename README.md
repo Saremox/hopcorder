@@ -98,6 +98,15 @@ Helm charts for both live in [`deploy/helm`](deploy/helm); each release
 publishes them to `oci://ghcr.io/saremox/charts` (and attaches them to the
 GitHub release):
 
+With a ClickHouse of its own (a single pod next to the server, see below):
+
+```bash
+helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
+  --set clickhouse.deploy.enabled=true
+```
+
+Or with an existing ClickHouse:
+
 ```bash
 helm install hopcorder-server oci://ghcr.io/saremox/charts/hopcorder-server --version 0.1.1 \
   --set config.clickhouse.url=http://clickhouse.db:8123 \
@@ -113,8 +122,20 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
 
 - **Server**: one replica (it derives route changes and outages from each
   stream's history in memory), `Recreate` on upgrade, probes on `/healthz`
-  and `/readyz`, optional Ingress and ServiceMonitor. Bring your own
-  ClickHouse.
+  and `/readyz`, optional Ingress and ServiceMonitor.
+- **ClickHouse**: bring your own (an operator or a managed service, for high
+  availability), or set `clickhouse.deploy.enabled=true` for a single pod
+  next to the server, enough for a monitoring aid: the official
+  `clickhouse/clickhouse-server` image as a one-replica StatefulSet with a
+  persistent volume (`clickhouse.deploy.persistence.size`, 20Gi), no
+  operator, no replication and no backups (snapshot the volume if you want
+  them). The chart generates its password once (or takes
+  `clickhouse.passwordSecret`), points the server at it, sizes its caches for
+  about 2 GiB, keeps its own logs for 7 days, and lets only the server reach
+  it (a NetworkPolicy; add Grafana with `clickhouse.deploy.networkPolicy.from`).
+  `clickhouse.deploy.readOnlyUser.enabled` adds a read-only user for Grafana
+  (SELECT on the hopcorder database, bounded queries), with its password in a
+  generated Secret.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
   after their pods, each with its own spool volume; `mode: daemonset` runs one
   agent per node, named after the node, with its spool on the node.
@@ -137,7 +158,8 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
 Every value is documented in the charts' `values.yaml`. A chart runs the
 image of its own version; `--set image.tag=main` follows `main` instead (or
 install from `deploy/helm` in a checkout). CI installs both charts into a
-kind cluster and checks that records arrive.
+kind cluster, the server with its own ClickHouse, and checks that records
+arrive.
 
 ### Privileges: `CAP_NET_RAW`, not root
 

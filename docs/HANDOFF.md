@@ -839,10 +839,50 @@ added in the commit that introduced it.
   batches would each derive events from half its cycles, and two ingesting
   at once could race the per-agent dedup. Scaling out would need
   stream-sticky routing first. The chart owns `listen`, the ASN cache path
-  (an emptyDir, or a PVC with `persistence.enabled`) and, with
-  `clickhouse.passwordSecret`, `password_file`; everything else in
-  `values.config` is the server's config file as-is. No ClickHouse is
-  bundled.
+  (an emptyDir, or a PVC with `persistence.enabled`), `password_file` (with
+  `clickhouse.passwordSecret` or `clickhouse.deploy`) and, with
+  `clickhouse.deploy`, `clickhouse.url` and `clickhouse.user`; everything else
+  in `values.config` is the server's config file as-is.
+- **Bundled ClickHouse (opt-in, `clickhouse.deploy.enabled`)**, added after
+  v0.1.1 for deployments where hopcorder is a monitoring aid: a one-replica
+  StatefulSet of the official `clickhouse/clickhouse-server` image (25.8, the
+  LTS line every test uses) with a persistent volume, in the server's chart.
+  Not a third-party chart: Bitnami's moved its free images to the unpatched
+  `bitnamilegacy` repository in August 2025, Altinity's is built around its
+  operator, and the small community charts that render exactly this
+  StatefulSet are harder to vouch for than the hundred lines it takes. No
+  operator, replication or backups (snapshot the volume; `retention_days`
+  bounds the data); for high availability use an operator or a managed
+  service and leave it off.
+  - The image's entrypoint creates the server's user from
+    `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` (all databases, for the
+    migrations) and removes the passwordless `default`. The password comes
+    from `clickhouse.passwordSecret` or a Secret the chart generates on
+    install and reads back (`lookup`) on upgrades; users defined in config
+    files follow the Secret on every start, so a reinstall with a new
+    password works with the old volume.
+  - `config.d/hopcorder.xml`: console logging only (no log files in the
+    container), caches sized for about 2 GiB (`mark_cache_size` 256 MiB,
+    `uncompressed_cache_size` 128 MiB, `index_mark_cache_size` 64 MiB),
+    `max_server_memory_usage_to_ram_ratio` 0.8 of the container's limit, and
+    a TTL (`systemLogRetentionDays`, 7) on the system log tables that 25.8
+    enables without one (query, part, trace, metric, text and error logs,
+    among others), which otherwise grow for good.
+  - `readOnlyUser` (for Grafana) is defined in `users.d/readonly.xml`, its
+    password read from the environment (`from_env`): `GRANT SELECT` on the
+    hopcorder database only and the compose stack's bounded profile
+    (`readonly = 2`, time, memory and concurrency limits with `MIN 1`, the
+    cancel setting const). Checked on 25.8: it reads the tables, and writes,
+    `system.users`, `url()`, `max_execution_time = 0` and changing the cancel
+    setting are refused.
+  - Runs as the image's `clickhouse` user (uid 101, `fsGroup` 101) without
+    capabilities or privilege escalation; the root file system stays
+    writable because the entrypoint writes its user file into
+    `/etc/clickhouse-server/users.d` at start (the chart mounts its two files
+    with `subPath`, so the image's own `config.d` stays). A NetworkPolicy (on
+    by default) admits only the server's pods and
+    `clickhouse.deploy.networkPolicy.from`. User and database names go into
+    the XML and a `GRANT`, so the chart accepts only identifiers.
 - **Agent chart**: `mode: statefulset` (default) gives every agent a stable
   name, used as `--agent-id`, and its own spool volume, so sequence numbers
   stay unique and streams stay continuous across restarts and rescheduling.
@@ -852,10 +892,12 @@ added in the commit that introduced it.
   `hostNetwork` traces from the node's network namespace. The chart owns
   `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`;
   the rest of `values.config` is the agent's config file.
-- **Tested in CI** (`helm` job, kind): ClickHouse, the server chart, two
-  StatefulSet agents and a hostNetwork DaemonSet agent tracing the server's
-  Service over TCP; the job passes when every agent's cycles arrive and a
-  TCP stream reached its destination. The development container cannot run
+- **Tested in CI** (`helm` job, kind): the server chart with its bundled
+  ClickHouse (and the read-only user), two StatefulSet agents and a
+  hostNetwork DaemonSet agent tracing the server's Service over TCP; the job
+  passes when every agent's cycles arrive, a TCP stream reached its
+  destination, and ClickHouse's read-only user can read the cycles but not
+  write. The development container cannot run
   kind (its cgroup v1 needs `failCgroupV1: false`, and then nested runc may
   not set `oom_score_adj`), so there the rendered manifests were validated
   with kubeconform (strict) and both images ran in Docker with the

@@ -74,7 +74,7 @@ spec:
               readOnly: true
             - name: data
               mountPath: /var/lib/hopcorder-server
-            {{- if .Values.clickhouse.passwordSecret.name }}
+            {{- if include "hopcorder-server.clickhousePasswordSecret" . }}
             - name: clickhouse-password
               mountPath: /etc/hopcorder/secrets
               readOnly: true
@@ -90,12 +90,12 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if .Values.clickhouse.passwordSecret.name }}
+        {{- with include "hopcorder-server.clickhousePasswordSecret" . }}
         - name: clickhouse-password
           secret:
-            secretName: {{ .Values.clickhouse.passwordSecret.name }}
+            secretName: {{ . }}
             items:
-              - key: {{ .Values.clickhouse.passwordSecret.key }}
+              - key: {{ include "hopcorder-server.clickhousePasswordKey" $ }}
                 path: clickhouse-password
         {{- end }}
       {{- with .Values.nodeSelector }}
