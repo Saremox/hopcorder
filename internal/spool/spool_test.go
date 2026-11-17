@@ -609,8 +609,8 @@ func TestNewSpoolStartsAtTheClock(t *testing.T) {
 	// A spool created before seqs came from the clock (counting from 1)
 	// keeps its counter.
 	old := t.TempDir()
-	o := Options{Dir: old, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Logger: slog.Default(), Now: time.Now}
-	s, err = openDB(o, filepath.Join(old, fileName), 1)
+	epoch := func() time.Time { return time.Unix(0, 0) } // the clock's seq is 1
+	s, err = Open(Options{Dir: old, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Logger: slog.Default(), Now: epoch})
 	if err != nil {
 		t.Fatal(err)
 	}

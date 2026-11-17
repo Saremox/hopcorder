@@ -49,7 +49,10 @@ type Sink interface {
 // safe for concurrent use.
 type Observer interface {
 	CycleDone(t *Target, rec *record.Record)
-	CycleFailed(t *Target)
+	// CycleFailed reports a cycle that could not run, with the reason
+	// (wrapping probe.ErrFlowInUse while another process holds the
+	// target's flow identifier).
+	CycleFailed(t *Target, err error)
 	CycleOverrun(t *Target)
 	ResolveFailed(t *Target)
 }
@@ -165,6 +168,9 @@ type runner struct {
 	// limit is the highest TTL the next adaptive cycle probes; 0 = MaxTTL.
 	// Only the runner's own loop touches it.
 	limit int
+	// flowInUse is set while cycles fail because another process holds
+	// the target's flow identifier. Only the runner's own loop touches it.
+	flowInUse bool
 
 	mu         sync.Mutex
 	ip         netip.Addr
@@ -195,9 +201,13 @@ func (r *runner) loop(ctx context.Context, offset time.Duration) {
 		}
 		switch {
 		case err != nil:
-			r.a.opts.Observer.CycleFailed(r.t)
-			r.log.Warn("cycle failed", "err", err)
+			r.a.opts.Observer.CycleFailed(r.t, err)
+			r.logFailure(err)
 		default:
+			if r.flowInUse {
+				r.flowInUse = false
+				r.log.Info("the flow's identifier is free again; probing resumed", "flow_id", r.t.FlowID)
+			}
 			if err := r.a.opts.Sink.Publish(ctx, rec); err != nil {
 				if ctx.Err() != nil {
 					return
@@ -217,6 +227,24 @@ func (r *runner) loop(ctx context.Context, offset time.Duration) {
 		}
 		timer.Reset(time.Until(next))
 	}
+}
+
+// logFailure logs a failed cycle. Another process holding the flow's
+// identifier stops this target (and only this one, with the other targets
+// of the flow) until the prober can hold it again, which it tries every
+// cycle: that is an error, logged when it starts; the retries are debug.
+func (r *runner) logFailure(err error) {
+	if !errors.Is(err, probe.ErrFlowInUse) {
+		r.log.Warn("cycle failed", "err", err)
+		return
+	}
+	if r.flowInUse {
+		r.log.Debug("target still not probed: its flow's identifier is in use", "err", err)
+		return
+	}
+	r.flowInUse = true
+	r.log.Error("target not probed: another process holds its flow's identifier; retrying every cycle "+
+		"(give this agent another flow_id if that process is meant to be there)", "flow_id", r.t.FlowID, "err", err)
 }
 
 // cycle resolves the target if needed, runs one trace and assembles the
@@ -414,6 +442,6 @@ func buildRecord(agentID string, t *Target, ip netip.Addr, start time.Time, res 
 type nopObserver struct{}
 
 func (nopObserver) CycleDone(*Target, *record.Record) {}
-func (nopObserver) CycleFailed(*Target)               {}
+func (nopObserver) CycleFailed(*Target, error)        {}
 func (nopObserver) CycleOverrun(*Target)              {}
 func (nopObserver) ResolveFailed(*Target)             {}

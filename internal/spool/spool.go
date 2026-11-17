@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -78,11 +79,19 @@ type Stats struct {
 
 // Spool is a durable, bounded, multi-consumer queue of records.
 type Spool struct {
-	db       *bolt.DB
 	opts     Options
+	path     string
 	enc      *zstd.Encoder
 	dec      *zstd.Decoder
 	firstSeq uint64 // seq of a new spool's first record
+
+	// dbMu guards db: transactions hold it for reading; it is held for
+	// writing to close the database, or to replace a file that bbolt
+	// panicked or faulted on (see replace).
+	dbMu    sync.RWMutex
+	db      *bolt.DB // nil once closed, or while a damaged file could not be replaced
+	damaged error    // why the file at path is to be moved aside; nil: it is not
+	closed  bool
 
 	mu         sync.Mutex
 	notify     map[string]chan struct{}
@@ -113,21 +122,73 @@ func Open(o Options) (*Spool, error) {
 	if err := os.MkdirAll(o.Dir, 0o750); err != nil {
 		return nil, fmt.Errorf("spool: %w", err)
 	}
-	path := filepath.Join(o.Dir, fileName)
-	s, err := openDB(o, path, clockSeq(o.Now()))
-	if errors.Is(err, errCorrupt) {
-		// A corrupt file must not stop the agent for good (bbolt can even
-		// fault on one): keep it for inspection and start over, with seqs
-		// from the clock like any new spool.
-		bad := fmt.Sprintf("%s.corrupt-%d", path, o.Now().Unix())
-		if rerr := os.Rename(path, bad); rerr != nil {
-			return nil, fmt.Errorf("%w (and cannot move it aside: %w)", err, rerr)
-		}
-		o.Logger.Error("spool: database unusable; moved aside, starting an empty spool",
-			"err", err, "kept_as", bad)
-		s, err = openDB(o, path, clockSeq(o.Now()))
+	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+	dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	s := &Spool{
+		opts: o, path: filepath.Join(o.Dir, fileName), enc: enc, dec: dec,
+		notify:  map[string]chan struct{}{},
+		cursors: map[string]uint64{},
 	}
-	return s, err
+	for _, c := range o.Consumers {
+		s.notify[c] = make(chan struct{}, 1)
+	}
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if err := s.openLocked(); err != nil {
+		enc.Close()
+		dec.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// openLocked opens the spool file and loads its state. A corrupt file must
+// not stop the agent for good (bbolt can even fault on one): it is kept for
+// inspection and the spool starts over, with seqs from the clock like any
+// new spool. The caller holds dbMu for writing.
+func (s *Spool) openLocked() error {
+	for retried := false; ; retried = true {
+		if s.damaged != nil {
+			bad := fmt.Sprintf("%s.corrupt-%d", s.path, s.opts.Now().Unix())
+			if err := os.Rename(s.path, bad); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("%w (and cannot move it aside: %w)", s.damaged, err)
+			}
+			s.opts.Logger.Error("spool: database unusable; moved aside, starting an empty spool",
+				"err", s.damaged, "kept_as", bad)
+			s.damaged = nil
+		}
+		s.firstSeq = clockSeq(s.opts.Now())
+		db, err := openDB(s.path)
+		if err == nil {
+			if err = s.initDB(db); err != nil {
+				closeWithin(db, s.opts.Logger)
+				err = fmt.Errorf("spool %s: %w", s.path, err)
+			}
+		}
+		if err == nil {
+			s.db = db
+			return nil
+		}
+		if !errors.Is(err, errCorrupt) || retried {
+			return err
+		}
+		s.damaged = err
+	}
+}
+
+// closeWithin closes db, giving up after a few seconds: after a panic
+// inside bbolt its locks might be held for good, and the spool must go on.
+func closeWithin(db *bolt.DB, log *slog.Logger) {
+	done := make(chan error, 1)
+	go func() { done <- guard(db.Close) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Warn("spool: closing the damaged database", "err", err)
+		}
+	case <-time.After(5 * time.Second):
+		log.Error("spool: the damaged database does not close; abandoning it")
+	}
 }
 
 // clockSeq is the first seq of a new spool: the current time in
@@ -142,67 +203,93 @@ func clockSeq(now time.Time) uint64 {
 }
 
 // errCorrupt marks a spool file that cannot be used: bbolt found it
-// invalid, its consistency check failed, or reading it faulted. Other errors
-// (locked, permissions, a full disk) leave the file alone.
+// invalid, its page structure or consistency check failed, or reading it
+// faulted or made bbolt panic. Other errors (locked, permissions, a full
+// disk) leave the file alone.
 var errCorrupt = errors.New("corrupt")
 
-// openDB opens the spool file, checks its consistency and initialises it;
-// firstSeq is the seq of a new spool's first record (0: 1). A spool that
-// has assigned seqs before keeps counting from where it was.
-func openDB(o Options, path string, firstSeq uint64) (s *Spool, err error) {
-	// Faults while reading a damaged memory-mapped file become errors.
+// guard runs fn, turning a panic (bbolt's, or a fault on its memory-mapped
+// file, which SetPanicOnFault makes one in this goroutine) into an error
+// wrapping errCorrupt.
+func guard(fn func() error) (err error) {
 	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
-	var db *bolt.DB
 	defer func() {
 		if r := recover(); r != nil {
-			if db != nil {
-				_ = db.Close()
-			}
-			s, err = nil, fmt.Errorf("spool %s: %w: %v", path, errCorrupt, r)
+			err = fmt.Errorf("%w: %v", errCorrupt, r)
 		}
 	}()
-	db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	return fn()
+}
+
+// openDB opens the spool file and checks it: first its page structure
+// (checkPages, under a shared lock), then every key and value and bbolt's
+// own consistency check (checkDB). An error wraps errCorrupt if the file is
+// unusable, ErrLocked if another process has it.
+func openDB(path string) (*bolt.DB, error) {
+	var db *bolt.DB
+	err := guard(func() error {
+		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+			if err := checkFile(path); err != nil {
+				return err
+			}
+		}
+		var err error
+		db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+		if err := openError(err); err != nil {
+			return err
+		}
+		if err := checkDB(db); err != nil {
+			return fmt.Errorf("%w: %w", errCorrupt, err)
+		}
+		return nil
+	})
+	if err != nil {
+		if db != nil {
+			_ = guard(db.Close)
+		}
+		return nil, fmt.Errorf("spool %s: %w", path, err)
+	}
+	return db, nil
+}
+
+// checkFile checks the page structure of an existing spool file while a
+// read-only bbolt holds a shared lock on it: that open reads only the meta
+// pages (a writable one would load the freelist), and it waits for, then
+// gives up on, a process that has the file open for writing.
+func checkFile(path string) error {
+	ro, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
+	if err := openError(err); err != nil {
+		return err
+	}
+	defer func() { _ = ro.Close() }()
+	if err := checkPages(path, ro.Info().PageSize); err != nil {
+		return fmt.Errorf("%w: %w", errCorrupt, err)
+	}
+	return nil
+}
+
+// openError classifies an error of bolt.Open.
+func openError(err error) error {
 	switch {
+	case err == nil:
+		return nil
 	case errors.Is(err, berrors.ErrTimeout):
-		return nil, fmt.Errorf("spool %s: %w", path, ErrLocked)
+		return ErrLocked
 	case errors.Is(err, berrors.ErrInvalid), errors.Is(err, berrors.ErrVersionMismatch), errors.Is(err, berrors.ErrChecksum):
-		return nil, fmt.Errorf("spool %s: %w: %w", path, errCorrupt, err)
-	case err != nil:
-		return nil, fmt.Errorf("spool %s: %w", path, err)
+		return fmt.Errorf("%w: %w", errCorrupt, err)
 	}
-	if err := checkDB(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("spool %s: %w: %w", path, errCorrupt, err)
-	}
-	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-	dec, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
-	s = &Spool{
-		db: db, opts: o, enc: enc, dec: dec,
-		notify:   map[string]chan struct{}{},
-		cursors:  map[string]uint64{},
-		firstSeq: max(firstSeq, 1),
-	}
-	for _, c := range o.Consumers {
-		s.notify[c] = make(chan struct{}, 1)
-	}
-	if err := s.init(); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("spool %s: %w", path, err)
-	}
-	return s, nil
+	return err
 }
 
 // checkDB reads every key and value, then runs bbolt's consistency check
 // (page structure and freelist).
 //
-// The walk comes first and runs in the caller's goroutine, where openDB has
-// turned faults into panics. tx.Check runs in a goroutine of its own, where a
-// fault on the memory-mapped file (a leaf element pointing past the mapping,
-// say) is fatal; bbolt pages carry no checksums, so a single damaged element
-// would otherwise crash the agent on every start. The walk reads every
-// branch, leaf and overflow page reachable from the buckets; the freelist,
-// the only other page the check reads, was loaded by bolt.Open in this
-// goroutine too.
+// checkPages has made sure before that no element points outside its page,
+// no overflow count beyond the file, and that the pages form a tree without
+// nested buckets, so neither of these faults, loops or recurses without
+// end. The walk still runs first, in the caller's goroutine, where guard
+// turns faults into errors (a read error on the mapped file is one): tx.Check
+// runs in a goroutine of its own, where a fault is fatal.
 func checkDB(db *bolt.DB) error {
 	if err := db.View(walkAll); err != nil {
 		return err
@@ -219,14 +306,17 @@ func checkDB(db *bolt.DB) error {
 	return errors.Join(first, err)
 }
 
-// walkAll visits every key and value of every bucket (nested ones included),
-// checking that keys are in order.
+// walkAll visits every key and value of every bucket, checking that keys
+// are in order and that no bucket holds a bucket (the spool has none).
 func walkAll(tx *bolt.Tx) error { return tx.ForEach(walkBucket) }
 
 // valueSink keeps the compiler from eliding the reads of the values.
 var valueSink atomic.Uint32
 
 func walkBucket(name []byte, b *bolt.Bucket) error {
+	if b == nil {
+		return fmt.Errorf("%q in the root is not a bucket", name)
+	}
 	var prev []byte
 	c := b.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
@@ -234,13 +324,8 @@ func walkBucket(name []byte, b *bolt.Bucket) error {
 			return fmt.Errorf("bucket %q: keys out of order", name)
 		}
 		prev = k
-		if v == nil { // a nested bucket
-			if nb := b.Bucket(k); nb != nil {
-				if err := walkBucket(k, nb); err != nil {
-					return err
-				}
-			}
-			continue
+		if v == nil {
+			return fmt.Errorf("bucket %q: nested bucket %q", name, k)
 		}
 		valueSink.Add(crc32.ChecksumIEEE(v)) // read the value itself, not just its header
 	}
@@ -253,26 +338,92 @@ type txState struct {
 	dropped uint64
 }
 
+// errClosed is returned for operations on a closed spool.
+var errClosed = errors.New("spool: closed")
+
+// acquire returns the database with dbMu held for reading, which release
+// gives back. If an earlier operation found the file damaged and it could
+// not be replaced then, that is tried again first.
+func (s *Spool) acquire() (*bolt.DB, error) {
+	s.dbMu.RLock()
+	if s.db != nil || s.closed {
+		if s.db == nil {
+			s.dbMu.RUnlock()
+			return nil, errClosed
+		}
+		return s.db, nil
+	}
+	s.dbMu.RUnlock()
+	s.dbMu.Lock()
+	if s.db == nil && !s.closed {
+		if err := s.openLocked(); err != nil {
+			s.dbMu.Unlock()
+			return nil, fmt.Errorf("spool unavailable: %w", err)
+		}
+	}
+	s.dbMu.Unlock()
+	return s.acquire()
+}
+
+func (s *Spool) release() { s.dbMu.RUnlock() }
+
+// replace handles an operation on db that bbolt panicked or faulted on
+// (err, wrapping errCorrupt): the file is damaged in a way the checks at
+// start did not catch, and bbolt's state in memory may be inconsistent
+// after the panic. Like Open with a file that fails its checks, it moves
+// the file aside and continues with an empty spool, at once, so the agent
+// keeps recording. If that fails, every operation tries again.
+func (s *Spool) replace(db *bolt.DB, err error) {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if s.db != db {
+		return // closed, or already replaced after another operation failed
+	}
+	s.opts.Logger.Error("spool: database damaged while in use", "err", err)
+	s.db, s.damaged = nil, err
+	closeWithin(db, s.opts.Logger)
+	if err := s.openLocked(); err != nil {
+		s.opts.Logger.Error("spool: cannot start an empty spool; retrying with the next operation", "err", err)
+	}
+}
+
 // update runs fn in a write transaction and, after a successful commit,
 // refreshes the in-memory mirrors of the stored counters. Commits of
 // concurrent appends can return in any order, so mirrors are only replaced
-// by a newer transaction's values.
+// by a newer transaction's values. A panic (or fault) inside replaces the
+// damaged file; see replace.
 func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
+	db, err := s.acquire()
+	if err != nil {
+		return err
+	}
+	err = s.updateDB(db, fn)
+	s.release()
+	if errors.Is(err, errCorrupt) {
+		s.replace(db, err)
+	}
+	return err
+}
+
+// updateDB is update on db, without dbMu (which the caller holds).
+func (s *Spool) updateDB(db *bolt.DB, fn func(tx *bolt.Tx, st *txState) error) error {
 	var (
 		st             txState
 		bytes, n, last uint64
 		gen            uint64
 	)
-	err := s.db.Update(func(tx *bolt.Tx) error {
-		if err := fn(tx, &st); err != nil {
-			return err
-		}
-		meta := tx.Bucket(bucketMeta)
-		bytes, n = getU64(meta, keyBytes), getU64(meta, keyCount)
-		last = getU64(meta, keyNextSeq) - 1
-		s.txGen++ // only one write transaction runs at a time
-		gen = s.txGen
-		return nil
+	err := guard(func() error {
+		return db.Update(func(tx *bolt.Tx) error {
+			if err := fn(tx, &st); err != nil {
+				return err
+			}
+			meta := tx.Bucket(bucketMeta)
+			bytes, n = getU64(meta, keyBytes), getU64(meta, keyCount)
+			last = getU64(meta, keyNextSeq) - 1
+			s.txGen++ // only one write transaction runs at a time
+			gen = s.txGen
+			return nil
+		})
 	})
 	if err != nil {
 		return err
@@ -292,8 +443,11 @@ func (s *Spool) update(fn func(tx *bolt.Tx, st *txState) error) error {
 	return nil
 }
 
-func (s *Spool) init() error {
-	return s.update(func(tx *bolt.Tx, st *txState) error {
+// initDB creates the buckets of a new spool in db and loads the state of
+// an existing one.
+func (s *Spool) initDB(db *bolt.DB) error {
+	cursors := map[string]uint64{}
+	err := s.updateDB(db, func(tx *bolt.Tx, st *txState) error {
 		for _, b := range [][]byte{bucketMeta, bucketRecords, bucketCursors} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
@@ -329,23 +483,41 @@ func (s *Spool) init() error {
 				if err := putU64(curs, []byte(c), next-1); err != nil {
 					return err
 				}
-				s.cursors[c] = next - 1
+				cursors[c] = next - 1
 				continue
 			}
-			s.cursors[c] = binary.BigEndian.Uint64(v)
+			cursors[c] = binary.BigEndian.Uint64(v)
 		}
 		if err := s.collectLocked(tx); err != nil {
 			return err
 		}
 		return s.enforceBoundsLocked(tx, st, 0)
 	})
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.cursors = cursors
+	s.mu.Unlock()
+	return nil
 }
 
 // Close closes the database.
 func (s *Spool) Close() error {
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	s.enc.Close()
 	s.dec.Close()
-	return s.db.Close()
+	if s.db == nil {
+		return nil
+	}
+	db := s.db
+	s.db = nil
+	return guard(db.Close)
 }
 
 // Append assigns the next seq, calls encode with it and stores the result.
@@ -403,41 +575,22 @@ func (s *Spool) Publish(_ context.Context, rec *record.Record) error {
 
 // Read returns up to maxRecords entries after consumer's cursor, stopping
 // before maxBytes of record data (but always returning at least one entry
-// if any is pending).
+// if any is pending). A panic (or fault) inside replaces the damaged file;
+// see replace.
 func (s *Spool) Read(consumer string, maxRecords, maxBytes int) ([]Entry, error) {
 	if _, ok := s.notify[consumer]; !ok {
 		return nil, fmt.Errorf("spool: unknown consumer %q", consumer)
 	}
-	var out []Entry
-	var corrupt []uint64
-	err := s.db.View(func(tx *bolt.Tx) error {
-		from := getU64(tx.Bucket(bucketCursors), []byte(consumer)) + 1
-		c := tx.Bucket(bucketRecords).Cursor()
-		size := 0
-		for k, v := c.Seek(seqKey(from)); k != nil && len(out) < maxRecords; k, v = c.Next() {
-			if len(k) != 8 {
-				continue // not a record key; cannot be acknowledged either
-			}
-			seq := binary.BigEndian.Uint64(k)
-			if len(v) < 8 {
-				corrupt = append(corrupt, seq)
-				continue
-			}
-			data, err := s.dec.DecodeAll(v[8:], nil)
-			if err != nil {
-				corrupt = append(corrupt, seq)
-				continue
-			}
-			if len(out) > 0 && size+len(data) > maxBytes {
-				break
-			}
-			size += len(data)
-			ts := time.Unix(0, int64(binary.BigEndian.Uint64(v[:8]))) //nolint:gosec // written from UnixNano
-			out = append(out, Entry{Seq: seq, TS: ts, Data: data})
-		}
-		return nil
-	})
+	db, err := s.acquire()
 	if err != nil {
+		return nil, fmt.Errorf("spool read: %w", err)
+	}
+	out, corrupt, err := s.read(db, consumer, maxRecords, maxBytes)
+	s.release()
+	if err != nil {
+		if errors.Is(err, errCorrupt) {
+			s.replace(db, err)
+		}
 		return nil, fmt.Errorf("spool read: %w", err)
 	}
 	for _, seq := range corrupt {
@@ -451,6 +604,41 @@ func (s *Spool) Read(consumer string, maxRecords, maxBytes int) ([]Entry, error)
 		}
 	}
 	return out, nil
+}
+
+// read is Read's transaction on db: the entries, and the seqs of records
+// that cannot be decoded.
+func (s *Spool) read(db *bolt.DB, consumer string, maxRecords, maxBytes int) (out []Entry, corrupt []uint64, err error) {
+	err = guard(func() error {
+		return db.View(func(tx *bolt.Tx) error {
+			from := getU64(tx.Bucket(bucketCursors), []byte(consumer)) + 1
+			c := tx.Bucket(bucketRecords).Cursor()
+			size := 0
+			for k, v := c.Seek(seqKey(from)); k != nil && len(out) < maxRecords; k, v = c.Next() {
+				if len(k) != 8 {
+					continue // not a record key; cannot be acknowledged either
+				}
+				seq := binary.BigEndian.Uint64(k)
+				if len(v) < 8 {
+					corrupt = append(corrupt, seq)
+					continue
+				}
+				data, err := s.dec.DecodeAll(v[8:], nil)
+				if err != nil {
+					corrupt = append(corrupt, seq)
+					continue
+				}
+				if len(out) > 0 && size+len(data) > maxBytes {
+					break
+				}
+				size += len(data)
+				ts := time.Unix(0, int64(binary.BigEndian.Uint64(v[:8]))) //nolint:gosec // written from UnixNano
+				out = append(out, Entry{Seq: seq, TS: ts, Data: data})
+			}
+			return nil
+		})
+	})
+	return out, corrupt, err
 }
 
 // Ack records that consumer has delivered every record up to and including

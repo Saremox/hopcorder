@@ -85,7 +85,33 @@ The section for a version is the text of its GitHub release.
 
 **Security: agent**
 
-<!-- round three: agent -->
+- Spoofed packets from anywhere can no longer forge hops, loops or a
+  reached destination by guessing the 16-bit probe id: a reply must also
+  match the probe's random IPv4 IP ID, a random nonce in its payload (which
+  destinations echo and ICMP errors quote) or the SYN's exact, random
+  sequence number. The review's spoofer, at 5,000–20,000 packets per
+  second, put fake hops into nearly every cycle; now none. This also stops local
+  processes from forging TCP replies with `connect()`. IPv6 routers must
+  quote the whole probe, as RFC 4443 requires; one that quotes only 8 bytes
+  now shows `no-reply`.
+- A reload (SIGHUP) keeps the metrics listener when its address is
+  unchanged, and binds a new address before releasing the old one, so a
+  local user can no longer take the port during a reload, make the agent
+  exit and serve their own metrics. A reload never stops the agent: if the
+  previous configuration cannot start again either, it is retried until it
+  does, while the endpoint answers 503.
+- Spool files with damage that still crashed or hung the agent (a fault
+  inside bbolt's check, an overflow count that made it loop for minutes and
+  take gigabytes, a self-referencing bucket, a page freed twice) are now
+  quarantined at start: the page structure is checked before bbolt reads
+  it. Damage bbolt only finds while running fails that operation, and the
+  file is moved aside and an empty spool started at once, instead of the
+  agent crashing.
+- A local user holding the agent's ICMP echo identifier (one ping socket)
+  no longer stops the agent: only the ICMP targets of that `flow_id` wait,
+  with an error in the log and `hopcorder_flow_in_use` at 1, and they
+  resume by themselves once the identifier is free. Every other target is
+  probed. `--once` prints the other targets' records and exits 1.
 
 **Security: CI, release and deployment**
 

@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -29,23 +30,23 @@ var (
 )
 
 // Golden bytes below were produced by an independent Python implementation
-// (struct + RFC 1071 checksum; the UDP compensation word was found by brute
-// force rather than with the algebra used in buildUDP).
+// (struct + RFC 1071 checksum; the paris and UDP compensation words were
+// found by brute force rather than with the algebra used in the builders).
 func TestBuildGolden(t *testing.T) {
 	tests := []struct {
 		name string
 		got  []byte
 		want string
 	}{
-		{"echo4 paris seq 1", buildEcho(src4, dst4, 33434, 1, true), "080056ba829a0001fffe686f70636f7264657200"},
-		{"echo4 paris seq 2", buildEcho(src4, dst4, 33434, 2, true), "080056ba829a0002fffd686f70636f7264657200"},
-		{"echo4 classic seq 1", buildEcho(src4, dst4, 33434, 1, false), "080056b9829a00010000686f70636f7264657200"},
-		{"echo6 paris seq 7", buildEcho(src6, dst6, 33434, 7, true), "800082f6829a0007fff8686f70636f7264657200"},
-		{"udp4 checksum 0x1234", buildUDP(src4, dst4, 33434, 33434, 0x1234), "829a829a00141234dd75686f70636f7264657200"},
-		{"udp6 checksum 0xabcd", buildUDP(src6, dst6, 33434, 33435, 0xabcd), "829a829b0014abcdd4a2686f70636f7264657200"},
+		{"echo4 paris seq 1", buildEcho(src4, dst4, 33434, 1, 0x01020304, true), "080056ba829a0001fbf801020304686f70636f7264657200"},
+		{"echo4 paris seq 2", buildEcho(src4, dst4, 33434, 2, 0xdeadbeef, true), "080056ba829a00026260deadbeef686f70636f7264657200"},
+		{"echo4 classic seq 1", buildEcho(src4, dst4, 33434, 1, 0x01020304, false), "080052b3829a0001000001020304686f70636f7264657200"},
+		{"echo6 paris seq 7", buildEcho(src6, dst6, 33434, 7, 0xcafe0001, true), "800082f2829a000734f9cafe0001686f70636f7264657200"},
+		{"udp4 checksum 0x1234", buildUDP(src4, dst4, 33434, 33434, 0x1234, 0x01020304), "829a829a00181234d96701020304686f70636f7264657200"},
+		{"udp6 checksum 0xabcd", buildUDP(src6, dst6, 33434, 33435, 0xabcd, 0xfffefdfc), "829a829b0018abcdd69efffefdfc686f70636f7264657200"},
 		{"ipv4 header", buildIPv4(src4, dst4, protoUDP, 5, 0x1234, 20), "45000028123400000511b755c0000201c6336407"},
-		{"tcp4 syn id 7", buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(7)), "829a01bb00070000000000006002faf02c9d0000020405b4"},
-		{"tcp6 syn id 0xabcd", buildTCPSyn(src6, dst6, 33434, 443, tcpSeq(0xabcd)), "829a01bbabcd0000000000006002faf0119e0000020405b4"},
+		{"tcp4 syn id 7", buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(7, 0x5a5a)), "829a01bb00075a5a000000006002faf0d2420000020405b4"},
+		{"tcp6 syn id 0xabcd", buildTCPSyn(src6, dst6, 33434, 443, tcpSeq(0xabcd, 0x0102)), "829a01bbabcd0102000000006002faf0109c0000020405b4"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,16 +75,22 @@ func TestParisEchoChecksumConstant(t *testing.T) {
 			proto = protoICMPv6
 		}
 		var first uint16
+		// Nonces include the extremes, whose words make the sum carry.
+		nonces := []uint32{0, 1, 0xffffffff, 0xfffe0001, 0x0001fffe, 0x80008000, 0x12345678}
 		for seq := uint16(1); seq < 0xffff; seq += 97 {
-			b := buildEcho(src, dst, 4242, seq, true)
+			nonce := nonces[int(seq)%len(nonces)]
+			b := buildEcho(src, dst, 4242, seq, nonce, true)
 			if s := verifySum(src, dst, proto, b); s != 0xffff {
-				t.Fatalf("%s seq %d: bad checksum (sum %#x)", dst, seq, s)
+				t.Fatalf("%s seq %d nonce %#x: bad checksum (sum %#x)", dst, seq, nonce, s)
 			}
 			c := binary.BigEndian.Uint16(b[2:])
 			if seq == 1 {
 				first = c
 			} else if c != first {
-				t.Fatalf("%s seq %d: checksum %#x differs from %#x", dst, seq, c, first)
+				t.Fatalf("%s seq %d nonce %#x: checksum %#x differs from %#x", dst, seq, nonce, c, first)
+			}
+			if got := binary.BigEndian.Uint32(b[10:]); got != nonce {
+				t.Fatalf("nonce %#x carried as %#x", nonce, got)
 			}
 		}
 	}
@@ -92,8 +99,9 @@ func TestParisEchoChecksumConstant(t *testing.T) {
 func TestUDPChecksumIsIdentifier(t *testing.T) {
 	for _, pair := range [][2]netip.Addr{{src4, dst4}, {src6, dst6}} {
 		src, dst := pair[0], pair[1]
-		for _, want := range []uint16{1, 2, 0x7fff, 0x8000, 0xfffd, 0xfffe} {
-			b := buildUDP(src, dst, 40000, 33434, want)
+		for i, want := range []uint16{1, 2, 0x7fff, 0x8000, 0xfffd, 0xfffe} {
+			nonce := []uint32{0, 0xffffffff, 0x12345678}[i%3]
+			b := buildUDP(src, dst, 40000, 33434, want, nonce)
 			if got := binary.BigEndian.Uint16(b[6:]); got != want {
 				t.Errorf("%s: checksum %#x, want %#x", dst, got, want)
 			}
@@ -143,11 +151,11 @@ func TestParseICMPv4(t *testing.T) {
 		err  error
 	}{
 		{"time exceeded / echo", router, timeExceeded4Echo,
-			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}, ipID: 1, quotedIPID: true}, nil},
+			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}, ipID: 1, quotedIPID: true, l4Off: 28, l4Len: 8}, nil},
 		{"port unreachable / udp", dst4, portUnreach4UDP,
-			icmpReply{kind: kindUnreachable, code: 3, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 0x1234, quotedIPID: true}, nil},
+			icmpReply{kind: kindUnreachable, code: 3, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 0x1234, quotedIPID: true, l4Off: 28, l4Len: 8}, nil},
 		{"quoted header with options", router, timeExceeded4Options,
-			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 1, quotedIPID: true}, nil},
+			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst4, proto: protoUDP, a: 33434, b: 33434, c: 0x1234}, ipID: 1, quotedIPID: true, l4Off: 32, l4Len: 8}, nil},
 		{"echo reply", dst4, echoReply4,
 			icmpReply{kind: kindEchoReply, key: probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}}, nil},
 		{"echo request ignored", dst4, "0800 0000 829a 0001", icmpReply{}, errIgnored},
@@ -186,9 +194,9 @@ func TestParseICMPv6(t *testing.T) {
 		err  error
 	}{
 		{"time exceeded / echo", router, timeExceeded6Echo,
-			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst6, proto: protoICMPv6, a: 33434, c: 7}}, nil},
+			icmpReply{kind: kindTimeExceeded, key: probeKey{dst: dst6, proto: protoICMPv6, a: 33434, c: 7}, l4Off: 48, l4Len: 8}, nil},
 		{"port unreachable / udp", dst6, portUnreach6UDP,
-			icmpReply{kind: kindUnreachable, code: 4, key: probeKey{dst: dst6, proto: protoUDP, a: 33434, b: 33435, c: 0xabcd}}, nil},
+			icmpReply{kind: kindUnreachable, code: 4, key: probeKey{dst: dst6, proto: protoUDP, a: 33434, b: 33435, c: 0xabcd}, l4Off: 48, l4Len: 8}, nil},
 		{"echo reply", dst6, echoReply6,
 			icmpReply{kind: kindEchoReply, key: probeKey{dst: dst6, proto: protoICMPv6, a: 33434, c: 7}}, nil},
 		{"echo reply from zoned link-local", netip.MustParseAddr("fe80::1%eth0"), echoReply6,
@@ -241,7 +249,7 @@ func TestParseTruncations(t *testing.T) {
 // The quoted headers in the golden messages are what our builders produce,
 // so a probe and the reply quoting it yield the same key.
 func TestBuiltProbesMatchQuotedKeys(t *testing.T) {
-	echo := buildEcho(src4, dst4, 33434, 1, true)
+	echo := buildEcho(src4, dst4, 33434, 1, 0x01020304, true)
 	q := append(buildIPv4(src4, dst4, protoICMP, 1, 1, len(echo)), echo[:8]...)
 	msg := append(unhex(t, "0b00 0000 00000000"), q...)
 	r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), msg)
@@ -250,6 +258,51 @@ func TestBuiltProbesMatchQuotedKeys(t *testing.T) {
 	}
 	if want := (probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}); r.key != want {
 		t.Errorf("key %+v, want %+v", r.key, want)
+	}
+}
+
+// The quoted L4 packet is cut at the length its IP header states, so RFC
+// 4884 padding is not compared with the probe's payload; a full quote is
+// compared in full, a short one as far as it goes (and on IPv6 must reach
+// past the nonce).
+func TestQuoteMatches(t *testing.T) {
+	udp := buildUDP(src4, dst4, 33434, 33434, 0x1234, 0x01020304)
+	msg := append(unhex(t, "0b00 0000 00000000"), buildIPv4(src4, dst4, protoUDP, 1, 7, len(udp))...)
+	msg = append(msg, udp...)
+	msg = append(msg, make([]byte, 128-ipv4HeaderLen-len(udp))...) // padded to 128 bytes
+	r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.l4Off != 8+ipv4HeaderLen || r.l4Len != len(udp) {
+		t.Fatalf("quoted l4 at %d+%d, want %d+%d", r.l4Off, r.l4Len, 8+ipv4HeaderLen, len(udp))
+	}
+	quote := msg[r.l4Off : r.l4Off+r.l4Len]
+	data := udp[8:]
+	other := buildUDP(src4, dst4, 33434, 33434, 0x1234, 0x01020305)[8:]
+	zeros := append(bytes.Clone(udp[:8]), make([]byte, len(udp)-8)...)
+	for _, c := range []struct {
+		name     string
+		quote    []byte
+		data     []byte
+		v6, want bool
+	}{
+		{"full quote", quote, data, false, true},
+		{"full quote, v6", quote, data, true, true},
+		{"other nonce", quote, other, false, false},
+		{"other nonce, v6", quote, other, true, false},
+		{"8 bytes", quote[:8], other, false, true},
+		{"8 bytes, v6", quote[:8], data, true, false},
+		{"up to the nonce's end", quote[:8+nonceEnd], data, true, true},
+		{"part of the nonce", quote[:8+nonceEnd-1], data, false, true},
+		{"part of another nonce", quote[:8+nonceEnd-1], other, false, false},
+		{"part of the nonce, v6", quote[:8+nonceEnd-1], data, true, false},
+		{"zero padding after 8 bytes", zeros, data, false, true},
+		{"zero padding after 8 bytes, v6", zeros, data, true, false},
+	} {
+		if got := quoteMatches(c.quote, c.data, c.v6); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
@@ -276,11 +329,11 @@ func TestParseTCP(t *testing.T) {
 	}{
 		// 443 -> 33434, seq 0x11111111, ack 0x00070001 (probe id 7 + 1), SYN|ACK.
 		{"syn-ack", "01bb829a 11111111 00070001 5012 ffff 0000 0000",
-			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}, seq: 0x00070000}, nil},
 		{"rst-ack", "01bb829a 00000000 00070001 5014 0000 0000 0000",
-			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}, seq: 0x00070000}, nil},
 		{"ack wraps into the id", "01bb829a 00000000 00080000 5014 0000 0000 0000",
-			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}}, nil},
+			icmpReply{kind: kindTCPReply, key: probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 7}, seq: 0x0007ffff}, nil},
 		{"incoming syn ignored", "01bb829a 11111111 00000000 5002 ffff 0000 0000", icmpReply{}, errIgnored},
 		{"plain ack ignored", "01bb829a 11111111 00070001 5010 ffff 0000 0000", icmpReply{}, errIgnored},
 		{"rst without ack ignored", "01bb829a 11111111 00000000 5004 ffff 0000 0000", icmpReply{}, errIgnored},
@@ -302,15 +355,16 @@ func TestParseTCP(t *testing.T) {
 }
 
 func TestQuotedTCPKey(t *testing.T) {
-	syn := buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(0x1234))
+	syn := buildTCPSyn(src4, dst4, 33434, 443, tcpSeq(0x1234, 0xbeef))
 	msg := append(unhex(t, "0b00 0000 00000000"), buildIPv4(src4, dst4, protoTCP, 1, 1, len(syn))...)
 	msg = append(msg, syn[:8]...)
 	r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), msg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 0x1234}); r.kind != kindTimeExceeded || r.key != want {
-		t.Errorf("got %+v, want key %+v", r, want)
+	if want := (probeKey{dst: dst4, proto: protoTCP, a: 33434, b: 443, c: 0x1234}); r.kind != kindTimeExceeded || r.key != want ||
+		r.seq != 0x1234beef {
+		t.Errorf("got %+v, want key %+v and seq 0x1234beef", r, want)
 	}
 	if s := verifySum(src4, dst4, protoTCP, syn); s != 0xffff {
 		t.Errorf("syn checksum does not verify (sum %#x)", s)
@@ -360,9 +414,10 @@ func TestParseMPLS(t *testing.T) {
 	if got := parseMPLS(bad, false); got != nil {
 		t.Errorf("version 1 extension parsed: %+v", got)
 	}
-	// The quoted datagram still parses as usual.
+	// The quoted datagram still parses as usual, without the padding (its
+	// IP header says 40 bytes).
 	if r, err := parseICMPv4(netip.MustParseAddr("203.0.113.9"), unhex(t, mplsV4Explicit)); err != nil ||
-		r.key != (probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}) {
+		r.key != (probeKey{dst: dst4, proto: protoICMP, a: 33434, c: 1}) || r.l4Off != 28 || r.l4Len != 20 {
 		t.Errorf("quoted probe: %+v %v", r, err)
 	}
 }

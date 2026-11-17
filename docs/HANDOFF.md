@@ -422,7 +422,11 @@ added in the commit that introduced it.
   technique): the first payload word is chosen so the checksum comes out to the
   id. This works identically for IPv4 and IPv6 (IPv6 has no IP ID) and the
   checksum is in the 8 quoted bytes. Demux key: (dst, proto, icmp id, seq) or
-  (dst, udp, sport, dport, checksum).
+  (dst, udp, sport, dport, checksum). Since round three of the security
+  review the ids are random (round two), and the 16 bits of the key are not
+  all a reply must match: ICMP and UDP payloads are `comp word | 4-byte
+  random nonce | "hopcorder\0"` (the paris word now compensates for seq and
+  the nonce), and the IPv4 IP ID is random on its own; see round three.
 - **`flow_id`** is the ICMP identifier (icmp) or UDP source port (udp),
   default 33434, constant across TTLs *and* cycles so paris keeps a target on
   one ECMP path over time; per-target configurable. Classic mode
@@ -448,7 +452,9 @@ added in the commit that introduced it.
 - **TCP SYN probing** (§4.3, done after M1 review): a SYN with an MSS option
   to `port` (default 443), source port `flow_id`. The probe id is the top 16
   bits of the sequence number (ECMP does not hash it; ICMP errors quote it;
-  SYN-ACK/RST acknowledge seq+1). Paris keeps both ports fixed; classic mode
+  SYN-ACK/RST acknowledge seq+1); since round three the low 16 bits are
+  random, and a reply must acknowledge exactly seq+1 (an ICMP error quote
+  all 32 bits). Paris keeps both ports fixed; classic mode
   walks the source port, since the destination port is the service being
   reached. The destination's SYN-ACK or RST is `reply`, as is an ICMP port
   unreachable from the destination itself (an iptables REJECT). Replies arrive
@@ -460,9 +466,10 @@ added in the commit that introduced it.
   were counted per flow from a random start): drawn per probe, never one
   whose key is in flight, a tombstoned one only when the flow has no other
   free id. Two hopcorder *processes* on one host (e.g. `--once` next to the
-  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second fails
-  at startup, as the first holds the echo identifier; with UDP or TCP both
-  start, and a reply can, rarely, be attributed to the other process's
+  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second does
+  not probe that flow's targets (since round three; it failed at startup
+  before), as the first holds the echo identifier; with UDP or TCP both
+  probe, and a reply can, very rarely, be attributed to the other process's
   probe.
 - **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
   review). Once a target was reached at distance d, cycles probe TTLs
@@ -539,14 +546,17 @@ added in the commit that introduced it.
 - **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
   and the original command-line flags and positional targets are re-applied.
   Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
-  metrics server, schedulers) shuts down as on SIGTERM and starts again with
-  the new config; only the prober and its raw sockets survive. A full
+  metrics, schedulers) shuts down as on SIGTERM and starts again with
+  the new config; only the prober and its raw sockets survive (and, since
+  round three of the security review, the metrics listener while its
+  address is unchanged). A full
   in-process restart was chosen over diffing configs because it applies every
   setting the same way and has one code path; the cost is a pause of about
   one shutdown (≤3s) and Prometheus counters restarting from zero, which
   `rate()` handles. If the new config fails to start, the previous one is
-  started again. Every reload reopens the JSONL file, which makes
-  rename-and-HUP log rotation work.
+  started again (and retried until it starts, since round three). Every
+  reload reopens the JSONL file, which makes rename-and-HUP log rotation
+  work.
 - **Shutdown**: schedulers stop first (in-flight cycles are abandoned), then
   outputs get up to 3s to drain what is spooled; whatever is left stays in the
   spool for the next start.
@@ -1431,7 +1441,10 @@ decisions:
   checking key order and reading every value, before `tx.Check`. Such
   damage then faults where it is recovered, and the file is quarantined.
   Values are read too because the check never reads them, and a drain that
-  reads one later is not protected.
+  reads one later is not protected. (Round three found this incomplete:
+  `tx.Check` also reads branch keys, which a cursor never touches, and
+  trusts overflow counts and child pointers; the page structure is now
+  checked first, see there.)
 - **Probe ids are random.** Each probe id is drawn from ChaCha8, seeded from
   `crypto/rand`. An id whose key is in flight is never chosen, and a
   tombstoned one only when the flow has no other free id. This replaces
@@ -1444,7 +1457,9 @@ decisions:
   fake loop, or ended the path early, with one datagram per cycle, for UDP
   and for ICMP.
 - **ICMPv4 errors must quote the probe's IP ID.** The probe id is already
-  the IP ID of every IPv4 probe. Unprivileged sockets choose ports, the UDP
+  the IP ID of every IPv4 probe (corrected in round three: that added no
+  bits against someone guessing ids, so the IP ID is now drawn on its own).
+  Unprivileged sockets choose ports, the UDP
   checksum and the echo sequence, but not the IP ID. A mismatch is dropped
   and counted in `hopcorder_probe_mismatched_replies_total`. Trade-off: a
   middlebox that rewrites IP IDs makes every hop beyond it silent on IPv4.
@@ -1471,7 +1486,8 @@ decisions:
   - An identifier held by another process fails the start with
     `ErrFlowInUse` and a hint to use `--flow-id`. A failed reload reverts
     as before. This replaces the "two hopcorder processes" caveat for
-    ICMP.
+    ICMP. (Changed in round three: any local user could stop the whole
+    agent that way; now only that flow's ICMP targets wait.)
   - Without ping sockets for the agent's group
     (`net.ipv4.ping_group_range`) nothing is held. This is logged once:
     at info if other groups may open ping sockets, at debug if nobody can
@@ -1487,10 +1503,15 @@ decisions:
     `SO_REUSEADDR` the hold can be shared, so it would protect nothing.
   - Both checked on Linux 6.18.
   - The gain would have been small. Forged ICMP errors for UDP and TCP
-    probes fail the IP ID check. A SYN-ACK or RST cannot be provoked
-    without choosing the SYN's sequence number. With random ids, the ids
-    an unprivileged process can still observe say nothing about the
-    others.
+    probes fail the IP ID check. With random ids, the ids an unprivileged
+    process can still observe say nothing about the others.
+  - Corrected in round three: "a SYN-ACK or RST cannot be provoked without
+    choosing the SYN's sequence number" was wrong. A process that binds
+    the flow's TCP port and loops `connect()` to the target provokes them,
+    and the kernel's ISN is a free 16-bit guess at the probe id, since only
+    the top 16 bits were checked; the review got 2 of 38 cycles recorded as
+    `reached` that way. Replies must now acknowledge the exact 32-bit
+    sequence number; see round three.
   - So two processes on the same UDP or TCP flow still start, and the
     caveat stays for them.
 - **`flow_id` has a global default and a `--flow-id` flag**, so a `--once`
@@ -1848,7 +1869,203 @@ high-severity issue. Four fixes followed. The decisions:
     hops with 128 MiB per query; before: 502). `TestTopologyClickHouse`
     still checks the edges themselves.
 
-<!-- round three: agent -->
+- **A reply must match at least 32 random bits, not 16.** Round two's checks
+  rested on the 16-bit probe id: the IPv4 IP ID was the probe id itself,
+  the echo data was `^seq` and the magic, TCP compared the top 16 bits of
+  the ack, and IPv6 had no second check. An off-path sender guessing ids
+  hit a probe in flight with probability (probes in flight)/65534 per
+  packet. In the review's netns PoC, forged time exceeded at 20k pps put
+  4–12 fake hops (and a fake loop) into 11 of 13 UDP cycles, and forged echo
+  replies at 5k pps recorded a black-holed target as `reached` in 11 of 12
+  ICMP cycles: the outages hopcorder exists to record. Now:
+  - The IPv4 IP ID is drawn on its own (1..0xffff; for 0 Linux would pick
+    one), and ICMPv4 errors must still quote it.
+  - ICMP and UDP probes carry a random 4-byte nonce after the compensation
+    word (16 payload bytes, were 12). Echo replies must echo it. An ICMP
+    error must quote unchanged whatever it quotes of the payload, cut at
+    the length the quoted IP header states, so RFC 4884 padding is not
+    compared. On IPv4 a quote of 8 bytes (RFC 792's minimum), or one padded
+    with zeros right after them, still counts: the IP ID covers it.
+  - On IPv6, ICMP errors for ICMP and UDP probes must quote the nonce.
+    Checked only "where quoted", a spoofer would quote 8 bytes and face 16
+    bits again (IPv6 has no IP ID), and RFC 4443 requires as much of the
+    packet as fits in 1280 bytes. Trade-off: an IPv6 router that quotes
+    less stays silent, counted as mismatched, as an IP ID rewriting
+    middlebox does on IPv4.
+  - TCP SYNs carry 16 random bits in the low half of the sequence number;
+    a SYN-ACK or RST must acknowledge exactly seq+1, an ICMP error must
+    quote all 32 bits (`pendingProbe.seq`).
+  - Paris: the compensation word cancels seq and the nonce, so the ICMP
+    checksum stays constant per flow; ports, identifier and lengths do not
+    change (TestParisKeepsFlowConstant, TestInnerPath).
+  - Random bits a forgery must guess: echo reply 48 (id and nonce);
+    ICMPv4 error 32 (id and IP ID), 64 if it quotes the payload, 48 for
+    TCP; ICMPv6 error 48, 32 for TCP; TCP reply 32.
+  - Measured with the review's spoofer, rerun as TestRawNetns/spoof (every
+    hop and the target silent, 3 cycles of 30 TTLs per protocol, two
+    runs): before, at least 6 fake hops in every UDP cycle at 20k pps and
+    4–10 fake `reply` hops in every ICMP cycle at 10k pps; after, none,
+    while 28 and 14 forgeries hit a probe in flight and were counted as
+    mismatched.
+- **Local processes can no longer forge TCP replies** (corrects
+  round two, which said they cannot be provoked without choosing the
+  SYN's sequence number). An unprivileged process that binds the unheld
+  TCP flow port and loops `connect()` to the target gets SYN-ACKs or RSTs
+  for the kernel's ISN, and only its top 16 bits were compared: the review
+  got 2 of 38 cycles recorded as `reached` at about 270 connects/s as uid
+  65534. With the exact ack an attempt matches with probability N/2^32 for
+  N probes in flight; at that rate, with 30 probes in flight a fifth of the
+  time (1 s timeout, 5 s interval), about one forged reply per month of
+  continuous attack, at a random TTL of one cycle. The TCP source port is
+  still not held: round two's reasons stand (TIME_WAIT makes the bind fail
+  at random on busy hosts, and with `SO_REUSEADDR` the hold can be shared),
+  and against a 1-in-2^32 guess a hold would add little.
+- **Accepted (forged replies):** forgeries still count in
+  `hopcorder_probe_mismatched_replies_total` (it measures attempts), and a
+  forgery for a timed-out probe's key counts as a late reply without the
+  further checks; neither reaches a record.
+- **Tests (forged replies):** TestEngineForgedRepliesRefused (15
+  forgeries, one per check and family; each forged reply is refused and
+  counted, and the probe stays pending for the genuine reply, which
+  arrives 20 ms later). Undoing any one fix in a scratch copy (IP ID =
+  probe id; no quote check; top 16 bits of the ack; the old echo data)
+  fails its cases. Also TestEngineIPIDIndependentOfProbeID,
+  TestEngineShortQuotes, TestQuoteMatches, and golden bytes regenerated by
+  an independent Python script. TestRawNetns/spoof fails on the pre-fix
+  code with fake hops in every cycle. TestParisKeepsFlowConstant now
+  checks ids for uniqueness per key: classic mode varies a port, and the
+  check failed about 1 run in 200.
+- **A reload never stops the agent, and never frees the metrics port.**
+  `runDaemon` closed the metrics listener on SIGHUP and bound it again only
+  after the outputs and `spool.Open` (whose full read of the spool widens
+  the window). A local user polling `bind()` took the port: the new
+  configuration failed, the revert failed the same way, `superviseDaemon`
+  returned, and the agent exited; with `Restart=always` every restart
+  failed while the port was held, and scrapes got the squatter's numbers
+  (the review won on the first SIGHUP as uid 65534; README tells operators
+  to reload daily from logrotate). Now:
+  - The supervisor owns the listener (`output.MetricsServer`), like the
+    prober. A configuration with the same `metrics.listen` gets the same
+    listener and only swaps what it serves (`Serve(path, metrics)`); while
+    no configuration runs it answers 503, so Prometheus sees `up == 0`.
+  - A new address is bound before the configuration starts, and the old
+    listener is closed only once the new configuration runs; if it fails,
+    the revert finds the old listener still bound. Cost: moving to an
+    address that overlaps the old one on the same port (`127.0.0.1:9469` to
+    `:9469`) fails the bind and is reverted; that needs a restart (README).
+  - Only the first start can end the supervisor. When the revert fails too
+    (anything else that can fail at start: a JSONL directory gone, the
+    spool locked, a certificate unreadable), the previous configuration is
+    retried with a wait doubling from `restartBackoffMin` (1 s) to
+    `restartBackoffMax` (1 min), logging an error each time, until it
+    starts or a reload brings one that does. Nothing is probed meanwhile;
+    retrying rather than probing without outputs, because every record
+    must go through the spool. `runDaemon` returning on its own (it does
+    not today) restarts the configuration the same way.
+  - Accepted: a local user who binds the port before the agent's first
+    start still fails that start (exit 1, systemd retries), as for any
+    service on an unprivileged port; the first start failing loudly is
+    §5.4's rule ("validate the whole config at startup and fail loudly").
+  - Tests (fake prober): TestReloadKeepsTheMetricsPort (a goroutine polls
+    `net.Listen` on the port during the reload; it never binds, the new
+    configuration runs and the port serves the agent's metrics),
+    TestReloadRetriesWhenTheRevertFails (the reload fails, the previous
+    configuration's JSONL directory is gone: the supervisor keeps running,
+    holds the port and answers 503, and resumes once the directory is
+    back), TestReloadMovesTheMetricsAddress, TestMetricsServer. The first
+    two fail against the previous supervisor ("address already in use",
+    and the supervisor exits).
+- **An echo identifier in use stops only its ICMP targets.** Where
+  `ping_group_range` admits everyone (systemd's default), a local user who
+  bound a ping socket to identifier 33434 before the agent started made
+  every start fail with `ErrFlowInUse`, UDP and TCP targets included (the
+  review: two starts as uid 65534, both exit 1). Now `HoldFlows` holds what
+  it can and returns the rest; `Raw.Trace` refuses an ICMP flow whose
+  identifier it was asked for but could not hold, after trying to hold it
+  again, so the targets come back by themselves once it is free (each
+  cycle retries: a socket and a bind). The targets' cycles fail: the
+  runner logs an error when it starts and info when it ends (debug in
+  between), `hopcorder_cycle_errors_total` counts them, and the gauge
+  `hopcorder_flow_in_use{target,protocol}` is 1 meanwhile (the
+  `agent.Observer`'s `CycleFailed` now gets the error). `runDaemon` and
+  `--once` log the hold failure and go on. `--once` prints the other
+  targets' records and exits 1, as for any target it cannot probe.
+  - Refusing rather than probing unprotected: with another process on the
+    identifier, its ping socket sees our echo replies and errors (with
+    their nonces) and can send echoes with our identifier, and a second
+    hopcorder on the flow is a misconfiguration to show, not to hide.
+  - Tests: TestDaemonFlowInUseStopsOnlyItsTargets (fake prober,
+    `Fake.SetHoldErr` per flow: the TCP and UDP targets are recorded, the
+    ICMP one not, the gauge is 1, and after the identifier frees the ICMP
+    target is recorded without a reload; before, `runDaemon` failed at
+    start). TestInnerHoldFlows (rawsock) checks the second prober's UDP
+    flow traces while its ICMP flow is refused, and that an identifier a
+    uid 65534 process held and let go is taken back by the next trace.
+- **The spool's page structure is checked before bbolt reads it, and
+  damage found while running is quarantined at once.** Round two's walk
+  did not cover everything bbolt trusts. In the review's 3000 random
+  corruptions, opened in child processes: one faulted inside `tx.Check`
+  (it reads branch keys, which a cursor never touches) on every start; 54
+  hung or grew to 1.5 GB in 16 s, all from a damaged page header
+  `overflow` field (`verifyPageReachable` loops up to 2^32 times); one
+  passed the check and panicked on the first Ack ("page already freed": an
+  overflow span covering a free page, which `tx.Check` compares with the
+  freelist only at its first page). A leaf element flagged as a nested
+  bucket rooted at its own page made `walkBucket` recurse until the stack
+  overflowed, on every start. Now:
+  - `checkPages` reads the file (`ReadAt`, not the mapping) under a shared
+    lock (a read-only bbolt open, which reads only the meta pages and still
+    gives `ErrLocked` while an agent has the file) and checks: the meta page
+    bbolt will use (the valid one with the higher txid, as bbolt picks it)
+    with the high water mark within the file; every page reachable from the
+    root and the freelist page for id, type, overflow within the high water
+    mark, and no page reached twice (so no cycles) or reachable and free;
+    every element within its page's span, no empty branch, depth at most
+    64; buckets only in the root and none in them, inline ones included;
+    freelist ids within the file and unique, read in 64 KiB chunks; every
+    page reachable or free. bbolt's on-disk format has not changed since
+    boltdb (version 2), and the check reads it in the host's byte order,
+    as bbolt does. Then bbolt opens the file read-write, the cursor walk
+    (which now also refuses nested buckets) and `tx.Check` run as before,
+    on a structure in which they cannot fault, loop or recurse.
+  - Chosen over running the check in a child process with a timeout and
+    memory cap: a re-exec would depend on `/proc/self/exe` and on the
+    systemd unit's and the container's sandboxing allowing it, a child's
+    memory counts against the same cgroup limit (the chart's 256 MiB), and
+    it would still leave damage that passes the check to crash the agent
+    later. The check is cheap: opening a 48 MB spool (12,000 records, page
+    cache warm) took 16 ms instead of 12.
+  - Every transaction runs under `guard`: `debug.SetPanicOnFault` for its
+    goroutine (drains and schedulers read and write in goroutines of their
+    own) and a recover. A panic or fault there fails that operation with an
+    error wrapping `errCorrupt`, and `Spool.replace` closes the database
+    (giving up after 5 s, in case bbolt's locks stayed held), moves the
+    file aside as `spool.db.corrupt-<time>` and opens an empty spool in its
+    place at once, seqs from the clock. Operations hold a read lock on the
+    database (`dbMu`), the replacement the write lock. If the replacement
+    fails (say the rename does), every operation tries again. Accepted: a
+    panic from a bug of our own inside a transaction is taken for damage
+    too; the file is kept for inspection.
+  - Not covered: a file cut below two pages still fails `bolt.Open` with a
+    plain error and is not quarantined, as before. (A freelist count that
+    claims more ids than its pages hold is refused before the writable
+    open, which would otherwise allocate them.)
+  - Tests, each opening the file in a child process (`TestDamagedChild`,
+    which bounds its run to 20 s and its heap to 512 MiB, uses both
+    consumers like the drains and appends like the schedulers):
+    TestDirectedDamageIsQuarantined (a nested bucket rooted at its own
+    page, a leaf's and the freelist's overflow count, a branch key outside
+    the mapping, a branch element pointing at its own page, an overflow
+    over a free page), TestDamageInUseIsQuarantined (a key moved outside
+    the mapping under the open database, and a panicking write
+    transaction), TestRandomDamageCorpus (cases 0..63 of the review's
+    generator and six cases that grew without bound before). Against the
+    previous spool every directed and in-use case fails (stack overflow,
+    the heap bound, "fatal error: fault", a kept file) and the corpus
+    sample with six failures; with the fix the full 3000-case campaign
+    (`HOPCORDER_SPOOL_CORPUS=3000`) keeps 2273 files and quarantines 727,
+    none failing, and the review's three kept files are quarantined at
+    open.
 
 **CI, release and deployment**
 

@@ -207,17 +207,25 @@ sudo setcap cap_net_raw+ep "$(command -v hopcorder)"
 or run it under systemd with `AmbientCapabilities=CAP_NET_RAW` (the shipped
 unit does). Without the capability the agent exits at startup and says so.
 
-**Other processes on the host.** Replies to probes reach every process that
-asks for them, so the agent keeps other local users from passing their
-packets off as answers: probe ids are random, ICMPv4 errors must quote the IP
-ID the probe was sent with, echo replies must echo its data, and the agent
-holds its ICMP echo identifier (`flow_id`) with an unprivileged "ping"
-socket, so no other process can claim it. That last part needs ping sockets
+**Forged answers.** Replies to probes reach every process that asks for
+them, and anyone who can send packets to the host can try to pass forged
+ones off as answers. So a reply must match more than the probe's random
+16-bit id: ICMPv4 errors must quote the probe's IP ID (random too), echo
+replies must echo a random nonce in its data, ICMP errors that quote the
+probe's payload must quote that nonce (on IPv6 they must quote it), and TCP
+replies must acknowledge the SYN's exact sequence number (32 random bits).
+Mismatches are dropped and counted in
+`hopcorder_probe_mismatched_replies_total`. The agent also holds its ICMP
+echo identifier (`flow_id`) with an unprivileged "ping" socket, so no other
+local process can claim it. That last part needs ping sockets
 for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
 every group); where other groups have them but the agent's does not, it
-logs so at startup. A second hopcorder (or `ping`) using the same echo
-identifier makes the agent fail at startup; give every process its own
-`flow_id` (`--flow-id`).
+logs so at startup. If another process (a second hopcorder, a `ping`, any
+local user) holds the echo identifier first, the agent's ICMP targets of
+that flow are not probed: it logs an error, `hopcorder_flow_in_use` is 1 and
+their cycles count as errors. Every other target is probed, and the ICMP
+targets resume by themselves once the identifier is free (tried every
+cycle). Give every hopcorder process its own `flow_id` (`--flow-id`).
 
 ## Quick start
 
@@ -262,7 +270,7 @@ and in `agent.example.yaml` show.
   held constant across all TTLs of a cycle and across cycles, so a
   load-balanced path is traced as one consistent path instead of flapping
   between members. ICMP keeps identifier and checksum constant (the payload
-  compensates for the sequence number); UDP keeps both ports fixed and makes
+  compensates for the sequence number and the nonce); UDP keeps both ports fixed and makes
   the UDP checksum the probe id; TCP keeps both ports fixed and carries the
   probe id in the SYN's sequence number. `flow_id` (ICMP id / UDP or TCP
   source port) is on every record. `paris: false` gives classic traceroute
@@ -310,7 +318,9 @@ Derived per cycle:
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
 next to a running agent with another `flow_id` (`--once --flow-id 40000
-example.net`); with the daemon's ICMP `flow_id` it fails at startup.
+example.net`). With the daemon's ICMP `flow_id` its ICMP targets fail like
+any target that cannot be probed: the other targets' records are printed,
+the error is logged, and the exit status is 1.
 
 ## Caveats when reading the data
 
@@ -332,16 +342,21 @@ example.net`); with the daemon's ICMP `flow_id` it fails at startup.
 - **NAT** in front of the agent usually rewrites and restores the probe
   headers transparently; a NAT that does not restore the quoted header breaks
   reply matching (every hop beyond it shows `no-reply`).
+- **IPv6 routers must quote the whole probe** in their ICMPv6 errors, as RFC
+  4443 requires: one that quotes only the first 8 bytes shows `no-reply`
+  (and counts in `hopcorder_probe_mismatched_replies_total`), since a spoofer
+  could otherwise leave out the nonce. IPv4 routers may quote 8 bytes.
 - **TCP "reply" may come from a middlebox.** Transparent proxies, SYN proxies
   and some load balancers answer the SYN with the destination's address, so a
   TCP trace can "reach" the target hops early (seen on the first test: port
   443 answered at TTL 2 behind a proxy). Compare with an ICMP or UDP trace to
   the same target when TCP distances look short.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
-  need different `flow_id`s. For ICMP the second one fails at startup (the
-  first holds the echo identifier, where ping sockets are permitted); with
-  UDP or TCP, or without ping sockets, it starts, and the two can
-  occasionally pick up each other's replies.
+  need different `flow_id`s. For ICMP the second one does not probe its
+  targets on that flow (the first holds the echo identifier, where ping
+  sockets are permitted); with UDP or TCP, or without ping sockets, both
+  probe, and the random IP IDs, nonces and sequence numbers make it very
+  unlikely that one takes the other's replies.
 - **Beyond the destination**: with `adaptive_max_ttl` (default), once a
   target has been reached, cycles probe only 3 TTLs past its distance. If such
   a cycle neither reaches the destination nor hits an unreachable (the path
@@ -416,13 +431,14 @@ hop addresses.
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
+| `hopcorder_flow_in_use` | target, protocol | 1 while the target is not probed because another process holds its ICMP echo identifier (`flow_id`) |
 | `hopcorder_resolve_errors_total` | target, protocol | Failed DNS lookups |
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
 | `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
 | `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
-| `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe but quoting another IPv4 ID or echoing other data, dropped: answers to another process's packets, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
+| `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number, dropped: answers to another process's packets, forgeries, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 
@@ -434,9 +450,16 @@ hop addresses.
 - **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent
-  restarts in-process with it (raw sockets stay open, seq continues); if the
-  new configuration cannot start, for example because its metrics address is
-  taken, the previous one is started again. Every reload reopens the JSONL
+  restarts in-process with it (raw sockets stay open, seq continues, and so
+  does the metrics listener while its address is unchanged; a new address is
+  bound before the old one is released). If the new configuration cannot
+  start, for example because its new metrics address is taken, the previous
+  one is started again; if that fails too, it is retried (from 1 s, doubling
+  to a minute) until it starts or another reload brings one that does, with
+  errors in the log and the metrics endpoint answering 503 meanwhile. A
+  reload never stops the agent. Moving the endpoint to another address with
+  the same port (`127.0.0.1:9469` to `:9469`) needs a restart: the new
+  address cannot be bound while the old one is. Every reload reopens the JSONL
   file, so log rotation can rename it and send SIGHUP instead of using
   `copytruncate`:
 
@@ -458,7 +481,8 @@ hop addresses.
   record carries `target_ip`.
 - **Spool disk use** tracks the high-water mark of `max_bytes` plus database
   overhead; the file reuses free space but does not shrink.
-- **A corrupt spool file** (failed consistency check at start) is renamed to
+- **A corrupt spool file** (its page structure or consistency check fails at
+  start, or bbolt faults or panics on it while the agent runs) is renamed to
   `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from
   the clock like any new spool's; the error is logged. The records
   in the old file are not delivered.

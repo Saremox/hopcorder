@@ -42,13 +42,23 @@ func (h heldID) String() string {
 // first.) Where ping sockets are not permitted for this process
 // (net.ipv4.ping_group_range), nothing is held and that is logged once.
 //
+// An identifier that cannot be held (another process has it, or the socket
+// fails) is left out; the error lists every such flow, and every other flow
+// is held. Trace refuses the left-out flows with that error, so another
+// process on the identifier stops only the ICMP targets of that flow, and
+// tries to hold the identifier again first: the targets resume once it is
+// free.
+//
 // UDP and TCP source ports are not held: a bound UDP port swallows the
 // datagrams other tracers send to it, so the host would stop answering them
 // with port unreachable, and a TCP port cannot be bound while any earlier
-// connection on it is in TIME_WAIT. Forged ICMP errors for those probes are
-// refused by the IP ID check instead, and their destination answers
-// (SYN-ACK, RST) cannot be provoked without choosing the SYN's sequence
-// number.
+// connection on it is in TIME_WAIT (and with SO_REUSEADDR the hold could
+// be shared). Forged ICMP errors for those probes are refused by the IP ID
+// check instead. A local process can provoke a destination's SYN-ACK or RST
+// from the flow's port with connect(), but the kernel chooses that SYN's
+// sequence number, and a reply counts only if it acknowledges a probe's
+// exact one (32 random bits: the probe id and 16 more): one attempt in 2^32
+// per probe in flight matches.
 func (r *Raw) HoldFlows(flows []Flow) error {
 	want := map[uint16]bool{}
 	var order []uint16
@@ -67,55 +77,79 @@ func (r *Raw) HoldFlows(flows []Flow) error {
 	if closed {
 		return errClosed
 	}
-	held := map[uint16]bool{}
-	for h := range r.held {
-		held[h.id] = true
-	}
-	opened := map[heldID]io.Closer{}
-	fail := func(h heldID, err error) error {
-		for _, c := range opened {
-			_ = c.Close()
-		}
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return fmt.Errorf("icmp flow_id %d: %s is %w (another hopcorder, or a ping, with the same identifier?); "+
-				"every hopcorder process on a host needs its own flow_id", h.id, h, ErrFlowInUse)
-		}
-		return fmt.Errorf("icmp flow_id %d: hold %s: %w", h.id, h, err)
-	}
-	for _, id := range order {
-		if held[id] {
-			continue
-		}
-		var first heldID
-		var firstErr error
-		for _, v6 := range []bool{false, true} {
-			h := heldID{v6: v6, id: id}
-			c, err := holdEchoID(h)
-			if err == nil {
-				opened[h] = c
-				firstErr = nil
-				break
-			}
-			if !errors.Is(err, errCannotHold) {
-				return fail(h, err)
-			}
-			if firstErr == nil {
-				first, firstErr = h, err
-			}
-		}
-		if firstErr != nil { // neither family: report why IPv4 could not
-			r.logCannotHold(first, firstErr)
-		}
-	}
 	for h, c := range r.held {
 		if !want[h.id] {
 			_ = c.Close()
 			delete(r.held, h)
 		}
 	}
-	for h, c := range opened {
-		r.held[h] = c
+	r.blocked = map[uint16]error{}
+	var errs []error
+	for _, id := range order {
+		if err := r.holdLocked(id); err != nil {
+			r.blocked[id] = err
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
+}
+
+// flowReady returns nil if the probes of the ICMP flow with identifier id
+// may be sent: HoldFlows was not asked to hold it, or holds it, or this
+// process cannot hold identifiers at all. If HoldFlows could not hold it,
+// it tries again and returns why it still cannot.
+func (r *Raw) flowReady(id uint16) error {
+	r.holdMu.Lock()
+	defer r.holdMu.Unlock()
+	if _, blocked := r.blocked[id]; !blocked {
+		return nil
+	}
+	r.mu.Lock()
+	closed := r.closed
+	r.mu.Unlock()
+	if closed {
+		return errClosed
+	}
+	if err := r.holdLocked(id); err != nil {
+		r.blocked[id] = err
+		return err
+	}
+	delete(r.blocked, id)
+	r.log.Info("now holding the ICMP echo identifier; probing its targets again", "identifier", id)
+	return nil
+}
+
+// holdLocked holds echo identifier id unless it is held already. Where this
+// process cannot hold identifiers (errCannotHold) that is logged and nil
+// returned; other failures are returned.
+func (r *Raw) holdLocked(id uint16) error {
+	for h := range r.held {
+		if h.id == id {
+			return nil
+		}
+	}
+	var first heldID
+	var firstErr error
+	for _, v6 := range []bool{false, true} {
+		h := heldID{v6: v6, id: id}
+		c, err := holdEchoID(h)
+		if err == nil {
+			r.held[h] = c
+			return nil
+		}
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("icmp flow_id %d: %s is %w (another hopcorder, or a ping, with the same identifier?); "+
+				"every hopcorder process on a host needs its own flow_id", h.id, h, ErrFlowInUse)
+		}
+		if !errors.Is(err, errCannotHold) {
+			return fmt.Errorf("icmp flow_id %d: hold %s: %w", h.id, h, err)
+		}
+		if firstErr == nil {
+			first, firstErr = h, err
+		}
+	}
+	// Neither family: report why IPv4 could not.
+	r.logCannotHold(first, firstErr)
 	return nil
 }
 

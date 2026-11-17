@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,6 +44,7 @@ type Metrics struct {
 	loops         *prometheus.CounterVec
 	overruns      *prometheus.CounterVec
 	cycleErrors   *prometheus.CounterVec
+	flowInUse     *prometheus.GaugeVec
 	resolveErrors *prometheus.CounterVec
 	outputErrors  *prometheus.CounterVec
 
@@ -90,6 +92,10 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		cycleErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_cycle_errors_total", Help: "Cycles that could not be run.",
 		}, tp),
+		flowInUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "hopcorder_flow_in_use",
+			Help: "1 while the target is not probed because another process holds its flow's identifier (ICMP echo identifier = flow_id).",
+		}, tp),
 		resolveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_resolve_errors_total", Help: "Failed DNS resolutions of a target.",
 		}, tp),
@@ -99,7 +105,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		paths: map[*agent.Target]*record.PathTracker{},
 	}
 	r.MustRegister(m.cycles, m.rtt, m.pathLen, m.pathChanges, m.loops, m.overruns,
-		m.cycleErrors, m.resolveErrors, m.outputErrors)
+		m.cycleErrors, m.flowInUse, m.resolveErrors, m.outputErrors)
 
 	build := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "hopcorder_build_info", Help: "Build information.",
@@ -141,7 +147,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			}, func() float64 { return float64(pr.Stats().SendErrors) }),
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "hopcorder_probe_mismatched_replies_total",
-				Help: "Replies that matched an in-flight probe but quoted another IPv4 ID or echoed other data (another process's packets, or IP IDs rewritten on the path); dropped.",
+				Help: "Replies that matched an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number (another process's packets, forgeries, or IP IDs rewritten on the path); dropped.",
 			}, func() float64 { return float64(pr.Stats().MismatchedReplies) }),
 		)
 	}
@@ -155,6 +161,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		for _, v := range []*prometheus.CounterVec{m.pathChanges, m.loops, m.overruns, m.cycleErrors, m.resolveErrors} {
 			v.WithLabelValues(host, proto)
 		}
+		m.flowInUse.WithLabelValues(host, proto)
 	}
 	return m
 }
@@ -167,10 +174,21 @@ func (m *Metrics) Handler() http.Handler {
 // maxMetricsConns caps concurrent connections to the metrics endpoint.
 const maxMetricsConns = 64
 
-// Serve listens on addr and serves the metrics at path. The returned stop
-// function shuts the server down and returns once the listener is closed,
-// so the address can be bound again right away (as a config reload does).
-func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger) (stop func(), err error) {
+// MetricsServer is the metrics endpoint's HTTP server. Its listener
+// outlives configurations: a reload swaps what it serves (Serve), never the
+// socket, so the port is never free for another local process to take
+// (which would make the new configuration, and going back to the old one,
+// fail to bind it, and could serve made-up metrics).
+type MetricsServer struct {
+	addr string
+	srv  *http.Server
+	done chan struct{}
+	mux  atomic.Pointer[http.ServeMux] // nil: no configuration is running
+}
+
+// ListenMetrics binds addr and serves on it. Until Serve installs metrics
+// it answers 503.
+func ListenMetrics(ctx context.Context, addr string, log *slog.Logger) (*MetricsServer, error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -180,24 +198,50 @@ func (m *Metrics) Serve(ctx context.Context, addr, path string, log *slog.Logger
 	// clients cannot pin goroutines and file descriptors the agent needs
 	// for probing.
 	ln = netutil.LimitListener(ln, maxMetricsConns)
-	mux := http.NewServeMux()
-	mux.Handle(path, m.Handler())
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
+	s := &MetricsServer{addr: addr, done: make(chan struct{})}
+	s.srv = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
 		WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 16 << 10}
-	log.Info("serving metrics", "addr", ln.Addr().String(), "path", path)
-	done := make(chan struct{})
+	log.Info("serving metrics", "addr", ln.Addr().String())
 	go func() {
-		defer close(done)
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		defer close(s.done)
+		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server failed", "err", err)
 		}
 	}()
-	return func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
-		<-done
-	}, nil
+	return s, nil
+}
+
+// Addr returns the address the server was asked to listen on.
+func (s *MetricsServer) Addr() string { return s.addr }
+
+// Serve makes the server serve m's metrics at path. With m nil it answers
+// 503 instead, while no configuration is running.
+func (s *MetricsServer) Serve(path string, m *Metrics) {
+	if m == nil {
+		s.mux.Store(nil)
+		return
+	}
+	mux := http.NewServeMux()
+	mux.Handle(path, m.Handler())
+	s.mux.Store(mux)
+}
+
+// ServeHTTP implements http.Handler.
+func (s *MetricsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mux := s.mux.Load()
+	if mux == nil {
+		http.Error(w, "the agent is (re)starting", http.StatusServiceUnavailable)
+		return
+	}
+	mux.ServeHTTP(w, r)
+}
+
+// Close shuts the server down and returns once the listener is closed.
+func (s *MetricsServer) Close() {
+	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.srv.Shutdown(sctx)
+	<-s.done
 }
 
 // OutputError counts a failed delivery; pass it as DrainOptions.OnError.
@@ -217,6 +261,7 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 		}
 	}
 	m.cycles.WithLabelValues(host, proto, result).Inc()
+	m.flowInUse.WithLabelValues(host, proto).Set(0)
 	m.pathLen.WithLabelValues(host, proto).Set(float64(rec.PathLen))
 	if len(rec.Loops) > 0 {
 		m.loops.WithLabelValues(host, proto).Inc()
@@ -235,8 +280,11 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 }
 
 // CycleFailed implements agent.Observer.
-func (m *Metrics) CycleFailed(t *agent.Target) {
+func (m *Metrics) CycleFailed(t *agent.Target, err error) {
 	m.cycleErrors.WithLabelValues(t.Host, string(t.Protocol)).Inc()
+	if errors.Is(err, probe.ErrFlowInUse) {
+		m.flowInUse.WithLabelValues(t.Host, string(t.Protocol)).Set(1)
+	}
 }
 
 // CycleOverrun implements agent.Observer.

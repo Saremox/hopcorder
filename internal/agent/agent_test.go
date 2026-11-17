@@ -47,7 +47,7 @@ type countObserver struct {
 }
 
 func (o *countObserver) CycleDone(*Target, *record.Record) { o.done.Add(1) }
-func (o *countObserver) CycleFailed(*Target)               { o.failed.Add(1) }
+func (o *countObserver) CycleFailed(*Target, error)        { o.failed.Add(1) }
 func (o *countObserver) CycleOverrun(*Target)              { o.overrun.Add(1) }
 func (o *countObserver) ResolveFailed(*Target)             { o.resolve.Add(1) }
 

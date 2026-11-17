@@ -53,9 +53,12 @@ type Raw struct {
 	v6     *raw6
 	wg     sync.WaitGroup
 
-	// held are the ping sockets holding echo identifiers (see HoldFlows).
+	// held are the ping sockets holding echo identifiers (see HoldFlows);
+	// blocked are the identifiers HoldFlows was asked for but could not
+	// hold, with the reason, whose flows Trace refuses.
 	holdMu     sync.Mutex
 	held       map[heldID]io.Closer
+	blocked    map[uint16]error
 	holdLogged map[bool]bool // by v6: "cannot hold" was logged
 
 	// kernelStamped counts replies whose receive time came from the kernel.
@@ -80,7 +83,7 @@ func NewRaw(logger *slog.Logger) *Raw {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	r := &Raw{log: logger, held: map[heldID]io.Closer{}, holdLogged: map[bool]bool{}}
+	r := &Raw{log: logger, held: map[heldID]io.Closer{}, blocked: map[uint16]error{}, holdLogged: map[bool]bool{}}
 	r.eng = newEngine(r)
 	return r
 }
@@ -98,8 +101,14 @@ func (r *Raw) Check() error {
 	return nil
 }
 
-// Trace implements Prober.
+// Trace implements Prober. An ICMP flow whose echo identifier HoldFlows was
+// asked for but could not hold is refused (see HoldFlows).
 func (r *Raw) Trace(ctx context.Context, req TraceRequest) ([]HopResult, error) {
+	if req.Protocol == ICMP {
+		if err := r.flowReady(req.FlowID); err != nil {
+			return nil, err
+		}
+	}
 	return r.eng.trace(ctx, req)
 }
 
