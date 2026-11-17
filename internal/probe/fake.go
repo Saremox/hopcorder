@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -28,8 +29,9 @@ type Fake struct {
 	scenarios map[netip.Addr][]Scenario
 	cycles    map[netip.Addr]int
 	requests  []TraceRequest
-	held      []Flow
-	holdErr   error
+	wanted    []Flow         // the flows of the last HoldFlows
+	holdErr   map[Flow]error // flows that cannot be held, see SetHoldErr
+	refused   map[Flow]error // wanted flows not held: Trace refuses them
 
 	late  atomic.Uint64
 	sent  atomic.Uint64
@@ -99,30 +101,65 @@ func (f *Fake) Requests() []TraceRequest {
 	return slices.Clone(f.requests)
 }
 
-// SetHoldErr makes later HoldFlows calls fail with err (nil: succeed).
-func (f *Fake) SetHoldErr(err error) {
+// SetHoldErr makes holding flow fail with err from now on (nil: succeed),
+// as if another process held its identifier: HoldFlows leaves it out and
+// returns err, and Trace refuses the flow with err until a retry (on each
+// Trace) succeeds.
+func (f *Fake) SetHoldErr(flow Flow, err error) {
 	f.mu.Lock()
-	f.holdErr = err
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	if f.holdErr == nil {
+		f.holdErr = map[Flow]error{}
+	}
+	if err == nil {
+		delete(f.holdErr, flow)
+		return
+	}
+	f.holdErr[flow] = err
 }
 
-// HoldFlows implements FlowHolder: it records flows, or fails as set by
-// SetHoldErr.
+// HoldFlows implements FlowHolder: it holds flows except those SetHoldErr
+// made fail, and returns their errors.
 func (f *Fake) HoldFlows(flows []Flow) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.holdErr != nil {
-		return f.holdErr
+	f.wanted, f.refused = slices.Clone(flows), map[Flow]error{}
+	var errs []error
+	for _, fl := range flows {
+		if err := f.holdErr[fl]; err != nil {
+			f.refused[fl] = err
+			errs = append(errs, err)
+		}
 	}
-	f.held = slices.Clone(flows)
-	return nil
+	return errors.Join(errs...)
 }
 
-// Held returns the flows of the last successful HoldFlows.
+// Held returns the flows HoldFlows was last given that are held.
 func (f *Fake) Held() []Flow {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return slices.Clone(f.held)
+	var out []Flow
+	for _, fl := range f.wanted {
+		if _, refused := f.refused[fl]; !refused {
+			out = append(out, fl)
+		}
+	}
+	return out
+}
+
+// flowReady is Raw.flowReady for the fake: a refused flow is retried.
+func (f *Fake) flowReady(fl Flow) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, refused := f.refused[fl]; !refused {
+		return nil
+	}
+	if err := f.holdErr[fl]; err != nil {
+		f.refused[fl] = err
+		return err
+	}
+	delete(f.refused, fl)
+	return nil
 }
 
 // Stats implements StatsProvider.
@@ -134,9 +171,13 @@ func (f *Fake) Stats() Stats {
 // flight at the same time.
 func (f *Fake) PeakConcurrency() int { return int(f.peak.Load()) }
 
-// Trace implements Prober.
+// Trace implements Prober. A flow HoldFlows could not hold is refused (and
+// not recorded in Requests) until holding it succeeds.
 func (f *Fake) Trace(ctx context.Context, req TraceRequest) ([]HopResult, error) {
 	if err := req.Validate(); err != nil {
+		return nil, err
+	}
+	if err := f.flowReady(Flow{Protocol: req.Protocol, ID: req.FlowID}); err != nil {
 		return nil, err
 	}
 	n := f.inUse.Add(1)

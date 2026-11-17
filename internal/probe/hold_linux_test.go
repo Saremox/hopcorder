@@ -87,10 +87,20 @@ func TestUnprivilegedChild(t *testing.T) {
 		}
 	}
 	udp := -1
+	squatted := map[int]int{} // identifier -> ping socket
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
 		switch f[0] {
+		case "release-ping": // release-ping <identifier>: close a squatted one
+			id, _ := strconv.Atoi(f[1])
+			fd, ok := squatted[id]
+			var err error = syscall.EBADF
+			if ok {
+				err = syscall.Close(fd)
+				delete(squatted, id)
+			}
+			fmt.Printf("%s %d: %v\n", f[0], id, err)
 		case "whoami":
 			st, _ := os.ReadFile("/proc/self/status")
 			var capEff string
@@ -107,6 +117,8 @@ func TestUnprivilegedChild(t *testing.T) {
 				err = syscall.Bind(fd, &syscall.SockaddrInet4{Port: id})
 				if f[0] == "bind-ping" || err != nil {
 					_ = syscall.Close(fd)
+				} else {
+					squatted[id] = fd
 				}
 			}
 			fmt.Printf("%s %d: %v\n", f[0], id, err)
@@ -192,20 +204,54 @@ func TestInnerHoldFlows(t *testing.T) {
 	if got := u.do("bind-ping 4244"); got != "bind-ping 4244: <nil>" {
 		t.Errorf("unprivileged process on a free echo identifier: %q (ping sockets not permitted?)", got)
 	}
-	// A second agent (here another prober in this process) fails clearly.
+	// A second agent (here another prober in this process) fails clearly,
+	// but only for the ICMP flow: its UDP flow is probed.
 	other := NewRaw(nil)
 	t.Cleanup(func() { _ = other.Close() })
+	if err := other.Check(); err != nil {
+		t.Fatal(err)
+	}
 	err = other.HoldFlows(flows)
 	if !errors.Is(err, ErrFlowInUse) || !strings.Contains(err.Error(), "ICMP echo identifier 4242") {
 		t.Errorf("second holder: %v", err)
 	}
-	// An identifier another process took first fails the start.
+	icmp := func(p *Raw, id uint16) error {
+		res, err := p.Trace(t.Context(), TraceRequest{Target: dst, Protocol: ICMP, FlowID: id, Paris: true,
+			MaxTTL: 4, Timeout: time.Second})
+		if err == nil && (res[3].Status != "reply" || res[3].From != dst) {
+			err = fmt.Errorf("trace %+v", res)
+		}
+		return err
+	}
+	if err := icmp(other, 4242); !errors.Is(err, ErrFlowInUse) {
+		t.Errorf("ICMP trace on an identifier another process holds: %v", err)
+	}
+	res, err = other.Trace(t.Context(), TraceRequest{Target: dst, Protocol: UDP, Port: DefaultUDPPort, FlowID: 4243,
+		Paris: true, MaxTTL: 4, Timeout: time.Second})
+	if err != nil || res[3].Status != "reply" {
+		t.Errorf("UDP trace beside the refused ICMP flow: %v %+v", err, res)
+	}
+	// An identifier another process took first stops its flow until that
+	// process lets it go; then the next trace holds it and probes, without
+	// another HoldFlows.
 	if got := u.do("squat-ping 4245"); got != "squat-ping 4245: <nil>" {
 		t.Fatalf("squat: %q", got)
 	}
 	err = other.HoldFlows([]Flow{{Protocol: ICMP, ID: 4245}})
 	if !errors.Is(err, ErrFlowInUse) || !strings.Contains(err.Error(), "ICMP echo identifier 4245") {
 		t.Errorf("identifier held by an unprivileged process: %v", err)
+	}
+	if err := icmp(other, 4245); !errors.Is(err, ErrFlowInUse) {
+		t.Errorf("ICMP trace on an identifier an unprivileged process holds: %v", err)
+	}
+	if got := u.do("release-ping 4245"); got != "release-ping 4245: <nil>" {
+		t.Fatalf("release: %q", got)
+	}
+	if err := icmp(other, 4245); err != nil {
+		t.Errorf("ICMP trace once the identifier is free: %v", err)
+	}
+	if got := u.do("bind-ping 4245"); got != "bind-ping 4245: address already in use" {
+		t.Errorf("identifier taken back by the retry is not held: %q", got)
 	}
 	// UDP source ports are deliberately not held (see HoldFlows).
 	if c, err := net.ListenPacket("udp4", ":4243"); err != nil {

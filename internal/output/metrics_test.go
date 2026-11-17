@@ -1,6 +1,8 @@
 package output
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -64,7 +66,8 @@ func TestMetrics(t *testing.T) {
 	m.CycleDone(t1, mkRecord("10.0.0.1", "10.7.7.7", "=192.0.2.9"))                 // path change
 	m.CycleDone(t1, mkRecord("10.0.0.1", "198.18.1.1", "198.18.1.2", "198.18.1.1")) // loop, unreached, change
 	m.CycleOverrun(t1)
-	m.CycleFailed(t1)
+	m.CycleFailed(t1, errors.New("trace: no route"))
+	m.CycleFailed(&targets[1], fmt.Errorf("trace: %w", probe.ErrFlowInUse))
 	m.ResolveFailed(&targets[1])
 	m.OutputError("http")(nil)
 
@@ -80,6 +83,9 @@ func TestMetrics(t *testing.T) {
 		`hopcorder_e2e_rtt_seconds_bucket{agent_id="lab",protocol="icmp",target="dc1.example",le="0.025"} 3`,
 		`hopcorder_cycle_overruns_total{agent_id="lab",protocol="icmp",target="dc1.example"} 1`,
 		`hopcorder_cycle_errors_total{agent_id="lab",protocol="icmp",target="dc1.example"} 1`,
+		`hopcorder_cycle_errors_total{agent_id="lab",protocol="udp",target="dc2.example"} 1`,
+		`hopcorder_flow_in_use{agent_id="lab",protocol="icmp",target="dc1.example"} 0`,
+		`hopcorder_flow_in_use{agent_id="lab",protocol="udp",target="dc2.example"} 1`,
 		`hopcorder_resolve_errors_total{agent_id="lab",protocol="udp",target="dc2.example"} 1`,
 		`hopcorder_output_errors_total{agent_id="lab",output="http"} 1`,
 		`hopcorder_output_pending_records{agent_id="lab",output="http"} 5`,

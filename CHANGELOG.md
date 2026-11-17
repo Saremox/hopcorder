@@ -94,6 +94,11 @@ The section for a version is the text of its GitHub release.
   processes from forging TCP replies with `connect()`. IPv6 routers must
   quote the whole probe, as RFC 4443 requires; one that quotes only 8 bytes
   now shows `no-reply`.
+- A local user holding the agent's ICMP echo identifier (one ping socket)
+  no longer stops the agent: only the ICMP targets of that `flow_id` wait,
+  with an error in the log and `hopcorder_flow_in_use` at 1, and they
+  resume by themselves once the identifier is free. Every other target is
+  probed. `--once` prints the other targets' records and exits 1.
 
 **Security: CI, release and deployment**
 

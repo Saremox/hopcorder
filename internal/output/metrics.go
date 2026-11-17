@@ -43,6 +43,7 @@ type Metrics struct {
 	loops         *prometheus.CounterVec
 	overruns      *prometheus.CounterVec
 	cycleErrors   *prometheus.CounterVec
+	flowInUse     *prometheus.GaugeVec
 	resolveErrors *prometheus.CounterVec
 	outputErrors  *prometheus.CounterVec
 
@@ -90,6 +91,10 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		cycleErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_cycle_errors_total", Help: "Cycles that could not be run.",
 		}, tp),
+		flowInUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "hopcorder_flow_in_use",
+			Help: "1 while the target is not probed because another process holds its flow's identifier (ICMP echo identifier = flow_id).",
+		}, tp),
 		resolveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_resolve_errors_total", Help: "Failed DNS resolutions of a target.",
 		}, tp),
@@ -99,7 +104,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		paths: map[*agent.Target]*record.PathTracker{},
 	}
 	r.MustRegister(m.cycles, m.rtt, m.pathLen, m.pathChanges, m.loops, m.overruns,
-		m.cycleErrors, m.resolveErrors, m.outputErrors)
+		m.cycleErrors, m.flowInUse, m.resolveErrors, m.outputErrors)
 
 	build := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "hopcorder_build_info", Help: "Build information.",
@@ -155,6 +160,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		for _, v := range []*prometheus.CounterVec{m.pathChanges, m.loops, m.overruns, m.cycleErrors, m.resolveErrors} {
 			v.WithLabelValues(host, proto)
 		}
+		m.flowInUse.WithLabelValues(host, proto)
 	}
 	return m
 }
@@ -217,6 +223,7 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 		}
 	}
 	m.cycles.WithLabelValues(host, proto, result).Inc()
+	m.flowInUse.WithLabelValues(host, proto).Set(0)
 	m.pathLen.WithLabelValues(host, proto).Set(float64(rec.PathLen))
 	if len(rec.Loops) > 0 {
 		m.loops.WithLabelValues(host, proto).Inc()
@@ -235,8 +242,11 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 }
 
 // CycleFailed implements agent.Observer.
-func (m *Metrics) CycleFailed(t *agent.Target) {
+func (m *Metrics) CycleFailed(t *agent.Target, err error) {
 	m.cycleErrors.WithLabelValues(t.Host, string(t.Protocol)).Inc()
+	if errors.Is(err, probe.ErrFlowInUse) {
+		m.flowInUse.WithLabelValues(t.Host, string(t.Protocol)).Set(1)
+	}
 }
 
 // CycleOverrun implements agent.Observer.

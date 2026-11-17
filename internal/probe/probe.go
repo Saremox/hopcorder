@@ -158,14 +158,17 @@ type Flow struct {
 // holds ICMP echo identifiers (see its HoldFlows for why not ports).
 type FlowHolder interface {
 	// HoldFlows makes flows the set held, releasing identifiers of flows
-	// no longer listed. If an identifier cannot be held, nothing changes
-	// and the error wraps ErrFlowInUse when another process holds it.
+	// no longer listed. A flow whose identifier cannot be held is left
+	// out, and the error lists every such flow (wrapping ErrFlowInUse
+	// when another process holds the identifier); the others are held.
+	// Trace refuses a left-out flow with that error, after trying to hold
+	// its identifier again, so its targets resume once it is free.
 	HoldFlows(flows []Flow) error
 }
 
-// ErrFlowInUse is returned (wrapped) by HoldFlows when another process holds
-// a flow's identifier, for example another hopcorder probing with the same
-// flow_id.
+// ErrFlowInUse is returned (wrapped) by HoldFlows, and by Trace for the flow,
+// when another process holds a flow's identifier, for example another
+// hopcorder probing with the same flow_id.
 var ErrFlowInUse = errors.New("in use by another process")
 
 // ErrPermission is returned (wrapped) when raw sockets cannot be opened.

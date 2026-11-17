@@ -466,9 +466,10 @@ added in the commit that introduced it.
   were counted per flow from a random start): drawn per probe, never one
   whose key is in flight, a tombstoned one only when the flow has no other
   free id. Two hopcorder *processes* on one host (e.g. `--once` next to the
-  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second fails
-  at startup, as the first holds the echo identifier; with UDP or TCP both
-  start, and a reply can, rarely, be attributed to the other process's
+  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second does
+  not probe that flow's targets (since round three; it failed at startup
+  before), as the first holds the echo identifier; with UDP or TCP both
+  probe, and a reply can, very rarely, be attributed to the other process's
   probe.
 - **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
   review). Once a target was reached at distance d, cycles probe TTLs
@@ -1479,7 +1480,8 @@ decisions:
   - An identifier held by another process fails the start with
     `ErrFlowInUse` and a hint to use `--flow-id`. A failed reload reverts
     as before. This replaces the "two hopcorder processes" caveat for
-    ICMP.
+    ICMP. (Changed in round three: any local user could stop the whole
+    agent that way; now only that flow's ICMP targets wait.)
   - Without ping sockets for the agent's group
     (`net.ipv4.ping_group_range`) nothing is held. This is logged once:
     at info if other groups may open ping sockets, at debug if nobody can
@@ -1912,6 +1914,32 @@ high-severity issue. Four fixes followed. The decisions:
   still not held: round two's reasons stand (TIME_WAIT makes the bind fail
   at random on busy hosts, and with `SO_REUSEADDR` the hold can be shared),
   and against a 1-in-2^32 guess a hold would add little.
+- **An echo identifier in use stops only its ICMP targets.** Where
+  `ping_group_range` admits everyone (systemd's default), a local user who
+  bound a ping socket to identifier 33434 before the agent started made
+  every start fail with `ErrFlowInUse`, UDP and TCP targets included (the
+  review: two starts as uid 65534, both exit 1). Now `HoldFlows` holds what
+  it can and returns the rest; `Raw.Trace` refuses an ICMP flow whose
+  identifier it was asked for but could not hold, after trying to hold it
+  again, so the targets come back by themselves once it is free (each
+  cycle retries: a socket and a bind). The targets' cycles fail: the
+  runner logs an error when it starts and info when it ends (debug in
+  between), `hopcorder_cycle_errors_total` counts them, and the gauge
+  `hopcorder_flow_in_use{target,protocol}` is 1 meanwhile (the
+  `agent.Observer`'s `CycleFailed` now gets the error). `runDaemon` and
+  `--once` log the hold failure and go on. `--once` prints the other
+  targets' records and exits 1, as for any target it cannot probe.
+  - Refusing rather than probing unprotected: with another process on the
+    identifier, its ping socket sees our echo replies and errors (with
+    their nonces) and can send echoes with our identifier, and a second
+    hopcorder on the flow is a misconfiguration to show, not to hide.
+  - Tests: TestDaemonFlowInUseStopsOnlyItsTargets (fake prober,
+    `Fake.SetHoldErr` per flow: the TCP and UDP targets are recorded, the
+    ICMP one not, the gauge is 1, and after the identifier frees the ICMP
+    target is recorded without a reload; before, `runDaemon` failed at
+    start). TestInnerHoldFlows (rawsock) checks the second prober's UDP
+    flow traces while its ICMP flow is refused, and that an identifier a
+    uid 65534 process held and let go is taken back by the next trace.
 - **Accepted:** forgeries still count in
   `hopcorder_probe_mismatched_replies_total` (it measures attempts), and a
   forgery for a timed-out probe's key counts as a late reply without the

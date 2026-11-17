@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -534,8 +533,7 @@ func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Conf
 	return c
 }
 
-// The daemon holds its targets' flows before anything else, and a flow held
-// by another process stops the start with a hint at the remedy.
+// The daemon holds its targets' flows.
 func TestDaemonHoldsFlows(t *testing.T) {
 	dir := t.TempDir()
 	cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
@@ -551,14 +549,60 @@ func TestDaemonHoldsFlows(t *testing.T) {
 	if got := f.Held(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("held %v, want %v", got, want)
 	}
+}
 
-	f = fakeNetwork()
-	f.SetHoldErr(fmt.Errorf("icmp flow_id 33434: ICMP echo identifier 33434 is %w", probe.ErrFlowInUse))
-	err := runDaemon(t.Context(), cfg, f, slog.New(slog.DiscardHandler))
-	if !errors.Is(err, probe.ErrFlowInUse) || !strings.Contains(err.Error(), "--flow-id") {
-		t.Errorf("runDaemon = %v, want ErrFlowInUse with a hint", err)
+// One process on the ICMP flow's identifier (any local user may open a ping
+// socket where ping_group_range allows it) stops only the ICMP targets of
+// that flow, visibly, and they come back once it is free, without a
+// reload. It used to fail every start, UDP and TCP targets included.
+func TestDaemonFlowInUseStopsOnlyItsTargets(t *testing.T) {
+	dir := t.TempDir()
+	metricsAddr := freeAddr(t)
+	cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", metricsAddr)
+	cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999},
+		config.Target{Host: "192.0.2.3", Protocol: "udp"}) // the UDP flow has the ICMP flow's id
+	if err := cfg.Finalize(config.FinalizeOptions{}); err != nil {
+		t.Fatal(err)
 	}
-	if n := len(f.Requests()); n != 0 {
-		t.Errorf("%d cycles probed although the flows could not be held", n)
+	f := fakeNetwork()
+	icmp := probe.Flow{Protocol: probe.ICMP, ID: 33434}
+	f.SetHoldErr(icmp, fmt.Errorf("icmp flow_id 33434: ICMP echo identifier 33434 is %w", probe.ErrFlowInUse))
+	stop := startDaemon(t, cfg, f)
+	byTarget := func() map[string]int {
+		n := map[string]int{}
+		for _, r := range readRecords(t, dir+"/out.jsonl") {
+			n[r.Target]++
+		}
+		return n
 	}
+	waitFor(t, 5*time.Second, func() bool { n := byTarget(); return n["192.0.2.2"] >= 3 && n["192.0.2.3"] >= 3 },
+		"records of the TCP and UDP targets")
+	m := getMetrics(t, metricsAddr)
+	for _, want := range []string{
+		`hopcorder_flow_in_use{agent_id="r",protocol="icmp",target="192.0.2.1"} 1`,
+		`hopcorder_flow_in_use{agent_id="r",protocol="tcp",target="192.0.2.2"} 0`,
+	} {
+		if !strings.Contains(m, want) {
+			t.Errorf("metrics lack %s:\n%s", want, grep(m, "flow_in_use"))
+		}
+	}
+	if strings.Contains(m, `hopcorder_cycle_errors_total{agent_id="r",protocol="icmp",target="192.0.2.1"} 0`) {
+		t.Errorf("failed cycles not counted:\n%s", grep(m, "cycle_errors"))
+	}
+	if n := byTarget()["192.0.2.1"]; n != 0 {
+		t.Errorf("%d records of the ICMP target although its identifier is not held", n)
+	}
+	for _, r := range f.Requests() {
+		if r.Protocol == probe.ICMP {
+			t.Fatalf("ICMP probes sent although the identifier is not held: %+v", r)
+		}
+	}
+
+	f.SetHoldErr(icmp, nil) // the other process exits
+	waitFor(t, 5*time.Second, func() bool { return byTarget()["192.0.2.1"] >= 2 }, "records of the ICMP target")
+	if m := getMetrics(t, metricsAddr); !strings.Contains(m,
+		`hopcorder_flow_in_use{agent_id="r",protocol="icmp",target="192.0.2.1"} 0`) {
+		t.Errorf("flow still shown in use:\n%s", grep(m, "flow_in_use"))
+	}
+	stop()
 }

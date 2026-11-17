@@ -220,9 +220,12 @@ echo identifier (`flow_id`) with an unprivileged "ping" socket, so no other
 local process can claim it. That last part needs ping sockets
 for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
 every group); where other groups have them but the agent's does not, it
-logs so at startup. A second hopcorder (or `ping`) using the same echo
-identifier makes the agent fail at startup; give every process its own
-`flow_id` (`--flow-id`).
+logs so at startup. If another process (a second hopcorder, a `ping`, any
+local user) holds the echo identifier first, the agent's ICMP targets of
+that flow are not probed: it logs an error, `hopcorder_flow_in_use` is 1 and
+their cycles count as errors. Every other target is probed, and the ICMP
+targets resume by themselves once the identifier is free (tried every
+cycle). Give every hopcorder process its own `flow_id` (`--flow-id`).
 
 ## Quick start
 
@@ -315,7 +318,9 @@ Derived per cycle:
 
 `--once` records carry `seq: 0`; it does not touch the spool, so it can run
 next to a running agent with another `flow_id` (`--once --flow-id 40000
-example.net`); with the daemon's ICMP `flow_id` it fails at startup.
+example.net`). With the daemon's ICMP `flow_id` its ICMP targets fail like
+any target that cannot be probed: the other targets' records are printed,
+the error is logged, and the exit status is 1.
 
 ## Caveats when reading the data
 
@@ -347,10 +352,11 @@ example.net`); with the daemon's ICMP `flow_id` it fails at startup.
   443 answered at TTL 2 behind a proxy). Compare with an ICMP or UDP trace to
   the same target when TCP distances look short.
 - **Two hopcorder processes on one host** (say `--once` next to the daemon)
-  need different `flow_id`s. For ICMP the second one fails at startup (the
-  first holds the echo identifier, where ping sockets are permitted); with
-  UDP or TCP, or without ping sockets, it starts, and the two can
-  occasionally pick up each other's replies.
+  need different `flow_id`s. For ICMP the second one does not probe its
+  targets on that flow (the first holds the echo identifier, where ping
+  sockets are permitted); with UDP or TCP, or without ping sockets, both
+  probe, and the random IP IDs, nonces and sequence numbers make it very
+  unlikely that one takes the other's replies.
 - **Beyond the destination**: with `adaptive_max_ttl` (default), once a
   target has been reached, cycles probe only 3 TTLs past its distance. If such
   a cycle neither reaches the destination nor hits an unreachable (the path
@@ -425,6 +431,7 @@ hop addresses.
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
+| `hopcorder_flow_in_use` | target, protocol | 1 while the target is not probed because another process holds its ICMP echo identifier (`flow_id`) |
 | `hopcorder_resolve_errors_total` | target, protocol | Failed DNS lookups |
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
