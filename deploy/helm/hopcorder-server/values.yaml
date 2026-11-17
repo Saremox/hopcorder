@@ -28,9 +28,10 @@ config:
     timeout: 30s
     retention_days: 90        # 0 keeps data forever
   # ingest: the server's defaults (deploy/server.example.yaml) fit
-  # resources.limits.memory below. A request holds up to about twice its
-  # decompressed size in memory while it is processed, so raise the memory
-  # limit with max_decoded_bytes x max_concurrent, e.g.
+  # resources.limits.memory below. A request holds up to about three times
+  # its decompressed size in memory while it is processed, plus about 24MiB
+  # while it is stored, so raise the memory limit with
+  # (3 x max_decoded_bytes + 24MiB) x max_concurrent, e.g.
   #   max_decoded_bytes: 32MiB
   #   max_concurrent: 4
   enrich:

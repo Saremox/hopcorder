@@ -39,6 +39,10 @@ The section for a version is the text of its GitHub release.
   (seven with the defaults, two from 16 MiB) could hold all of it between
   them, each waiting for more, until their read timeout. A body now reserves
   what it needs at once, in turn, and gives it back once it is decoded.
+- Memory sizing, corrected: a request being processed holds up to about
+  three times `max_decoded_bytes` (not twice), plus about 24 MiB while it is
+  stored; plan for `max_concurrent` of them. Decoded records no longer keep
+  spare capacity, which made it up to 3.6 times.
 
 **Security: read side and Grafana**
 

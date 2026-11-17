@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -558,7 +559,32 @@ func parseRecord(b []byte, now time.Time, maxAge time.Duration) (*record.Record,
 	case rec.TS.After(now.Add(maxFutureSkew)):
 		return nil, fmt.Errorf("ts more than %s ahead of the server's clock", maxFutureSkew)
 	}
+	compact(&rec)
 	return &rec, nil
+}
+
+// compact gives a decoded record's slices the length they hold: the decoder
+// grows them by doubling. A hop is 88 bytes in memory for as little as 30
+// of JSON (a silent one), so the records of a request take up to about
+// three times its decoded size; with the slack it was 3.6 times (records of
+// 9 silent hops).
+func compact(rec *record.Record) {
+	if cap(rec.Hops) > len(rec.Hops) {
+		rec.Hops = slices.Clone(rec.Hops)
+	}
+	for i := range rec.Hops {
+		if h := &rec.Hops[i]; cap(h.MPLS) > len(h.MPLS) {
+			h.MPLS = slices.Clone(h.MPLS)
+		}
+	}
+	if cap(rec.Loops) > len(rec.Loops) {
+		rec.Loops = slices.Clone(rec.Loops)
+	}
+	for i := range rec.Loops {
+		if l := &rec.Loops[i]; cap(l.TTLs) > len(l.TTLs) {
+			l.TTLs = slices.Clone(l.TTLs)
+		}
+	}
 }
 
 // jsonError describes a decoding error without the value that caused it

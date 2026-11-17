@@ -1225,8 +1225,8 @@ decisions:
   a PTR it controls at every TTL): one 19 KiB request (31 MiB decoded) held
   507 MiB at insert time, now 65 MiB. An agent's normal batch (1 MiB) is
   still one insert. The zstd decoder (and its window) is closed before the
-  records are stored. A request being processed holds about twice
-  `max_decoded_bytes`.
+  records are stored. A request being processed holds up to about three
+  times `max_decoded_bytes` (corrected in round three; this said twice).
 - **The Go memory limit follows the cgroup's**: at start, unless GOMEMLIMIT
   is set, the server sets it to 90% of the memory limit of its cgroup (v2:
   the lowest `memory.max` from its own cgroup up; v1:
@@ -1352,9 +1352,10 @@ decisions:
   (golangci-lint, helm) and govulncheck are also updated by hand.
 - **Server chart: the server's ingest limits.** `values.yaml` had set
   `max_body_bytes` 64 MiB and `max_decoded_bytes` 512 MiB, written before
-  the review lowered the defaults. A request holds up to about twice its
-  decompressed size while it is parsed (measured: 255 MiB of NDJSON held
-  507 MiB of records). So one 119 KiB zstd body that expands to 512 MiB
+  the review lowered the defaults. A request holds up to about three times
+  its decompressed size while it is parsed (measured: 255 MiB of NDJSON held
+  507 MiB of records; up to three times for silent hops, round three). So
+  one 119 KiB zstd body that expands to 512 MiB
   went past the pod's 1 GiB limit. The block is gone: the defaults apply,
   with a comment to raise the memory limit together with
   `max_decoded_bytes × max_concurrent`.
@@ -1661,6 +1662,21 @@ high-severity issue. Four fixes followed. The decisions:
     agent's batch: `[503 200 503 408 200 200 408 200 503 408]` after 4 s
     before, all 200 in 0.5 s now), `TestChunkPoolOrder`;
     `TestReadBufferBounded` and `TestSlowBodiesHoldNoIngestSlot` adapted.
+- **A request holds up to about three times `max_decoded_bytes`, not
+  twice** (corrected here, in round two's text, `server.example.yaml` and
+  the chart's `values.yaml`). A hop is 88 bytes in memory for as little as
+  31 of JSON (a silent one), so decoded records take up to 3.0 times their
+  NDJSON (255 silent hops a record; 1.6 times for answering hops, whose
+  addresses lengthen the JSON). The decoder also left slices with the spare
+  capacity of growing them by doubling: records of 9 silent hops took 3.6
+  times. A record now keeps only what it holds (`compact`), 2.3 times for
+  those. While a request is stored, one insert's rows and request body come
+  on top, up to about 24 MiB: a whole request of 31 MiB of 255 silent hops
+  peaked at 114 MiB (3.6 times). So ingest needs about `max_concurrent x
+  (3 x max_decoded_bytes + 24 MiB)`, plus the stream state and the read
+  buffer: with the defaults 480 + 170 + 32 MiB, within the chart's 1 GiB.
+  Test: `TestDecodedRecordsMemory` (at most 3.2 times for records of 9 and
+  of 255 silent hops; 3.6 before).
 
 **Read side, enrichment and the browser**
 - **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in

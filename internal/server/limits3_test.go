@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -531,5 +532,43 @@ func TestChunkPoolOrder(t *testing.T) {
 	}
 	if err := p.acquire(t.Context(), 5); err == nil {
 		t.Error("a reservation larger than the pool was granted")
+	}
+}
+
+// The records of a request take about three times its decoded size, not
+// twice as documented (88 bytes of memory per hop for as little as 30 of
+// JSON), and slices grown by doubling made it 3.6 times. The documented
+// factor is three.
+func TestDecodedRecordsMemory(t *testing.T) {
+	s := New(Options{Store: newFakeStore(), Logger: quietLogger()})
+	s.ingester.now = func() time.Time { return t0.Add(time.Hour) }
+	for _, hops := range []int{9, 255} {
+		r := &record.Record{Schema: record.SchemaVersion, AgentID: "lab", TS: t0, Target: "dc1.example",
+			TargetIP: netip.MustParseAddr("192.0.2.9"), AF: 4, Protocol: "icmp", PathLen: hops, PathHash: "x",
+			Loops: []record.Loop{}}
+		for i := range hops {
+			r.Hops = append(r.Hops, record.Hop{TTL: i + 1, Status: record.StatusNoReply})
+		}
+		var b bytes.Buffer
+		for seq := uint64(1); b.Len() < 4<<20; seq++ {
+			r.Seq = seq
+			line, _ := json.Marshal(r)
+			b.Write(line)
+			b.WriteByte('\n')
+		}
+		raw := b.Bytes()
+		var m0, m1 runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&m0)
+		recs, res, code, _ := s.decode("", bytes.NewReader(raw))
+		runtime.GC()
+		runtime.ReadMemStats(&m1)
+		live := float64(int64(m1.HeapAlloc)-int64(m0.HeapAlloc)) / float64(len(raw))
+		if code != 0 || res.Rejected != 0 || live > 3.2 {
+			t.Errorf("%d silent hops a record: code %d, %d rejected, records hold %.2f times their decoded size",
+				hops, code, res.Rejected, live)
+		}
+		runtime.KeepAlive(recs)
+		runtime.KeepAlive(raw)
 	}
 }
