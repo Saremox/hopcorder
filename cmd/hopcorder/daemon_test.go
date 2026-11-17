@@ -861,19 +861,23 @@ func daemonConfigJSONL(t *testing.T, spoolDir, out, metrics string) *config.Conf
 	return c
 }
 
-// The daemon holds its targets' flows.
+// The daemon holds its targets' flows: a classic TCP flow (which walks the
+// source port) with a port for each TTL.
 func TestDaemonHoldsFlows(t *testing.T) {
 	dir := t.TempDir()
 	cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
-	cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999})
+	classic := false
+	cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999},
+		config.Target{Host: "192.0.2.3", Protocol: "tcp", FlowID: 900, Paris: &classic, MaxTTL: 12})
 	if err := cfg.Finalize(config.FinalizeOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	f := fakeNetwork()
 	stop := startDaemon(t, cfg, f)
-	waitFor(t, 3*time.Second, func() bool { return len(f.Held()) == 2 }, "held flows")
+	waitFor(t, 3*time.Second, func() bool { return len(f.Held()) == 3 }, "held flows")
 	stop()
-	want := []probe.Flow{{Protocol: probe.ICMP, ID: 33434}, {Protocol: probe.TCP, ID: 999}}
+	want := []probe.Flow{{Protocol: probe.ICMP, ID: 33434}, {Protocol: probe.TCP, ID: 999},
+		{Protocol: probe.TCP, ID: 900, Ports: 12}}
 	if got := f.Held(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("held %v, want %v", got, want)
 	}
@@ -974,57 +978,81 @@ func TestFailedReloadKeepsTheFlowsHeld(t *testing.T) {
 // One process on the ICMP flow's identifier (any local user may open a ping
 // socket where ping_group_range allows it) stops only the ICMP targets of
 // that flow, visibly, and they come back once it is free, without a
-// reload. It used to fail every start, UDP and TCP targets included.
+// reload. It used to fail every start, UDP and TCP targets included. The
+// same for a TCP flow's source port (since round six, when a connection
+// from it made the target answer for that connection and the cycles look
+// unanswered): only that flow's TCP targets stop.
 func TestDaemonFlowInUseStopsOnlyItsTargets(t *testing.T) {
-	dir := t.TempDir()
-	metricsAddr := freeAddr(t)
-	cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", metricsAddr)
-	cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999},
-		config.Target{Host: "192.0.2.3", Protocol: "udp"}) // the UDP flow has the ICMP flow's id
-	if err := cfg.Finalize(config.FinalizeOptions{}); err != nil {
-		t.Fatal(err)
+	type target struct {
+		host  string
+		proto probe.Protocol
 	}
-	f := fakeNetwork()
-	icmp := probe.Flow{Protocol: probe.ICMP, ID: 33434}
-	f.SetHoldErr(icmp, fmt.Errorf("icmp flow_id 33434: ICMP echo identifier 33434 is %w", probe.ErrFlowInUse))
-	stop := startDaemon(t, cfg, f)
-	byTarget := func() map[string]int {
-		n := map[string]int{}
-		for _, r := range readRecords(t, dir+"/out.jsonl") {
-			n[r.Target]++
-		}
-		return n
-	}
-	waitFor(t, 5*time.Second, func() bool { n := byTarget(); return n["192.0.2.2"] >= 3 && n["192.0.2.3"] >= 3 },
-		"records of the TCP and UDP targets")
-	m := getMetrics(t, metricsAddr)
-	for _, want := range []string{
-		`hopcorder_flow_in_use{agent_id="r",protocol="icmp",target="192.0.2.1"} 1`,
-		`hopcorder_flow_in_use{agent_id="r",protocol="tcp",target="192.0.2.2"} 0`,
+	for _, c := range []struct {
+		refused probe.Flow
+		target  target   // the refused flow's
+		others  []target // probed meanwhile
+		err     string
+	}{
+		{probe.Flow{Protocol: probe.ICMP, ID: 33434}, target{"192.0.2.1", probe.ICMP},
+			[]target{{"192.0.2.2", probe.TCP}, {"192.0.2.3", probe.UDP}},
+			"icmp flow_id 33434: ICMP echo identifier 33434 is %w"},
+		{probe.Flow{Protocol: probe.TCP, ID: 999}, target{"192.0.2.2", probe.TCP},
+			[]target{{"192.0.2.1", probe.ICMP}, {"192.0.2.3", probe.UDP}},
+			"tcp flow_id 999: IPv4 TCP port 999 is %w"},
 	} {
-		if !strings.Contains(m, want) {
-			t.Errorf("metrics lack %s:\n%s", want, grep(m, "flow_in_use"))
-		}
-	}
-	if strings.Contains(m, `hopcorder_cycle_errors_total{agent_id="r",protocol="icmp",target="192.0.2.1"} 0`) {
-		t.Errorf("failed cycles not counted:\n%s", grep(m, "cycle_errors"))
-	}
-	if n := byTarget()["192.0.2.1"]; n != 0 {
-		t.Errorf("%d records of the ICMP target although its identifier is not held", n)
-	}
-	for _, r := range f.Requests() {
-		if r.Protocol == probe.ICMP {
-			t.Fatalf("ICMP probes sent although the identifier is not held: %+v", r)
-		}
-	}
+		t.Run(string(c.refused.Protocol), func(t *testing.T) {
+			dir := t.TempDir()
+			metricsAddr := freeAddr(t)
+			cfg := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", metricsAddr)
+			cfg.Targets = append(cfg.Targets, config.Target{Host: "192.0.2.2", Protocol: "tcp", FlowID: 999},
+				config.Target{Host: "192.0.2.3", Protocol: "udp"}) // the UDP flow has the ICMP flow's id
+			if err := cfg.Finalize(config.FinalizeOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			f := fakeNetwork()
+			f.SetHoldErr(c.refused, fmt.Errorf(c.err, probe.ErrFlowInUse))
+			stop := startDaemon(t, cfg, f)
+			byTarget := func() map[string]int {
+				n := map[string]int{}
+				for _, r := range readRecords(t, dir+"/out.jsonl") {
+					n[r.Target]++
+				}
+				return n
+			}
+			waitFor(t, 5*time.Second, func() bool {
+				n := byTarget()
+				return n[c.others[0].host] >= 3 && n[c.others[1].host] >= 3
+			}, "records of the other targets")
+			gauge := func(tg target, v int) string {
+				return fmt.Sprintf(`hopcorder_flow_in_use{agent_id="r",protocol="%s",target="%s"} %d`, tg.proto, tg.host, v)
+			}
+			m := getMetrics(t, metricsAddr)
+			for _, want := range []string{gauge(c.target, 1), gauge(c.others[0], 0)} {
+				if !strings.Contains(m, want) {
+					t.Errorf("metrics lack %s:\n%s", want, grep(m, "flow_in_use"))
+				}
+			}
+			if strings.Contains(m, fmt.Sprintf(`hopcorder_cycle_errors_total{agent_id="r",protocol="%s",target="%s"} 0`,
+				c.target.proto, c.target.host)) {
+				t.Errorf("failed cycles not counted:\n%s", grep(m, "cycle_errors"))
+			}
+			if n := byTarget()[c.target.host]; n != 0 {
+				t.Errorf("%d records of the %s target although its flow is not held", n, c.target.proto)
+			}
+			for _, r := range f.Requests() {
+				if r.Protocol == c.refused.Protocol && r.FlowID == c.refused.ID {
+					t.Fatalf("probes sent although the flow is not held: %+v", r)
+				}
+			}
 
-	f.SetHoldErr(icmp, nil) // the other process exits
-	waitFor(t, 5*time.Second, func() bool { return byTarget()["192.0.2.1"] >= 2 }, "records of the ICMP target")
-	if m := getMetrics(t, metricsAddr); !strings.Contains(m,
-		`hopcorder_flow_in_use{agent_id="r",protocol="icmp",target="192.0.2.1"} 0`) {
-		t.Errorf("flow still shown in use:\n%s", grep(m, "flow_in_use"))
+			f.SetHoldErr(c.refused, nil) // the other process exits
+			waitFor(t, 5*time.Second, func() bool { return byTarget()[c.target.host] >= 2 }, "records of the refused target")
+			if m := getMetrics(t, metricsAddr); !strings.Contains(m, gauge(c.target, 0)) {
+				t.Errorf("flow still shown in use:\n%s", grep(m, "flow_in_use"))
+			}
+			stop()
+		})
 	}
-	stop()
 }
 
 // Targets whose metrics share series are named at start.

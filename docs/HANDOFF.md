@@ -463,16 +463,18 @@ added in the commit that introduced it.
   as TCP, so each family gets a raw TCP socket on first use, with a kernel BPF
   filter passing only ACK+SYN or ACK+RST segments; on IPv6 that socket also
   sends the SYNs. The kernel answers the SYN-ACK with an RST, so no
-  connection is ever established.
+  connection is ever established. (Since round six of the review the
+  agent holds every TCP source port it probes from, so that no local
+  connection shares the probes' four-tuple; see there.)
 - **Probe ids are random** (since round two of the security review; they
   were counted per flow from a random start): drawn per probe, never one
   whose key is in flight, a tombstoned one only when the flow has no other
   free id. Two hopcorder *processes* on one host (e.g. `--once` next to the
-  daemon) need different `flow_id`s (`--flow-id`): for ICMP the second does
-  not probe that flow's targets (since round three; it failed at startup
-  before), as the first holds the echo identifier; with UDP or TCP both
-  probe, and a reply can, very rarely, be attributed to the other process's
-  probe.
+  daemon) need different `flow_id`s (`--flow-id`): for ICMP (since round
+  three; it failed at startup before) and TCP (since round six) the second
+  does not probe that flow's targets, as the first holds the echo
+  identifier or the source ports; with UDP both probe, and a reply can,
+  very rarely, be attributed to the other process's probe.
 - **Adaptive max TTL** (`adaptive_max_ttl`, default on; added after M1
   review). Once a target was reached at distance d, cycles probe TTLs
   1..d+3. If that batch neither reaches the destination nor hits an
@@ -1546,6 +1548,13 @@ decisions:
     sequence number; see round three.
   - So two processes on the same UDP or TCP flow still start, and the
     caveat stays for them.
+  - (Round six: TCP source ports are now held, for UDP this stands. The
+    TCP reasons were weighed against forged replies only; a local
+    connection from the flow's port made the target answer every probe
+    for that connection, and the cycles were recorded as outages. A
+    TIME_WAIT on the port no longer fails a start, it refuses the flow's
+    TCP targets for up to a minute, and a socket with `SO_REUSEADDR`
+    cleared shares the port with nobody. See round six, "TCP flows".)
 - **`flow_id` has a global default and a `--flow-id` flag**, so a `--once`
   run next to the daemon can take another flow without a config file.
 - **Every new spool starts its seqs at the clock** (time in microseconds),
@@ -1968,7 +1977,9 @@ high-severity issue. Four fixes followed. The decisions:
   continuous attack, at a random TTL of one cycle. The TCP source port is
   still not held: round two's reasons stand (TIME_WAIT makes the bind fail
   at random on busy hosts, and with `SO_REUSEADDR` the hold can be shared),
-  and against a 1-in-2^32 guess a hold would add little.
+  and against a 1-in-2^32 guess a hold would add little. (Round six: it is
+  held now, against a connection from the port rather than forgeries; why
+  round two's reasons no longer stand is in round six, "TCP flows".)
 - **Accepted (forged replies):** forgeries still count in
   `hopcorder_probe_mismatched_replies_total` (it measures attempts), and a
   forgery for a timed-out probe's key counts as a late reply without the
@@ -3435,7 +3446,125 @@ decisions:
 
 **TCP flows**
 
-<!-- round six: tcp flows -->
+- **The agent holds its TCP flows' source ports** (corrects rounds two
+  and three, which left them unheld; that decision was not locked). An
+  unprivileged local process with a connection from a TCP flow's source
+  port to the target's service (`nc -p 33434 target 443`) shares the
+  probes' four-tuple, so the target answers every probe SYN with a
+  challenge ACK for that connection (RFC 5961) instead of a SYN-ACK or
+  RST. The BPF filter drops pure ACKs, so every cycle was recorded as
+  `reached: false` while the connection was open, with no error and no
+  metric (review, round six: the real binary in netns, uid 65534, 5
+  cycles reached, then 10 of 10 not). The same happens by accident: 33434
+  lies in Linux's ephemeral range, so any local connection to the
+  target's host and port (the agent's own HTTP output, when a TCP target
+  is the ingest host:port, as in `deploy/helm/ci/agent-ds-values.yaml`)
+  could get it. Classic mode walks the source port and was open on every
+  port: a connection from the port of the destination's TTL made that
+  probe go unanswered and the next one reach, so the target looked one hop
+  further away, behind a silent hop. Now:
+  - `Raw.HoldFlows` holds every source port of every TCP flow with two TCP
+    sockets, IPv4 on `0.0.0.0` and IPv6-only on `[::]` (TCP's ports are one
+    table for both families; IPv6-only keeps the two from colliding),
+    bound with `SO_REUSEADDR` cleared, never listening or connecting
+    (`holdTCPPort`). A classic flow holds a port for each TTL, `flow_id`
+    to `flow_id + max_ttl - 1` (`probe.Flow.Ports`, set by
+    `probe.NewFlow`, which `flowsOf` uses).
+  - Handled exactly like the echo identifiers: a port that cannot be held
+    (EADDRINUSE) refuses only that flow's TCP targets of that family, with
+    `ErrFlowInUse` (error log, `hopcorder_cycle_errors_total`,
+    `hopcorder_flow_in_use` 1), and `Raw.flowReady`, now called for TCP
+    too, tries it again every cycle, so the targets resume by themselves.
+    A reload holds both configurations' ports until the new one runs
+    (round four), and `--once` refuses the TCP targets of the daemon's
+    flows as it does the ICMP ones.
+  - Why round two's reasons no longer stand. TIME_WAIT: since round three
+    a hold that fails stops only that flow's targets and is retried every
+    cycle, so a TIME_WAIT on the port (a connection from it closed from
+    this side less than a minute before the first start) refuses the
+    flow's TCP targets for at most a minute, visibly, instead of failing
+    the start; once held, the kernel gives the port to no connection, so
+    no new TIME_WAIT appears on it. `SO_REUSEADDR`: the hold leaves it
+    cleared, and the kernel shares a port only between sockets that all
+    set it (or all `SO_REUSEPORT` under one uid); setting it would not
+    even have helped against TIME_WAIT (a bind with it set fails the same
+    against a TIME_WAIT of a socket without it). "The gain would be
+    small" was measured against forged replies, not against a connection
+    the target answers for.
+  - Checked on Linux 6.18 in netns (Python and `TestInnerTCPHold`): with
+    the hold, the raw TCP socket still gets every SYN-ACK and RST, and
+    the kernel still answers each SYN-ACK with a RST (the target keeps no
+    SYN-RECV or connection), so a bound socket that neither listens nor
+    is connected changes nothing about the replies; uid 65534 cannot
+    bind the port (plain, `SO_REUSEADDR`, `SO_REUSEPORT`, a specific
+    address) or connect from it, and with `ip_local_port_range` narrowed
+    to the held port a `connect()` without bind fails with EADDRNOTAVAIL
+    (it gets the port when it is not held). A connection from the port, a
+    TIME_WAIT on it or a listener makes the hold fail with EADDRINUSE. A
+    UDP bind to the same number is unaffected.
+  - Considered, not done: passing pure ACKs from the target to the flow
+    port through BPF and counting them. With the port held, an
+    interfering local connection can only predate the hold, and then the
+    hold fails visibly. A connection that only the target still has (its
+    side of one whose local socket is gone, CLOSE-WAIT in the check)
+    heals at the first probe: the agent's kernel answers the challenge
+    ACK with a RST at exactly the target's `rcv_nxt`, which resets it, and
+    the next SYNs got SYN-ACKs. Passing ACKs would copy every ACK the
+    host receives to user space unless the filter were rebuilt per flow
+    port, for a case that lasts one probe. Also considered: a default TCP
+    `flow_id` below `ip_unprivileged_port_start`; it would rename every
+    TCP stream on the server, and the agent (without
+    `CAP_NET_BIND_SERVICE`) could not hold it either.
+  - UDP stays unheld; round two's reason stands (a bound UDP port
+    swallows other tracers' probes). No analogue of this finding: a UDP
+    target's port unreachable does not depend on the agent host's
+    sockets, and the raw ICMP socket gets a copy whatever local socket
+    has the port. (Draining the target's ICMP rate limit with stray UDP,
+    the review's info item, is not about the port.)
+  - Accepted: a local user who binds or connects from the port before the
+    agent's first start (or during a restart) stops that flow's TCP
+    targets until it lets go, visibly; the same as for ICMP since round
+    three, and a refusal rather than records saying the target is down.
+    A TIME_WAIT does the same for up to a minute (the real binary resumed
+    62 s after the attacker's `nc` exited), and a server listening on the
+    port does it for good: such a host needs another `flow_id` (the error
+    says so). Where the agent may not bind a port, nothing is held and
+    probing goes on: below `ip_unprivileged_port_start` without
+    `CAP_NET_BIND_SERVICE` no unprivileged process may bind it either
+    (debug log); a security policy refusing the bind is warned about
+    once. A classic flow takes two descriptors per TTL (510 at `max_ttl`
+    255). The development container has no IPv6 (`ipv6.disable=1`), so
+    the IPv6 hold (an IPv6-only socket beside the IPv4 one, per the
+    kernel's `ipv6_rcv_saddr_equal`) is exercised by CI only.
+  - Tests: `TestRawNetns/tcp-hold` (rawsock; `TestInnerTCPHold`, a uid
+    65534 child and a listener in the target namespace, IPv4 and, where
+    there is IPv6, IPv6): the review's attack with the attacker first
+    (HoldFlows fails naming the port, three traces are refused, not
+    recorded; once the connection is reset the next trace holds the port
+    and reaches, and the attacker cannot connect again), the agent first
+    (connect and binds refused; traces to an open and a closed port reach;
+    `ss` in the target namespace shows nothing left from the held port),
+    a classic flow attacked at the TTL 3 port, the narrowed ephemeral
+    range, release and Close. Before the fix: HoldFlows returned nil and
+    every trace was "no-reply, no-reply" at TTLs 3 and 4 while the
+    connection was open; with classic ports unheld, "no-reply, reply";
+    with Trace not refusing TCP flows, the silent outage again.
+    `TestRawHoldsTCPPorts` (default run: TCP binds need no privileges):
+    a listener on the port refuses only the IPv4 TCP flow, not IPv6 or
+    UDP, is retried by each trace, the port is held once free, a classic
+    flow's ports are held, release and Close free them; it fails with
+    TCP flows not held or classic ports not held.
+    `TestHoldKeysAreTheProbesPorts`: what is held and checked is exactly
+    the ports the engine sends from (paris, classic, both families, a
+    classic flow wrapping through port 0). `TestDaemonFlowInUseStopsOnlyItsTargets`
+    now also refuses a TCP flow (fake prober), and `TestDaemonHoldsFlows`
+    checks a classic flow's ports. The real binary in netns, as the
+    review's run: with the agent first, 14 of 14 cycles reached while uid
+    65534's `nc -p 33434` failed ("bind failed: Address already in use");
+    before, 8 of 14 were recorded unreached. With the attacker first, the
+    target was refused (an error logged, `hopcorder_flow_in_use` 1, cycle
+    errors counted) with no record, and resumed by itself; before, 9
+    records said unreached, with no error and the gauge at 0.
 
 **Spool and its volume**
 

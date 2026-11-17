@@ -361,6 +361,15 @@ func TestRawNetns(t *testing.T) {
 		in(3, "sysctl", "-qw", "net.ipv4.icmp_ratelimit=0")
 		inner(t, "TestInnerHoldFlows|TestInnerForgeRefused")
 	})
+	t.Run("tcp-hold", func(t *testing.T) {
+		addrs := []string{"10.99.3.2"}
+		if ipv6Supported() {
+			addrs = append(addrs, "fd99:3::2")
+		}
+		startTCPListener(t, topo.ns[3], addrs...)
+		t.Setenv("HOPCORDER_NETNS_TARGET", topo.ns[3])
+		inner(t, "TestInnerTCPHold")
+	})
 	t.Run("spoof", func(t *testing.T) {
 		if _, err := exec.LookPath("iptables"); err != nil {
 			t.Skip("iptables not installed")

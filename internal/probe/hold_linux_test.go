@@ -89,10 +89,34 @@ func TestUnprivilegedChild(t *testing.T) {
 	}
 	udp := -1
 	squatted := map[int]int{} // identifier -> ping socket
+	conns := map[int]int{}    // local port -> connected TCP socket
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
 		switch f[0] {
+		case "bind-tcp": // bind-tcp <port> <4|6>: bind a TCP socket as hard as a user can, then close it
+			port, _ := strconv.Atoi(f[1])
+			fmt.Printf("%s %d %s: %v\n", f[0], port, f[2], bindTCP(port, f[2] == "6"))
+		case "connect-tcp": // connect-tcp <local port, 0: the kernel's choice> <dst> <dport>; keeps it open
+			port, _ := strconv.Atoi(f[1])
+			dport, _ := strconv.Atoi(f[3])
+			fd, local, err := connectTCP(port, netip.MustParseAddr(f[2]), dport)
+			if err == nil {
+				conns[local] = fd
+				fmt.Printf("%s %d: <nil> from %d\n", f[0], port, local)
+				break
+			}
+			fmt.Printf("%s %d: %v\n", f[0], port, err)
+		case "reset-tcp": // reset-tcp <local port>: close a connection with a RST, so it leaves no TIME_WAIT
+			port, _ := strconv.Atoi(f[1])
+			fd, ok := conns[port]
+			var err error = syscall.EBADF
+			if ok {
+				delete(conns, port)
+				_ = syscall.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER, &syscall.Linger{Onoff: 1})
+				err = syscall.Close(fd)
+			}
+			fmt.Printf("%s %d: %v\n", f[0], port, err)
 		case "release-ping": // release-ping <identifier>: close a squatted one
 			id, _ := strconv.Atoi(f[1])
 			fd, ok := squatted[id]
@@ -172,6 +196,79 @@ func TestUnprivilegedChild(t *testing.T) {
 			fmt.Println("unknown command")
 		}
 	}
+}
+
+// soReusePort is SO_REUSEPORT (asm-generic; not in package syscall).
+const soReusePort = 15
+
+// bindTCP binds a TCP socket to port on the wildcard address of one family
+// with SO_REUSEADDR and SO_REUSEPORT set (the IPv6 one IPv6-only), and
+// closes it.
+func bindTCP(port int, v6 bool) error {
+	family := syscall.AF_INET
+	var sa syscall.Sockaddr = &syscall.SockaddrInet4{Port: port}
+	if v6 {
+		family, sa = syscall.AF_INET6, &syscall.SockaddrInet6{Port: port}
+	}
+	fd, err := syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	for _, o := range []int{syscall.SO_REUSEADDR, soReusePort} {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, o, 1); err != nil {
+			return err
+		}
+	}
+	if v6 {
+		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1); err != nil {
+			return err
+		}
+	}
+	return syscall.Bind(fd, sa)
+}
+
+// connectTCP connects a TCP socket from local port port (0: the kernel
+// picks one) to dst:dport, like `nc -p <port> <dst> <dport>`, and returns
+// it with its local port.
+func connectTCP(port int, dst netip.Addr, dport int) (int, int, error) {
+	// Each family's addresses built in its own branch: As4 panics on an
+	// IPv6 address.
+	var family int
+	var local, remote syscall.Sockaddr
+	if dst.Is6() {
+		family = syscall.AF_INET6
+		local, remote = &syscall.SockaddrInet6{Port: port}, &syscall.SockaddrInet6{Port: dport, Addr: dst.As16()}
+	} else {
+		family = syscall.AF_INET
+		local, remote = &syscall.SockaddrInet4{Port: port}, &syscall.SockaddrInet4{Port: dport, Addr: dst.As4()}
+	}
+	fd, err := syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return -1, 0, err
+	}
+	if port != 0 {
+		err = syscall.Bind(fd, local)
+	}
+	if err == nil {
+		err = syscall.Connect(fd, remote)
+	}
+	var sa syscall.Sockaddr
+	if err == nil {
+		sa, err = syscall.Getsockname(fd)
+	}
+	if err != nil {
+		_ = syscall.Close(fd)
+		return -1, 0, err
+	}
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return fd, sa.Port, nil
+	case *syscall.SockaddrInet6:
+		return fd, sa.Port, nil
+	}
+	_ = syscall.Close(fd)
+	return -1, 0, fmt.Errorf("local address %v", sa)
 }
 
 func TestInnerHoldFlows(t *testing.T) {

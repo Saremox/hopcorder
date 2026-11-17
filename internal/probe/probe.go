@@ -149,13 +149,40 @@ var ErrNoRoute = errors.New("no route to target")
 type Flow struct {
 	Protocol Protocol
 	ID       uint16
+	// Ports is the number of TCP source ports the flow's probes use, from
+	// ID on: classic mode walks the source port (ID for TTL 1, ID+1 for
+	// TTL 2, ...), so a classic TCP flow uses max_ttl of them. 0 means
+	// ID alone. NewFlow sets it.
+	Ports int
+}
+
+// NewFlow returns the flow of a target probed with protocol p and flow ID
+// id, in paris mode or not, at TTLs up to maxTTL.
+func NewFlow(p Protocol, id uint16, paris bool, maxTTL int) Flow {
+	f := Flow{Protocol: p, ID: id}
+	if p == TCP && !paris && maxTTL > 1 {
+		f.Ports = maxTTL
+	}
+	return f
+}
+
+// tcpSourcePort returns the source port of the TCP probe with TTL ttl. The
+// destination port is the service being reached, so classic mode walks the
+// source port instead.
+func tcpSourcePort(flowID uint16, paris bool, ttl int) uint16 {
+	if paris {
+		return flowID
+	}
+	return flowID + uint16(ttl-1) //nolint:gosec // wraps like classic traceroute
 }
 
 // FlowHolder is implemented by probers that hold their flows' local
 // identifiers with ordinary sockets so that no other process on the host
 // can claim them. An unprivileged process holding one could otherwise see
-// the answers to the probes and send packets that pass for probes. Raw
-// holds ICMP echo identifiers (see its HoldFlows for why not ports).
+// the answers to the probes and send packets that pass for probes, or, on
+// a TCP port, keep a connection to the target, which the target then
+// answers the probes for. Raw holds ICMP echo identifiers and TCP source
+// ports (see its HoldFlows for why not UDP ports).
 type FlowHolder interface {
 	// HoldFlows makes flows the set held, releasing identifiers of flows
 	// no longer listed. A flow whose identifier cannot be held is left
@@ -168,7 +195,8 @@ type FlowHolder interface {
 
 // ErrFlowInUse is returned (wrapped) by HoldFlows, and by Trace for the flow,
 // when another process holds a flow's identifier, for example another
-// hopcorder probing with the same flow_id.
+// hopcorder probing with the same flow_id, or a connection from its TCP
+// port.
 var ErrFlowInUse = errors.New("in use by another process")
 
 // ErrPermission is returned (wrapped) when raw sockets cannot be opened.

@@ -396,7 +396,7 @@ func agentTargets(cfg *config.Config) []agent.Target {
 func flowsOf(targets []agent.Target) []probe.Flow {
 	var flows []probe.Flow
 	for _, t := range targets {
-		if f := (probe.Flow{Protocol: t.Protocol, ID: t.FlowID}); !slices.Contains(flows, f) {
+		if f := probe.NewFlow(t.Protocol, t.FlowID, t.Paris, t.MaxTTL); !slices.Contains(flows, f) {
 			flows = append(flows, f)
 		}
 	}
@@ -414,19 +414,20 @@ func unionFlows(a, b []probe.Flow) []probe.Flow {
 	return out
 }
 
-// holdFlows makes the prober hold the local identifiers of flows (see
-// probe.FlowHolder), releasing every other. An identifier it cannot hold
-// (another process has it) stops only the targets of that flow: the prober
-// refuses their cycles, and retries the identifier on each, while every
-// other target is probed. That is logged here unless logger is nil, and
-// then per target by the agent (and counted in hopcorder_flow_in_use).
+// holdFlows makes the prober hold the local identifiers of flows (ICMP echo
+// identifiers, TCP source ports; see probe.FlowHolder), releasing every
+// other. An identifier it cannot hold (another process has it) stops only
+// the targets of that flow: the prober refuses their cycles, and retries
+// the identifier on each, while every other target is probed. That is
+// logged here unless logger is nil, and then per target by the agent (and
+// counted in hopcorder_flow_in_use).
 func holdFlows(prober probe.Prober, flows []probe.Flow, logger *slog.Logger) {
 	h, ok := prober.(probe.FlowHolder)
 	if !ok {
 		return
 	}
 	if err := h.HoldFlows(flows); err != nil && logger != nil {
-		logger.Error("cannot hold the identifier of some flows: their targets are not probed until it is free "+
+		logger.Error("cannot hold the identifier or port of some flows: their targets are not probed until it is free "+
 			"(retried every cycle; set another with --flow-id or flow_id in the config)", "err", err)
 	}
 }
