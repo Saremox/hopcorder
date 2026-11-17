@@ -15,6 +15,14 @@ The section for a version is the text of its GitHub release.
 
 - UI: a click on the timeline while it reloads no longer throws.
 
+**Fixed (review round five)**
+
+<!-- round five: time zone -->
+
+<!-- round five: grafana user -->
+
+<!-- round five: streams -->
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent

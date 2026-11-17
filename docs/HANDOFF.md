@@ -3163,3 +3163,26 @@ decisions:
     whether an immutable release can be deleted and its tag name reused
     (`publish` deletes a release on a confirmed difference; if the name
     cannot be reused, that version is skipped, and the next one released).
+
+
+### Security and correctness review, round five
+
+A fifth review (the same four areas, for correctness as well as security,
+with the code added in round four first) found three high findings, all on
+the read side: Grafana's read-only ClickHouse user could still exhaust
+ClickHouse's memory through the hyperscan cache, every time window was
+shifted with a ClickHouse whose time zone is not UTC, and two targets of
+one host (dual-stack, or two ports) made one stream. Medium and lower
+findings are listed at the end, for the owner to decide on. The decisions:
+
+**Time zones**
+
+<!-- round five: time zone -->
+
+**Grafana's ClickHouse user**
+
+<!-- round five: grafana user -->
+
+**One stream per target**
+
+<!-- round five: streams -->
