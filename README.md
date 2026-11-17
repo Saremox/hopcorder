@@ -47,13 +47,16 @@ amd64 and arm64, with the example configs and systemd units:
 curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.1/hopcorder_0.1.1_linux_amd64.tar.gz | tar -xz
 ```
 
-Or build it; requires Linux and Go 1.27+:
+Or build a release; requires Linux and Go 1.27+:
 
 ```bash
-go install github.com/saremox/hopcorder/cmd/hopcorder@latest
+go install github.com/saremox/hopcorder/cmd/hopcorder@v0.1.1
 ```
 
-or from a checkout:
+Name a version that has a [GitHub release](https://github.com/Saremox/hopcorder/releases),
+not `@latest`: the Go module proxy serves every `v*` tag pushed to the
+repository as a version, released or not, and keeps it after the tag is
+gone (v0.1.0 is retracted for that reason). Or from a checkout:
 
 ```bash
 make build

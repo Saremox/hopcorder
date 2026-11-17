@@ -48,6 +48,9 @@ The section for a version is the text of its GitHub release.
 - The release archives are owned by root (0/0) and reproducible. They
   carried the build user's uid, which GNU tar restores when root unpacks
   them, so that uid owned the unpacked binary.
+- Go: install a released version (`go install …@v0.1.1`), not `@latest`:
+  the Go module proxy takes any `v*` tag as a version, released or not, and
+  keeps it. `go.mod` retracts the withdrawn v0.1.0.
 
 ## v0.1.1
 

@@ -1630,3 +1630,19 @@ high-severity issue. Four fixes followed. The decisions:
   request as the dry run. Two builds of the same commit give the same
   archives (checked). The chart packages are not reproducible: `helm
   package` stamps the current time.
+- **A tag is a Go release, whatever the workflow says.** proxy.golang.org
+  serves any `vX.Y.Z` tag as a version once someone asks for it, and
+  `@latest` resolves to the highest: off main, without CI, even when
+  verify-tag fails. It caches it for good; deleting the tag does not help,
+  and undoing it takes a higher version whose `go.mod` retracts it, which
+  pushes the version numbers up for good. README recommended
+  `go install …@latest`.
+  - README now recommends the release archives, or
+    `go install …@vX.Y.Z` of a version with a GitHub release, and says why.
+  - `go.mod` retracts v0.1.0 (withdrawn, its tag deleted). Whether the
+    proxy cached it was not checked, to keep the module path off an outside
+    service. The retraction takes effect with the next release, whose
+    `go.mod` carries it; `go mod tidy` keeps it, and the toolchain checks
+    (ci, `release-build.sh`) read only the `toolchain` line.
+  - Only a tag ruleset (a repository setting) keeps stray `v*` tags out;
+    nothing in the repository's files can.
