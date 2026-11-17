@@ -122,9 +122,10 @@ func (c *Client) Ping(ctx context.Context) error {
 // Params are values for {name:Type} placeholders.
 type Params map[string]string
 
-// Exec runs a statement that returns no rows, in the configured database.
+// Exec runs a statement that returns no rows, in the configured database,
+// with the settings WithWriteSettings put into ctx.
 func (c *Client) Exec(ctx context.Context, query string, params Params) error {
-	return c.do(ctx, true, nil, params, strings.NewReader(query), nil)
+	return c.do(ctx, true, writeSettings(ctx), params, strings.NewReader(query), nil)
 }
 
 // ExecServer runs a statement outside any database, e.g. CREATE DATABASE.
@@ -133,8 +134,12 @@ func (c *Client) ExecServer(ctx context.Context, query string) error {
 }
 
 // InsertJSON inserts rows (one JSON object each) into table with the
-// JSONEachRow format, as one INSERT, i.e. one atomic block for batches of
-// sane size.
+// JSONEachRow format, as one INSERT, with the settings WithWriteSettings
+// put into ctx. Rows of one partition that fit one block (a million rows)
+// are one part of table, written atomically; the table's materialized
+// views are not: ClickHouse commits the part before it runs them, one
+// after another, and an error in one leaves the part and the views before
+// it written.
 func (c *Client) InsertJSON(ctx context.Context, table string, rows [][]byte) error {
 	if len(rows) == 0 {
 		return nil
@@ -144,11 +149,29 @@ func (c *Client) InsertJSON(ctx context.Context, table string, rows [][]byte) er
 		body.Write(r)
 		body.WriteByte('\n')
 	}
-	q := url.Values{}
+	q := writeSettings(ctx)
 	q.Set("query", "INSERT INTO "+quoteIdent(table)+" FORMAT JSONEachRow")
 	q.Set("input_format_skip_unknown_fields", "0")
 	q.Set("date_time_input_format", "best_effort")
 	return c.do(ctx, true, q, nil, &body, nil)
+}
+
+type writeSettingsKey struct{}
+
+// WithWriteSettings returns a context whose InsertJSON and Exec calls also
+// send s, e.g. a query_id to find the statement in system.processes by.
+// Query ignores them.
+func WithWriteSettings(ctx context.Context, s Settings) context.Context {
+	return context.WithValue(ctx, writeSettingsKey{}, s)
+}
+
+func writeSettings(ctx context.Context) url.Values {
+	q := url.Values{}
+	s, _ := ctx.Value(writeSettingsKey{}).(Settings)
+	for k, v := range s {
+		q.Set(k, v)
+	}
+	return q
 }
 
 // Settings are ClickHouse settings for the queries of one caller, sent as

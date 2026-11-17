@@ -377,6 +377,30 @@ func TestValidateRejects(t *testing.T) {
 		{"IPv6 loop in an IPv4 record", func(r *Record) {
 			r.Loops = []Loop{{IP: ip("2001:db8::1"), TTLs: []int{1, 2}}}
 		}},
+		// What Finalize derives must be the hops' (fourth security review):
+		// records that flipped reached without hops made an outage each.
+		{"reached without a reply", func(r *Record) {
+			r.Hops = r.Hops[:1]
+			r.PathLen, r.PathHash = 1, PathHash(r.Hops)
+		}},
+		{"a reply but not reached", func(r *Record) { r.Reached = false }},
+		{"no hops but reached", func(r *Record) {
+			r.Hops, r.PathLen, r.PathHash = []Hop{}, 0, PathHash(nil)
+		}},
+		{"path_hash of other hops", func(r *Record) { r.PathHash = PathHash(hops("x:10.0.0.2", "r:192.0.2.1")) }},
+		{"hops past the reply", func(r *Record) {
+			r.Hops = append(r.Hops, Hop{TTL: 3, Status: StatusNoReply})
+			r.PathLen, r.PathHash = 3, PathHash(r.Hops)
+		}},
+		{"hops past an unreachable", func(r *Record) {
+			r.Hops[0].Status, r.Hops[0].Code = StatusUnreachable, IntPtr(1)
+			r.PathHash = PathHash(r.Hops)
+		}},
+		{"a loop the hops do not show", func(r *Record) { r.Loops = []Loop{{IP: ip("10.0.0.1"), TTLs: []int{1, 2}}} }},
+		{"a loop left out", func(r *Record) {
+			r.Hops = hops("x:10.0.0.1", "x:10.0.0.1", "r:192.0.2.1")
+			r.PathLen, r.PathHash = 3, PathHash(r.Hops)
+		}},
 	}
 	if err := good().Validate(); err != nil {
 		t.Fatalf("baseline invalid: %v", err)
@@ -385,6 +409,7 @@ func TestValidateRejects(t *testing.T) {
 	r6 := good()
 	r6.AF, r6.TargetIP = 6, ip("fe80::9%eth0.100")
 	r6.Hops[0].IP, r6.Hops[1].IP = ip("fe80::1"), ip("fe80::9")
+	r6.PathHash = PathHash(r6.Hops)
 	if err := r6.Validate(); err != nil {
 		t.Errorf("link-local target with a zone: %v", err)
 	}

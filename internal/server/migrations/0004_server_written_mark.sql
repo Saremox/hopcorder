@@ -1,0 +1,21 @@
+-- The deduplication mark in agent_seq is written by the server (security
+-- review, round four).
+--
+-- agent_seq_mv wrote it while ClickHouse inserted a cycles part, as one of
+-- the part's views, in an order that varies between databases. A view that
+-- failed after it (memory, disk, a restart) left the mark past cycles whose
+-- hop or loop rows were missing, and the agent's retry was answered
+-- "duplicates": those rows were lost for good. The server now writes
+-- agent_seq itself, once a part is stored with its hop and loop rows and
+-- its events were derived (see Ingester in internal/server/ingest.go).
+--
+-- Rolling back to a version before this migration: that version does not
+-- write the mark itself, so recreate the view first, or it stores retried
+-- batches twice after its next restart:
+--
+--   CREATE MATERIALIZED VIEW agent_seq_mv TO agent_seq AS
+--   SELECT agent_id, max(seq) AS max_seq FROM cycles GROUP BY agent_id;
+--
+-- (and drop it again before rolling forward: the server refuses to start
+-- while it exists). A dropped view loses no data; no other view changes.
+DROP VIEW IF EXISTS agent_seq_mv;

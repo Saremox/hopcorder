@@ -32,6 +32,11 @@ log:
 clickhouse:                     # the HTTP interface
   url: http://127.0.0.1:8123
   database: hopcorder           # created on startup if missing; migrations run automatically
+  # The user needs all privileges on the database, and to see and stop its
+  # own queries: GRANT SELECT(query_id, user, query) ON system.processes
+  # (the default user and the images' CLICKHOUSE_USER have it; the server
+  # refuses to start without it: after a failed insert it stops the insert
+  # before it looks at what was stored).
   user: default
   # The password from a file. Under systemd the unit's dynamic user can only
   # read world-readable files (this one included): pass it as a credential
@@ -45,7 +50,7 @@ ingest:
   max_body_bytes: 8MiB          # compressed request body
   max_decoded_bytes: 32MiB      # after decompression (an agent's batch is 1MiB by default); a request
                                 # being processed holds up to about three times this in memory, plus
-                                # about 24MiB while it is stored
+                                # about 32MiB while it is stored (a part of it and its events at a time)
   max_concurrent: 4             # requests processed at once; more wait, then get 503 (agents retry)
   max_streams: 20000            # (agent, target, protocol, flow) tracked in memory, 1 to 9 KiB each
   # max_streams_per_agent: 4096 # of them one agent's (default 4096, or half of max_streams if less);

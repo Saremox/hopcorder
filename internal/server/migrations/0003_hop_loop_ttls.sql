@@ -17,7 +17,11 @@ ALTER TABLE cycles
         DEFAULT arrayResize(CAST([], 'Array(Array(UInt8))'), length(`hops.ttl`)) AFTER `hops.mpls`;
 
 -- Recreated reading the new column. The server applies migrations before it
--- accepts ingest, so no insert can slip through between the two statements.
+-- accepts ingest, but another server can still insert between the two
+-- statements (a rolling upgrade), storing cycles without hop rows, and a
+-- migration that dies between them leaves no view for a version that has
+-- it recorded (security review, round four). Later view changes use ALTER
+-- TABLE ... MODIFY QUERY, and the server refuses to start without the view.
 DROP VIEW IF EXISTS hops_mv;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS hops_mv TO hops AS

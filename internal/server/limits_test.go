@@ -74,9 +74,11 @@ func isRestore(q string) bool { return strings.Contains(q, "seq < {before:UInt64
 func recordLine(seq uint64, ts time.Time, targetIP, hopIP string) string {
 	tip, _ := json.Marshal(targetIP)
 	hip, _ := json.Marshal(hopIP)
+	ip, _ := netip.ParseAddr(hopIP)
+	hash := record.PathHash([]record.Hop{{TTL: 1, Status: record.StatusTTLExpired, IP: ip}})
 	return fmt.Sprintf(`{"schema":1,"agent_id":"lab","seq":%d,"ts":%q,"target":"dc1.example","target_ip":%s,`+
-		`"af":6,"protocol":"icmp","flow_id":1,"reached":false,"path_len":1,"path_hash":"x","loops":[],`+
-		`"hops":[{"ttl":1,"status":"ttl-expired","ip":%s,"rtt_us":5}]}`, seq, ts.Format(time.RFC3339Nano), tip, hip)
+		`"af":6,"protocol":"icmp","flow_id":1,"reached":false,"path_len":1,"path_hash":%q,"loops":[],`+
+		`"hops":[{"ttl":1,"status":"ttl-expired","ip":%s,"rtt_us":5}]}`, seq, ts.Format(time.RFC3339Nano), tip, hash, hip)
 }
 
 // IPv6 zones are any text to netip: refused on hops and loops, and on
