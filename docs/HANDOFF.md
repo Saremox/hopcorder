@@ -985,7 +985,8 @@ fixes. The decisions:
   payload.
 - **Grafana reads ClickHouse with a read-only user** in the compose stack
   (`deploy/compose/clickhouse-init.sql`): SELECT on the hopcorder database,
-  `readonly = 2` (no writes; the plugin may still set query settings), and no
+  `readonly = 2` (no writes; the plugin may still set query settings; since
+  round four `readonly = 1`, see there), and no
   privileges for table functions (`url()`, `file()`). Any viewer, anonymous
   ones included, can send Grafana SQL, so that user is the boundary.
 - **ClickHouse is no longer published** on the host (`docker compose exec
@@ -1150,10 +1151,13 @@ decisions:
   16, `cancel_http_readonly_queries_on_client_close = 1` CONST. The
   constraints need `MIN 1`: 0 means unlimited and passes any `MAX`. A query
   may lower these, not raise them, and cannot switch profiles. The
-  plugin's own query timeout must stay at or below 300 s. The script runs on
+  plugin's own query timeout must stay at or below 300 s (295 s: the plugin
+  adds 5). The script runs on
   the first start of an empty volume and can be re-run on an older one
   (every statement is `IF NOT EXISTS`; since round three the profile is
-  `OR REPLACE`, so a re-run also updates it).
+  `OR REPLACE`, so a re-run also updates it). Round four: the list of
+  constrained settings was not a boundary; `readonly = 1`, 400 MB and
+  600 MB, and the user is `OR REPLACE` too.
 - **ASN names are copied out of their line** (`strings.Clone`): a name was
   a substring of the line it came from, so a small, compressible download
   with 60 KB lines kept up to the whole 256 MiB it inflated to (measured:
@@ -1737,6 +1741,10 @@ high-severity issue. Four fixes followed. The decisions:
   - Accepted: `system.query_log` keeps each query's text (at most what the
     client sent; in the chart for `systemLogRetentionDays`), so a viewer can
     still write to disk at the rate they upload SQL, without amplification.
+    Wrong, as round four found: the profiler and logging settings, still
+    changeable, made ClickHouse write about 1.5 MB/s of its own logs, and
+    even without them every query writes a few hundred bytes of logs,
+    however short its SQL (see round four).
   - Tests: `TestGrafanaUserClickHouse` (`clickhouse` tag) creates the
     compose user from the script, runs every dashboard query with it and
     every spill variant, which it refused only with the fix;
@@ -2310,7 +2318,107 @@ decisions:
 
 **Grafana's ClickHouse user**
 
-<!-- round four: grafana user -->
+- **Grafana's ClickHouse user has `readonly = 1`, an allowlist**
+  (`grafana_limits` in `deploy/compose/clickhouse-init.sql`). With `readonly = 2`
+  and a list of constrained settings, every setting off the list was the
+  viewer's to change, and some of them were not harmless (ClickHouse 25.8,
+  2 GiB containers, the review's measurements):
+  - Memory tracking off: `SELECT length(groupArray(number)) FROM
+    numbers(300000000) SETTINGS max_untracked_memory = 100000000000,
+    memory_profiler_step = 0` OOM-killed ClickHouse (without the settings
+    it fails at the 1 GB limit), and so did 14 queries with
+    `max_threads = 1000, use_concurrency_control = 0` (1,882 threads, each
+    with up to 4 MiB untracked).
+  - `use_query_cache = 1, query_cache_ttl = 100000000`: 1,100 queries
+    pinned 1.1 GiB for good (the cache counted 4.3 MB of it).
+  - The profilers (`memory_profiler_sample_probability = 1` with
+    `max_untracked_memory` and `memory_profiler_step` at 1,
+    `trace_profile_events`, `query_profiler_*`), `log_processors_profiles`,
+    `opentelemetry_*`, `log_query_threads` and `log_query_views`: about
+    1.5 MB/s of `trace_log` from 8 queries, the chart's 20 GiB volume in
+    about four hours. `log_queries = 0` or `log_queries_min_type` kept a
+    query out of `query_log`.
+
+  Now a query may change only settings marked `CHANGEABLE_IN_READONLY`:
+  `max_execution_time` (60 s, `MIN 1 MAX 300`), which the plugin sends.
+  Every other one is refused with READONLY (164), in the query, as a
+  request parameter and through a profile switch; "setting" one to the
+  value it already has passes (ClickHouse skips unchanged values).
+  `readonly` itself is CONST. `cancel_http_readonly_queries_on_client_close`
+  still works, as it needs `readonly > 0`. The round-three spill CONSTs and
+  the `MIN 1` limits stay, harmless, for the profile with `readonly = 2`.
+  - What the plugin sends, read in the source and seen in ClickHouse's
+    request log: 4.23.5 (`pkg/plugin/driver.go`) passes the data source's
+    `customSettings` and, with `enableRowLimit`, `limit` as connection
+    settings; clickhouse-go 2.50.0's HTTP transport adds `database`,
+    `default_format=Native`, `client_protocol_version=54460` and, from the
+    query's deadline, `max_execution_time` (the data source's
+    `queryTimeout`, 60 s, plus 5), and `query_id` or `quota_key` only when
+    set, which the plugin does not do. ClickHouse takes all of these but
+    `max_execution_time` and `limit` as request parameters, not settings.
+    Our data source has no custom settings and no row limit; either needs
+    `CHANGEABLE_IN_READONLY`, and `queryTimeout` must stay at 295 s or
+    below.
+  - Checked with the real Grafana (13.3.1, the compose stack with the
+    signed 4.23.5 plugin from Grafana's artifact bucket, as grafana.com is
+    unreachable from the development container): its requests were
+    exactly `client_protocol_version=54460&database=hopcorder&default_format=Native&max_execution_time=64`
+    (14 for the health check), the health check passed and all 17
+    dashboard queries returned rows (`go test -tags grafana ./dashboards/`).
+  - Upgrade: the compose user is `OR REPLACE` now. A user's own settings
+    win over its profile's, so the old user's `readonly = 2` would have
+    survived a re-run of the script (checked: the old script, then the new
+    one, gives `readonly = 1` and keeps the grant).
+- **Grafana's memory limits fit the bundled ClickHouse**: 400 MB per query
+  and 600 MB for all of the user's queries, were 1 GB and 2 GB, sized for
+  the server chart's bundled ClickHouse. 2 GB was more than the chart's ClickHouse may use at
+  all (0.8 × 2Gi, 1.6 GiB); 600 MB is 35% of it, and the rest is for the
+  server's inserts and reads, ClickHouse's caches (at most 448 MiB) and
+  ClickHouse itself (200–400 MiB measured). The dashboards need far less:
+  on a week of eight streams (161,280 cycles, 1.9 million hop rows) their
+  largest query took 17 MiB and all 17 together 41 MiB, over 24 hours or
+  seven days. In a 2 GiB container with the chart's configuration, viewer
+  queries holding what the old limits allowed (three of 255 MiB) got the
+  server's 600 MB query killed in 3 of 3 runs (ClickHouse's overcommit
+  tracker picks the query using the most); with the new limits (four of
+  128 MiB, near the 600 MB cap) it succeeded 3 of 3 times.
+  - Not taken: `memory_overcommit_ratio_denominator = 1` for the user, so
+    that ClickHouse cancels Grafana's queries first when it runs out of
+    memory as a whole. It did pick them, but cancelling them did not free
+    the memory in time: the server's query still failed in 3 of 6 runs
+    (4 of 6 without).
+- **Accepted, and left to the owner: every query writes ClickHouse's own
+  logs.** Round three's "without amplification" was wrong (corrected
+  there): even with no setting changeable, each query, however short and
+  whether it runs or is refused, adds rows to `query_log`,
+  `processors_profile_log` and `trace_log`, 361 B per query after merging
+  with the chart's configuration (plus about 640 B of `text_log` in
+  compose, whose ClickHouse logs at trace level). One anonymous viewer got
+  1,238 queries/s to ClickHouse through the compose stack's Grafana (50
+  `SELECT 1` per `/api/ds/query`, 8 connections; a third refused as too
+  many at once, and logged as well): about 0.45 MB/s with the chart's
+  logging, which fills its 20 GiB volume in about 13 hours, well inside
+  the 7 days ClickHouse keeps the logs. The profile cannot bound that
+  without keeping queries out of `query_log`: refused queries are logged
+  too, so a ClickHouse quota would not, and logging less per query (no
+  processor profiles, settings or profile events) only took it to 103 B.
+  The bound is the request rate at Grafana: keep anonymous and untrusted
+  users away from it (the compose stack is a try-out on localhost), limit
+  `/api/ds/query` at a proxy, watch the ClickHouse volume, or lower
+  `systemLogRetentionDays`.
+- Tests:
+  - `TestGrafanaUserClickHouse` (`clickhouse` tag, CI job `clickhouse`)
+    sends queries as the plugin does (its request parameters; not the
+    server's client, which adds `readonly = 2` and other settings) and runs
+    every dashboard query, checks `readonly = 1`, the cancel setting and the
+    memory limits against the chart's budget, that `max_execution_time`
+    can be set from 1 to 300 s, that a query stops when its client goes
+    away, and that 41 settings (each variant above, the limits, `readonly`
+    and the spill settings) are refused in the query and 6 as request
+    parameters. With the old profile, 23 of the settings and 5 of the
+    parameters were accepted.
+  - The CI `grafana` job runs every dashboard query through the real
+    plugin, unchanged.
 
 **Read API**
 

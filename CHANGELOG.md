@@ -85,7 +85,25 @@ The section for a version is the text of its GitHub release.
   took 3.1 GiB and 29 s, more than a read query may use (1 GiB), so long
   paths, real or sent to that end, broke the view; now 49 MiB and 0.4 s.
 
-<!-- round four: grafana user -->
+- The compose stack's read-only ClickHouse user for Grafana has
+  `readonly = 1`: its queries
+  may change `max_execution_time` (up to 300 s; the Grafana plugin sends it)
+  and no other setting. With `readonly = 2`, the settings left off its list
+  let any viewer switch off ClickHouse's memory tracking and OOM-kill it
+  with one query, pin about 1 GiB of memory in the query cache for good,
+  make ClickHouse write about 1.5 MB/s of its own logs, or keep queries out
+  of `query_log`. A data source with custom settings or a row limit, or a
+  query timeout above 295 s, now gets its queries refused: allow such a
+  setting with `CHANGEABLE_IN_READONLY` in the profile.
+- The same user's memory is bounded to 400 MB per query and 600 MB for all
+  of its queries (were 1 GB and 2 GB, more than the chart's 2Gi ClickHouse
+  may use: two viewer queries got a query of the server killed). Compose:
+  re-run `deploy/compose/clickhouse-init.sql` on an existing volume (it now
+  replaces the user too).
+- Known: every query still makes ClickHouse write a few hundred bytes of its
+  own logs. Through the compose stack's Grafana one anonymous viewer sent
+  1,200 queries/s, about 0.45 MB/s with the chart's logging: keep untrusted
+  users away from Grafana, or rate-limit it.
 
 <!-- round four: read API -->
 
