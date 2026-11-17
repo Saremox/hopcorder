@@ -1546,7 +1546,47 @@ high-severity issue. Four fixes followed. The decisions:
 
 **Ingest and storage**
 
-<!-- round three: ingest -->
+- **Stream state is bounded however busy an agent is.** A sweep cannot
+  touch an agent that a request holds locked, and it skipped those; nothing
+  else bounded the streams. One agent_id with two requests always in flight
+  (4096 new streams each) was never swept, so its state grew without bound
+  (256k streams and 503 MiB after 41 s in the review; 17,800 streams in
+  0.13 s against `max_streams` 2000 in the test), and since the count stayed
+  over the limit, every sweep (every second) dropped every other agent's
+  streams: an agent with 300 streams lost the events of 44 cycles (beyond
+  the restore budget) in every batch. Now:
+  - A stream gets state only while there is room: fewer than `max_streams`
+    in all (checked and counted in one compare-and-swap) and fewer than the
+    new `ingest.max_streams_per_agent` of its agent, by default 4096 (what
+    one request may carry) or half of `max_streams` if less, so that no one
+    agent can fill the state (at most `max_streams`). Cycles of a stream
+    without room are stored but derive no events, and are counted
+    (`hopcorder_server_unrestored_cycles_total`) and warned about once per
+    batch like unrestored ones; the stream is restored once there is room.
+  - At `max_streams` the sweep frees 10% from the agents with the most
+    streams: it finds the level that cutting every agent above it to it
+    frees enough, counting all agents, and cuts those, least recently used
+    streams first. A locked agent above the level is given it and cuts
+    itself under its own lock when its request ends. So the agent with more
+    than its share pays, and an agent below the level loses nothing.
+    Before, the excess was taken from every agent that could be swept, by
+    age.
+  - Accepted: many agent_ids are still many agents. A flood of new ones,
+    each with fewer streams than a real agent, still makes the real agents
+    the largest and cuts them (the agent LRU and authentication at the
+    proxy, §2, bound that). When the other agents' streams plus one agent's
+    share exceed `max_streams`, that agent can keep the state full, so new
+    streams of others get none until a sweep cuts it back (existing ones
+    stay): keep `max_streams` above the real streams plus one share. A real
+    agent with more streams than its share derives no events for the rest
+    (the warning names the option).
+  - Tests: `TestLockedAgentStreamsBounded`; `TestLockedAgentDoesNotEvictOthers`
+    (the other agent's cycles without events per batch during the attack:
+    `[44 0 0 0 0 0]`, as without one, was `[44 44 44 44 44 44]`);
+    `TestHeavyAgentPaysAtMaxStreams` (five agents of 240 streams keep them
+    all while a locked agent fills the rest; also fails if the level leaves
+    locked agents out); `TestStreamsPerAgentBound`, `TestWaterLevel`,
+    `TestServerStreamsPerAgent`.
 
 **Read side, enrichment and the browser**
 - **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in

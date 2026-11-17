@@ -38,6 +38,11 @@ const (
 	DefaultRetentionDays     = 90
 )
 
+// DefaultMaxStreamsPerAgent is the default ingest.max_streams_per_agent (as
+// many streams as one request may carry), or half of max_streams if that is
+// less.
+const DefaultMaxStreamsPerAgent = 4096
+
 // ServerConfig configures `hopcorder server`.
 type ServerConfig struct {
 	// Listen is the HTTP address for ingest, the read API, health and
@@ -85,12 +90,17 @@ type IngestConfig struct {
 	// 10s, then get 503 and the agent retries.
 	MaxConcurrent int `yaml:"max_concurrent"`
 	// MaxStreams streams (agent, target, protocol, flow) and MaxAgents
-	// agents are tracked in memory; idle ones are dropped after
-	// StreamIdleTimeout, the least recently used beyond the limits. A
-	// dropped stream is restored from ClickHouse when it comes back.
-	MaxStreams        int      `yaml:"max_streams"`
-	MaxAgents         int      `yaml:"max_agents"`
-	StreamIdleTimeout Duration `yaml:"stream_idle_timeout"`
+	// agents are tracked in memory, at most MaxStreamsPerAgent streams of
+	// one agent (default 4096, or half of MaxStreams if less); a stream
+	// beyond them derives no events. Idle ones are dropped after
+	// StreamIdleTimeout; at MaxStreams the agents with the most streams
+	// drop their least recently used, beyond MaxAgents the least recently
+	// used agents go. A dropped stream is restored from ClickHouse when it
+	// comes back.
+	MaxStreams         int      `yaml:"max_streams"`
+	MaxStreamsPerAgent int      `yaml:"max_streams_per_agent"`
+	MaxAgents          int      `yaml:"max_agents"`
+	StreamIdleTimeout  Duration `yaml:"stream_idle_timeout"`
 	// MaxRecordAge refuses records older than this (and more than a day
 	// in the future): it must exceed the agents' spool max_age.
 	MaxRecordAge Duration `yaml:"max_record_age"`
@@ -191,6 +201,7 @@ func (c *ServerConfig) Finalize() error {
 	}
 	setInt(&c.Ingest.MaxConcurrent, DefaultIngestConcurrency)
 	setInt(&c.Ingest.MaxStreams, DefaultMaxStreams)
+	setInt(&c.Ingest.MaxStreamsPerAgent, max(1, min(DefaultMaxStreamsPerAgent, c.Ingest.MaxStreams/2)))
 	setInt(&c.Ingest.MaxAgents, DefaultMaxAgents)
 	setDur(&c.Ingest.StreamIdleTimeout, DefaultStreamIdleTimeout)
 	setDur(&c.Ingest.MaxRecordAge, DefaultMaxRecordAge)
@@ -270,6 +281,9 @@ func (c *ServerConfig) Finalize() error {
 	if c.Ingest.MaxConcurrent < 1 || c.Ingest.MaxStreams < 1 || c.Ingest.MaxAgents < 1 ||
 		c.Ingest.StreamIdleTimeout.D() < time.Minute || c.Query.MaxConcurrent < 1 {
 		fail("ingest/query: max_concurrent, max_streams and max_agents must be positive, stream_idle_timeout at least 1m")
+	}
+	if c.Ingest.MaxStreamsPerAgent < 1 || c.Ingest.MaxStreamsPerAgent > c.Ingest.MaxStreams {
+		fail("ingest.max_streams_per_agent %d: want 1 to max_streams (%d)", c.Ingest.MaxStreamsPerAgent, c.Ingest.MaxStreams)
 	}
 	if c.Ingest.MaxRecordAge.D() < time.Hour {
 		fail("ingest.max_record_age: must be at least 1h (and longer than the agents' spool max_age)")

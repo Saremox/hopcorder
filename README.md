@@ -573,11 +573,15 @@ loop addresses of the record's address family and without a zone, and `ts`
 at most `ingest.max_record_age` (30 days) old and at most a day ahead of the
 server's clock. Errors reported for rejected records are at most 200 bytes and
 never quote the record. The server keeps state for at most
-`ingest.max_streams` streams (20,000; 1 to 9 KiB each) and `ingest.max_agents`
-agents (10,000), drops idle ones after `stream_idle_timeout`, and the least
-recently used beyond the limits; they are restored from ClickHouse when they
-return, at most 256 per request within 5 s (the rest with their next batch,
-counted in `hopcorder_server_unrestored_cycles_total`). Running in a cgroup
+`ingest.max_streams` streams (20,000; 1 to 9 KiB each), at most
+`ingest.max_streams_per_agent` of one agent (4096, or half of `max_streams` if
+less), and `ingest.max_agents` agents (10,000). It drops idle ones after
+`stream_idle_timeout`; at `max_streams` the agents with the most streams drop
+their least recently used, beyond `max_agents` the least recently used agents
+go. Dropped ones are restored from ClickHouse when they return, at most 256
+per request within 5 s (the rest with their next batch); the cycles of a
+stream without state derive no events and are counted in
+`hopcorder_server_unrestored_cycles_total`. Running in a cgroup
 with a memory limit (a container, or a systemd unit with `MemoryMax=`), the
 server sets the Go memory limit to 90% of it unless `GOMEMLIMIT` is set.
 Read-API queries are limited to `query.max_concurrent` at once and to

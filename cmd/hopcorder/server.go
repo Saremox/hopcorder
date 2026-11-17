@@ -161,7 +161,8 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 	srv := server.New(server.Options{Store: ch, Pinger: ch, Enricher: en, Logger: logger, Registry: reg,
 		MaxBodyBytes: int64(cfg.Ingest.MaxBodyBytes), MaxDecodedBytes: int64(cfg.Ingest.MaxDecodedBytes),
 		MaxConcurrentIngest: cfg.Ingest.MaxConcurrent, MaxConcurrentQueries: cfg.Query.MaxConcurrent,
-		MaxStreams: cfg.Ingest.MaxStreams, MaxAgents: cfg.Ingest.MaxAgents, StreamIdleTTL: cfg.Ingest.StreamIdleTimeout.D(),
+		MaxStreams: cfg.Ingest.MaxStreams, MaxStreamsPerAgent: cfg.Ingest.MaxStreamsPerAgent, MaxAgents: cfg.Ingest.MaxAgents,
+		StreamIdleTTL:    cfg.Ingest.StreamIdleTimeout.D(),
 		MaxRecordAge:     cfg.Ingest.MaxRecordAge.D(),
 		MaxResponseBytes: int64(cfg.Query.MaxResponseBytes), MaxQueryMemory: int64(cfg.Query.MaxMemoryBytes),
 		AllowedHosts: allowed, UI: uiHandler})

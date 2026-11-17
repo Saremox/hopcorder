@@ -17,7 +17,15 @@ The section for a version is the text of its GitHub release.
 
 **Security: server ingest**
 
-<!-- round three: ingest -->
+- One agent can no longer crowd the others out of the stream state. An agent
+  kept busy by back-to-back requests was never swept, so it escaped
+  `ingest.max_streams` without bound and made every sweep drop every other
+  agent's streams, whose cycles then derived no path changes or outages. The
+  limit now always holds, the new `ingest.max_streams_per_agent` (4096, or
+  half of `max_streams` if less) bounds one agent, and at the limit the
+  agents with the most streams give theirs up first. Cycles of streams
+  beyond the limits are stored, and counted in
+  `hopcorder_server_unrestored_cycles_total`.
 
 **Security: read side and Grafana**
 

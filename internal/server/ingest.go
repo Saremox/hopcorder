@@ -45,12 +45,17 @@ type Ingester struct {
 	metrics *serverMetrics
 
 	// State is kept per agent and per stream, keyed by what agents send, so
-	// it is bounded: streams and agents idle for idleTTL are dropped (a
-	// stream that comes back is restored from storage, as after a restart),
-	// and beyond maxStreams and maxAgents the least recently used go first.
-	maxStreams int
-	maxAgents  int
-	idleTTL    time.Duration
+	// it is bounded. There is state for at most maxStreams streams, and for
+	// at most streamsPerAgent of one agent: a stream beyond them keeps none
+	// (its cycles are stored but derive no events). Streams and agents idle
+	// for idleTTL are dropped (a stream that comes back is restored from
+	// storage, as after a restart); at maxStreams the agents with the most
+	// streams drop their least recently used, and beyond maxAgents the
+	// least recently used agents go.
+	maxStreams         int
+	maxStreamsPerAgent int // 0: the default (see streamsPerAgent)
+	maxAgents          int
+	idleTTL            time.Duration
 	// maxRecordAge is how old a record may be (the handler refuses older
 	// ones); restores look no further back than that.
 	maxRecordAge time.Duration
@@ -73,6 +78,17 @@ type agentState struct {
 	highWater uint64
 	streams   map[streamKey]*stream
 	used      time.Time
+	// nstreams is len(streams), for sweeps that find the agent locked.
+	nstreams atomic.Int64
+	// keep, unless negative, is how many streams a sweep left the agent
+	// while it was locked; ingestAgent drops the rest before unlocking.
+	keep atomic.Int64
+}
+
+func newAgentState() *agentState {
+	a := &agentState{streams: map[streamKey]*stream{}}
+	a.keep.Store(-1)
+	return a
 }
 
 // Defaults for the ingester's state bounds.
@@ -81,6 +97,10 @@ const (
 	// (255 IPv6 hops and a 255-character target), so 20,000 hold at most
 	// about 170 MiB.
 	DefaultMaxStreams = 20000
+	// DefaultMaxStreamsPerAgent is as many streams as one request may
+	// carry; an agent has a stream per target, protocol and flow. (At most
+	// half of max_streams by default: see streamsPerAgent.)
+	DefaultMaxStreamsPerAgent = maxStreamsPerRequest
 	// DefaultMaxAgents: an agent's state without its streams is under
 	// 1 KiB; agents normally have several streams each, so this only binds
 	// when someone sends many agent_ids.
@@ -155,7 +175,7 @@ func (in *Ingester) lockAgent(id string) *agentState {
 		in.mu.Lock()
 		a, ok := in.agents[id]
 		if !ok {
-			a = &agentState{streams: map[streamKey]*stream{}}
+			a = newAgentState()
 			in.agents[id] = a
 		}
 		in.mu.Unlock()
@@ -167,51 +187,70 @@ func (in *Ingester) lockAgent(id string) *agentState {
 	}
 }
 
-// sweep drops idle streams and agents, and the least recently used agents
-// and streams beyond maxAgents and maxStreams (down to 90% of each). Agents
-// being ingested right now are skipped. It walks all state, which the
-// limits bound, at most every sweepInterval, or every second while over a
-// limit.
+// streamsPerAgent is how many streams one agent may have state for:
+// maxStreamsPerAgent (at most maxStreams), by default 4096 or half of
+// maxStreams if that is less, so that no one agent can fill the state.
+func (in *Ingester) streamsPerAgent() int {
+	if in.maxStreamsPerAgent > 0 {
+		return min(in.maxStreamsPerAgent, in.maxStreams)
+	}
+	return max(1, min(DefaultMaxStreamsPerAgent, in.maxStreams/2))
+}
+
+// sweep drops idle streams and agents, the least recently used agents
+// beyond maxAgents (down to 90%), and, once the streams reach maxStreams,
+// streams down to 90% of it: the agents with the most streams give up
+// their least recently used first (see waterLevel), so one agent sending
+// many streams pays for them, not everyone else. An agent being ingested
+// right now cannot be swept; it is told how many streams to keep and drops
+// the rest itself before it unlocks (ingestAgent). It walks all state,
+// which the limits bound, at most every sweepInterval, or every second
+// while at a limit.
 func (in *Ingester) sweep() {
 	now := in.now()
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	overStreams, overAgents := in.nstreams.Load() > int64(in.maxStreams), len(in.agents) > in.maxAgents
+	overStreams, overAgents := in.nstreams.Load() >= int64(in.maxStreams), len(in.agents) > in.maxAgents
 	over := overStreams || overAgents
 	if since := now.Sub(in.lastSweep); since < sweepInterval && (!over || since < time.Second) {
 		return
 	}
 	in.lastSweep = now
 	cutoff := now.Add(-in.idleTTL)
-	type lruStream struct {
-		a    *agentState
-		k    streamKey
-		used time.Time
-	}
 	type lruAgent struct {
 		id   string
 		a    *agentState
 		used time.Time
 	}
-	var streams []lruStream
+	type holder struct {
+		a *agentState
+		n int
+	}
 	var agents []lruAgent
+	var holders []holder
 	for id, a := range in.agents {
 		if !a.mu.TryLock() {
+			if n := int(a.nstreams.Load()); overStreams && n > 0 {
+				holders = append(holders, holder{a, n})
+			}
 			continue
 		}
+		a.keep.Store(-1) // a share left from an earlier sweep: this one decides
 		for k, s := range a.streams {
 			if s.used.Before(cutoff) {
-				delete(a.streams, k)
-				in.nstreams.Add(-1)
-			} else if overStreams {
-				streams = append(streams, lruStream{a, k, s.used})
+				in.dropStream(a, k)
 			}
 		}
 		if len(a.streams) == 0 && a.used.Before(cutoff) {
 			a.evicted = true
 			delete(in.agents, id)
-		} else if overAgents {
-			agents = append(agents, lruAgent{id, a, a.used})
+		} else {
+			if overAgents {
+				agents = append(agents, lruAgent{id, a, a.used})
+			}
+			if overStreams && len(a.streams) > 0 {
+				holders = append(holders, holder{a, len(a.streams)})
+			}
 		}
 		a.mu.Unlock()
 	}
@@ -223,6 +262,7 @@ func (in *Ingester) sweep() {
 				l.a.evicted = true
 				delete(in.agents, l.id)
 				in.nstreams.Add(-int64(len(l.a.streams)))
+				l.a.nstreams.Store(0)
 				l.a.streams = nil
 				l.a.mu.Unlock()
 				n++
@@ -233,25 +273,88 @@ func (in *Ingester) sweep() {
 			"max_agents", in.maxAgents, "dropped", n)
 	}
 	if excess := in.nstreams.Load() - int64(in.maxStreams)*9/10; overStreams && excess > 0 {
-		slices.SortFunc(streams, func(x, y lruStream) int { return x.used.Compare(y.used) })
-		n := 0
-		for _, l := range streams {
-			if int64(n) >= excess {
-				break
+		// Agents just dropped above (only sweeps set evicted, under in.mu)
+		// have no streams left to give.
+		holders = slices.DeleteFunc(holders, func(h holder) bool { return h.a.evicted })
+		counts := make([]int, len(holders))
+		for i, h := range holders {
+			counts[i] = h.n
+		}
+		keep := waterLevel(counts, excess)
+		n, busy := 0, 0
+		for _, h := range holders {
+			if h.n <= keep {
+				continue
 			}
-			if l.a.mu.TryLock() {
-				if _, ok := l.a.streams[l.k]; ok && !l.a.evicted {
-					delete(l.a.streams, l.k)
-					in.nstreams.Add(-1)
-					n++
-				}
-				l.a.mu.Unlock()
+			if h.a.mu.TryLock() {
+				n += in.trimLocked(h.a, keep)
+				h.a.mu.Unlock()
+			} else {
+				h.a.keep.Store(int64(keep))
+				busy++
 			}
 		}
 		in.metrics.evicted("stream", n)
-		in.log.Warn("tracking too many streams; dropped the least recently used (they are restored from storage when they come back)",
-			"max_streams", in.maxStreams, "dropped", n)
+		in.log.Warn("tracking too many streams; the agents with the most dropped their least recently used "+
+			"(they are restored from storage when they come back)", "max_streams", in.maxStreams, "dropped", n,
+			"kept_per_agent", keep, "agents_dropping_later", busy)
 	}
+}
+
+// waterLevel returns the highest level such that cutting every count above
+// it down to it removes at least excess: the largest counts are cut first,
+// and no count at or below the level is touched.
+func waterLevel(counts []int, excess int64) int {
+	counts = slices.Clone(counts)
+	slices.SortFunc(counts, func(x, y int) int { return y - x })
+	var sum int64
+	for i, c := range counts {
+		sum += int64(c)
+		next := 0
+		if i+1 < len(counts) {
+			next = counts[i+1]
+		}
+		// Levelling the i+1 largest at L removes sum - (i+1)*L.
+		if level := (sum - excess) / int64(i+1); level >= int64(next) {
+			return int(max(level, 0))
+		}
+	}
+	return 0
+}
+
+// trimLocked drops a's least recently used streams beyond keep and returns
+// how many it dropped; a must be locked.
+func (in *Ingester) trimLocked(a *agentState, keep int) int {
+	n := len(a.streams) - keep
+	if n <= 0 {
+		return 0
+	}
+	type lru struct {
+		k    streamKey
+		used time.Time
+	}
+	all := make([]lru, 0, len(a.streams))
+	for k, s := range a.streams {
+		all = append(all, lru{k, s.used})
+	}
+	slices.SortFunc(all, func(x, y lru) int { return x.used.Compare(y.used) })
+	for _, l := range all[:n] {
+		in.dropStream(a, l.k)
+	}
+	return n
+}
+
+// unlockAgent drops the streams a sweep found a (agent id) should give up
+// while it was locked, then unlocks it.
+func (in *Ingester) unlockAgent(id string, a *agentState) {
+	if keep := a.keep.Swap(-1); keep >= 0 {
+		if n := in.trimLocked(a, int(keep)); n > 0 {
+			in.metrics.evicted("stream", n)
+			in.log.Warn("agent has more streams than tracking leaves it room for; dropped its least recently used",
+				"agent_id", id, "dropped", n, "kept", keep, "max_streams", in.maxStreams)
+		}
+	}
+	a.mu.Unlock()
 }
 
 // restoreBudget bounds the stream restores of one request.
@@ -307,7 +410,7 @@ func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestRe
 
 func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.Record, rb *restoreBudget) (accepted, dups int, err error) {
 	a := in.lockAgent(id)
-	defer a.mu.Unlock()
+	defer in.unlockAgent(id, a)
 	now := in.now()
 	a.used = now
 	if !a.loaded {
@@ -393,9 +496,13 @@ func (in *Ingester) insertCycles(ctx context.Context, a *agentState, recs []*rec
 func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Record, now time.Time, rb *restoreBudget) {
 	var ev events
 	tried := map[*stream]bool{}
-	var skipped, failed int
+	var skipped, failed, noRoom int
 	for _, r := range recs {
 		s := in.stream(a, keyOf(r))
+		if s == nil {
+			noRoom++
+			continue
+		}
 		s.used = now
 		if !s.loaded && !tried[s] {
 			tried[s] = true
@@ -418,20 +525,47 @@ func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Re
 			"(the streams are restored with their next batch)", "agent_id", recs[0].AgentID, "cycles", skipped,
 			"failed_restores", failed)
 	}
+	if noRoom > 0 {
+		in.metrics.unrestoredCycles(noRoom)
+		in.log.Warn("no room to track more streams; these cycles derive no path changes or outages "+
+			"(raise ingest.max_streams or max_streams_per_agent if this agent's streams are real)",
+			"agent_id", recs[0].AgentID, "cycles", noRoom, "agent_streams", len(a.streams),
+			"max_streams_per_agent", in.streamsPerAgent(), "max_streams", in.maxStreams)
+	}
 	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventsTimeout)
 	defer cancel()
 	in.insertEvents(ectx, ev)
 }
 
-// stream returns a's stream k, creating it; a must be locked.
+// stream returns a's stream k, creating it if there is room: nil if a has
+// streamsPerAgent streams already, or all agents together maxStreams. a
+// must be locked.
 func (in *Ingester) stream(a *agentState, k streamKey) *stream {
-	s, ok := a.streams[k]
-	if !ok {
-		s = &stream{key: k}
-		a.streams[k] = s
-		in.nstreams.Add(1)
+	if s, ok := a.streams[k]; ok {
+		return s
 	}
+	if len(a.streams) >= in.streamsPerAgent() {
+		return nil
+	}
+	for n := in.nstreams.Load(); ; n = in.nstreams.Load() {
+		if n >= int64(in.maxStreams) {
+			return nil
+		}
+		if in.nstreams.CompareAndSwap(n, n+1) {
+			break
+		}
+	}
+	s := &stream{key: k}
+	a.streams[k] = s
+	a.nstreams.Add(1)
 	return s
+}
+
+// dropStream forgets a's stream k; a must be locked.
+func (in *Ingester) dropStream(a *agentState, k streamKey) {
+	delete(a.streams, k)
+	a.nstreams.Add(-1)
+	in.nstreams.Add(-1)
 }
 
 func (in *Ingester) loadHighWater(ctx context.Context, id string) (uint64, error) {

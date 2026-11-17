@@ -88,11 +88,13 @@ type Options struct {
 	// name in their Host header, against DNS rebinding; empty allows any.
 	// /healthz, /readyz and /metrics answer every host.
 	AllowedHosts []string
-	// MaxStreams, MaxAgents and StreamIdleTTL bound the per-stream and
-	// per-agent state kept in memory (see Ingester).
-	MaxStreams    int
-	MaxAgents     int
-	StreamIdleTTL time.Duration
+	// MaxStreams, MaxStreamsPerAgent, MaxAgents and StreamIdleTTL bound
+	// the per-stream and per-agent state kept in memory (see Ingester);
+	// MaxStreamsPerAgent defaults to 4096 or half of MaxStreams if less.
+	MaxStreams         int
+	MaxStreamsPerAgent int
+	MaxAgents          int
+	StreamIdleTTL      time.Duration
 	// MaxRecordAge refuses records older than this (default 30 days);
 	// records more than a day ahead of the server's clock are refused too.
 	MaxRecordAge time.Duration
@@ -155,6 +157,9 @@ func New(o Options) *Server {
 	in := NewIngester(o.Store, o.Enricher, o.Logger, m)
 	if o.MaxStreams > 0 {
 		in.maxStreams = o.MaxStreams
+	}
+	if o.MaxStreamsPerAgent > 0 {
+		in.maxStreamsPerAgent = o.MaxStreamsPerAgent
 	}
 	if o.MaxAgents > 0 {
 		in.maxAgents = o.MaxAgents
