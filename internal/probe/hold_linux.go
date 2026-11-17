@@ -45,10 +45,13 @@ func (h heldID) String() string {
 // UDP and TCP source ports are not held: a bound UDP port swallows the
 // datagrams other tracers send to it, so the host would stop answering them
 // with port unreachable, and a TCP port cannot be bound while any earlier
-// connection on it is in TIME_WAIT. Forged ICMP errors for those probes are
-// refused by the IP ID check instead, and their destination answers
-// (SYN-ACK, RST) cannot be provoked without choosing the SYN's sequence
-// number.
+// connection on it is in TIME_WAIT (and with SO_REUSEADDR the hold could
+// be shared). Forged ICMP errors for those probes are refused by the IP ID
+// check instead. A local process can provoke a destination's SYN-ACK or RST
+// from the flow's port with connect(), but the kernel chooses that SYN's
+// sequence number, and a reply counts only if it acknowledges a probe's
+// exact one (32 random bits: the probe id and 16 more): one attempt in 2^32
+// per probe in flight matches.
 func (r *Raw) HoldFlows(flows []Flow) error {
 	want := map[uint16]bool{}
 	var order []uint16

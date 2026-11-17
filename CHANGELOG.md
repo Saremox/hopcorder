@@ -85,7 +85,15 @@ The section for a version is the text of its GitHub release.
 
 **Security: agent**
 
-<!-- round three: agent -->
+- Spoofed packets from anywhere can no longer forge hops, loops or a
+  reached destination by guessing the 16-bit probe id: a reply must also
+  match the probe's random IPv4 IP ID, a random nonce in its payload (which
+  destinations echo and ICMP errors quote) or the SYN's exact, random
+  sequence number. The review's spoofer, at 10,000–20,000 packets per
+  second, put fake hops into every cycle; now none. This also stops local
+  processes from forging TCP replies with `connect()`. IPv6 routers must
+  quote the whole probe, as RFC 4443 requires; one that quotes only 8 bytes
+  now shows `no-reply`.
 
 **Security: CI, release and deployment**
 

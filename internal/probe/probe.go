@@ -123,9 +123,12 @@ type Stats struct {
 	SendErrors  uint64
 	LateReplies uint64
 	// MismatchedReplies counts replies that matched an in-flight probe's
-	// addresses, ports and id but not the rest of it: an ICMPv4 error
-	// quoting another IP identification, or an echo reply with other data.
-	// They answer another process's packets, or a middlebox on the path
+	// addresses, ports and 16-bit id but not the rest of it: an ICMPv4
+	// error quoting another IP identification, an echo reply with other
+	// data, an ICMP error quoting another payload (or, on IPv6, too little
+	// of it to show the probe's nonce), a TCP reply acknowledging another
+	// sequence number. They answer another process's packets, or were
+	// forged by someone guessing probe ids, or a middlebox on the path
 	// rewrote IP IDs (hops beyond it then stay silent on IPv4).
 	MismatchedReplies uint64
 }

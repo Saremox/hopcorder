@@ -141,7 +141,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			}, func() float64 { return float64(pr.Stats().SendErrors) }),
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
 				Name: "hopcorder_probe_mismatched_replies_total",
-				Help: "Replies that matched an in-flight probe but quoted another IPv4 ID or echoed other data (another process's packets, or IP IDs rewritten on the path); dropped.",
+				Help: "Replies that matched an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number (another process's packets, forgeries, or IP IDs rewritten on the path); dropped.",
 			}, func() float64 { return float64(pr.Stats().MismatchedReplies) }),
 		)
 	}

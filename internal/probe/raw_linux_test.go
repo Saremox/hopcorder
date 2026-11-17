@@ -243,7 +243,13 @@ func setupNetns(t *testing.T) *netnsTopo {
 	if _, err := exec.LookPath("ip"); err != nil {
 		t.Skip("iproute2 not installed")
 	}
-	topo := &netnsTopo{prefix: fmt.Sprintf("hc%d", os.Getpid())}
+	// HOPCORDER_NETNS_PREFIX tells concurrent runs on one machine apart
+	// beyond the process id (at most 5 characters: link names are short).
+	prefix := os.Getenv("HOPCORDER_NETNS_PREFIX")
+	if prefix == "" {
+		prefix = "hc"
+	}
+	topo := &netnsTopo{prefix: fmt.Sprintf("%.5s%d", prefix, os.Getpid())}
 	names := []string{"agent", "r1", "r2", "target"}
 	for _, n := range names {
 		ns := topo.prefix + n
@@ -354,6 +360,24 @@ func TestRawNetns(t *testing.T) {
 		defer in(2, append([]string{"iptables", "-D"}, rule...)...)
 		in(3, "sysctl", "-qw", "net.ipv4.icmp_ratelimit=0")
 		inner(t, "TestInnerHoldFlows|TestInnerForgeRefused")
+	})
+	t.Run("spoof", func(t *testing.T) {
+		if _, err := exec.LookPath("iptables"); err != nil {
+			t.Skip("iptables not installed")
+		}
+		in := func(i int, args ...string) { run(t, append([]string{"ip", "netns", "exec", topo.ns[i]}, args...)...) }
+		// Every hop and the target silent, so any answer is a forgery.
+		silent := map[int][]string{
+			1: {"OUTPUT", "-p", "icmp", "--icmp-type", "time-exceeded", "-j", "DROP"},
+			2: {"OUTPUT", "-p", "icmp", "--icmp-type", "time-exceeded", "-j", "DROP"},
+			3: {"INPUT", "-s", "10.99.1.2", "-j", "DROP"},
+		}
+		for i, rule := range silent {
+			in(i, append([]string{"iptables", "-A"}, rule...)...)
+			defer in(i, append([]string{"iptables", "-D"}, rule...)...)
+		}
+		t.Setenv("HOPCORDER_NETNS_SPOOFER", topo.ns[3]) // the spoofer sends from the target's namespace
+		inner(t, "TestInnerSpoofRefused")
 	})
 	t.Run("loop", func(t *testing.T) {
 		// Make r2 send target traffic back to r1: a two-router loop. Host

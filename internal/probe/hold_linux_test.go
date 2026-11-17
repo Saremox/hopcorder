@@ -140,8 +140,9 @@ func TestUnprivilegedChild(t *testing.T) {
 				err = syscall.SetsockoptInt(udp, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
 			}
 			// A payload whose UDP checksum is the probe id; corked, so the
-			// kernel computes the checksum in software.
-			payload := buildUDP(src, dst, uint16(port), uint16(port), uint16(sum))[8:]
+			// kernel computes the checksum in software. (It cannot know
+			// the probe's nonce either.)
+			payload := buildUDP(src, dst, uint16(port), uint16(port), uint16(sum), 0)[8:]
 			for range 5 { // an ICMP error queued on the socket fails one write
 				if err != nil && !errors.Is(err, syscall.ECONNREFUSED) {
 					break

@@ -207,12 +207,17 @@ sudo setcap cap_net_raw+ep "$(command -v hopcorder)"
 or run it under systemd with `AmbientCapabilities=CAP_NET_RAW` (the shipped
 unit does). Without the capability the agent exits at startup and says so.
 
-**Other processes on the host.** Replies to probes reach every process that
-asks for them, so the agent keeps other local users from passing their
-packets off as answers: probe ids are random, ICMPv4 errors must quote the IP
-ID the probe was sent with, echo replies must echo its data, and the agent
-holds its ICMP echo identifier (`flow_id`) with an unprivileged "ping"
-socket, so no other process can claim it. That last part needs ping sockets
+**Forged answers.** Replies to probes reach every process that asks for
+them, and anyone who can send packets to the host can try to pass forged
+ones off as answers. So a reply must match more than the probe's random
+16-bit id: ICMPv4 errors must quote the probe's IP ID (random too), echo
+replies must echo a random nonce in its data, ICMP errors that quote the
+probe's payload must quote that nonce (on IPv6 they must quote it), and TCP
+replies must acknowledge the SYN's exact sequence number (32 random bits).
+Mismatches are dropped and counted in
+`hopcorder_probe_mismatched_replies_total`. The agent also holds its ICMP
+echo identifier (`flow_id`) with an unprivileged "ping" socket, so no other
+local process can claim it. That last part needs ping sockets
 for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
 every group); where other groups have them but the agent's does not, it
 logs so at startup. A second hopcorder (or `ping`) using the same echo
@@ -262,7 +267,7 @@ and in `agent.example.yaml` show.
   held constant across all TTLs of a cycle and across cycles, so a
   load-balanced path is traced as one consistent path instead of flapping
   between members. ICMP keeps identifier and checksum constant (the payload
-  compensates for the sequence number); UDP keeps both ports fixed and makes
+  compensates for the sequence number and the nonce); UDP keeps both ports fixed and makes
   the UDP checksum the probe id; TCP keeps both ports fixed and carries the
   probe id in the SYN's sequence number. `flow_id` (ICMP id / UDP or TCP
   source port) is on every record. `paris: false` gives classic traceroute
@@ -332,6 +337,10 @@ example.net`); with the daemon's ICMP `flow_id` it fails at startup.
 - **NAT** in front of the agent usually rewrites and restores the probe
   headers transparently; a NAT that does not restore the quoted header breaks
   reply matching (every hop beyond it shows `no-reply`).
+- **IPv6 routers must quote the whole probe** in their ICMPv6 errors, as RFC
+  4443 requires: one that quotes only the first 8 bytes shows `no-reply`
+  (and counts in `hopcorder_probe_mismatched_replies_total`), since a spoofer
+  could otherwise leave out the nonce. IPv4 routers may quote 8 bytes.
 - **TCP "reply" may come from a middlebox.** Transparent proxies, SYN proxies
   and some load balancers answer the SYN with the destination's address, so a
   TCP trace can "reach" the target hops early (seen on the first test: port
@@ -422,7 +431,7 @@ hop addresses.
 | `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
 | `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
-| `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe but quoting another IPv4 ID or echoing other data, dropped: answers to another process's packets, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
+| `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number, dropped: answers to another process's packets, forgeries, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 

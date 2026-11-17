@@ -1,9 +1,11 @@
 package probe
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"slices"
 
 	"github.com/saremox/hopcorder/internal/record"
 )
@@ -41,10 +43,15 @@ const (
 const (
 	ipv4HeaderLen = 20
 	ipv6HeaderLen = 40
-	// payloadMagic follows the 2-byte compensation word in every probe so
-	// probes are recognisable in packet captures.
+	// Every ICMP and UDP probe carries, after its 8-byte header, a 2-byte
+	// checksum compensation word, a random 4-byte nonce and payloadMagic
+	// (so probes are recognisable in packet captures).
+	nonceLen     = 4
 	payloadMagic = "hopcorder\x00"
-	payloadLen   = 2 + len(payloadMagic)
+	payloadLen   = 2 + nonceLen + len(payloadMagic)
+	// nonceEnd is how much of the payload a quote must hold to include the
+	// nonce.
+	nonceEnd = 2 + nonceLen
 )
 
 // probeKey identifies one in-flight probe. The fields hold whatever the
@@ -78,6 +85,15 @@ type icmpReply struct {
 	// says whether there was one (ICMPv4 errors).
 	ipID       uint16
 	quotedIPID bool
+	// seq is the full sequence number of the SYN that a TCP reply
+	// acknowledges (its ack minus one) or an ICMP error quotes; set when
+	// key.proto is TCP.
+	seq uint32
+	// l4Off and l4Len locate the quoted L4 packet of an ICMP error in the
+	// message: its header and as much of its payload as was quoted, cut at
+	// the length its IP header states, so that RFC 4884 padding and
+	// extensions are left out. Both are 0 for echo and TCP replies.
+	l4Off, l4Len int
 }
 
 // Parse errors. errIgnored marks well-formed ICMP that is simply not a reply
@@ -131,12 +147,13 @@ func pseudoHeaderSum(src, dst netip.Addr, proto uint8, n int) uint32 {
 	return sum
 }
 
-// buildEcho returns an ICMPv4 or ICMPv6 echo request. In paris mode the
-// payload's first word compensates for seq, so the checksum (which some ECMP
+// buildEcho returns an ICMPv4 or ICMPv6 echo request whose data carries
+// nonce, which the destination echoes back. In paris mode the payload's
+// first word compensates for seq and nonce, so the checksum (which some ECMP
 // routers hash on, as part of the first four L4 bytes) is the same for every
 // probe of a flow. src and dst are only used for the ICMPv6 pseudo-header;
 // the kernel recomputes that checksum anyway, and arrives at the same value.
-func buildEcho(src, dst netip.Addr, id, seq uint16, paris bool) []byte {
+func buildEcho(src, dst netip.Addr, id, seq uint16, nonce uint32, paris bool) []byte {
 	b := make([]byte, 8+payloadLen)
 	if dst.Is4() {
 		b[0] = icmp4EchoRequest
@@ -145,12 +162,14 @@ func buildEcho(src, dst netip.Addr, id, seq uint16, paris bool) []byte {
 	}
 	binary.BigEndian.PutUint16(b[4:], id)
 	binary.BigEndian.PutUint16(b[6:], seq)
+	binary.BigEndian.PutUint32(b[10:], nonce)
 	if paris {
-		// seq + ^seq == 0xffff, i.e. ones-complement zero: the sum, and
-		// therefore the checksum, no longer depends on seq.
-		binary.BigEndian.PutUint16(b[8:], ^seq)
+		// x + ^x == 0xffff, i.e. ones-complement zero: with x the sum of
+		// seq and the nonce's two words, the packet's sum, and therefore
+		// its checksum, no longer depends on either.
+		binary.BigEndian.PutUint16(b[8:], ^fold(uint32(seq)+nonce>>16+nonce&0xffff))
 	}
-	copy(b[10:], payloadMagic)
+	copy(b[8+nonceEnd:], payloadMagic)
 	var initial uint32
 	if dst.Is6() {
 		initial = pseudoHeaderSum(src, dst, protoICMPv6, len(b))
@@ -159,16 +178,18 @@ func buildEcho(src, dst netip.Addr, id, seq uint16, paris bool) []byte {
 	return b
 }
 
-// buildUDP returns a UDP header and payload whose checksum is exactly want,
-// achieved by choosing the payload's first word. The checksum identifies the
-// probe while ports — the fields ECMP hashes on — stay fixed. want must be in
-// 1..0xfffe (0 means "no checksum" in IPv4 and 0xffff is its alias).
-func buildUDP(src, dst netip.Addr, sport, dport, want uint16) []byte {
+// buildUDP returns a UDP header and a payload carrying nonce, with a
+// checksum of exactly want, achieved by choosing the payload's first word.
+// The checksum identifies the probe while ports — the fields ECMP hashes
+// on — stay fixed. want must be in 1..0xfffe (0 means "no checksum" in IPv4
+// and 0xffff is its alias).
+func buildUDP(src, dst netip.Addr, sport, dport, want uint16, nonce uint32) []byte {
 	b := make([]byte, 8+payloadLen)
 	binary.BigEndian.PutUint16(b[0:], sport)
 	binary.BigEndian.PutUint16(b[2:], dport)
 	binary.BigEndian.PutUint16(b[4:], uint16(len(b)))
-	copy(b[10:], payloadMagic)
+	binary.BigEndian.PutUint32(b[10:], nonce)
+	copy(b[8+nonceEnd:], payloadMagic)
 	// With the checksum and compensation words zero, the folded sum is s.
 	// We need fold(s + comp) == ^want, so comp = ^want - s in ones-complement
 	// arithmetic, which is ^want + ^s.
@@ -181,7 +202,7 @@ func buildUDP(src, dst netip.Addr, sport, dport, want uint16) []byte {
 
 // buildTCPSyn returns a TCP SYN with an MSS option, like a real connection
 // attempt, so middleboxes treat it as one. The probe id travels in the
-// sequence number (seq = id<<16), which ECMP does not hash on; a SYN-ACK or
+// sequence number (see tcpSeq), which ECMP does not hash on; a SYN-ACK or
 // RST acknowledges seq+1, and ICMP errors quote the sequence number in their
 // first 8 bytes.
 func buildTCPSyn(src, dst netip.Addr, sport, dport uint16, seq uint32) []byte {
@@ -197,8 +218,10 @@ func buildTCPSyn(src, dst netip.Addr, sport, dport uint16, seq uint32) []byte {
 	return b
 }
 
-// tcpSeq is the sequence number that carries probe id.
-func tcpSeq(id uint16) uint32 { return uint32(id) << 16 }
+// tcpSeq is a SYN's sequence number: the probe id in the top 16 bits (the
+// key) and random bits in the low 16. A reply must acknowledge exactly
+// seq+1, and an ICMP error must quote all 32 bits.
+func tcpSeq(id, random uint16) uint32 { return uint32(id)<<16 | uint32(random) }
 
 // parseTCP parses a TCP segment (no IP header) received from from. Only a
 // SYN-ACK or an RST with ACK — the two answers to a SYN — is a reply.
@@ -213,12 +236,12 @@ func parseTCP(from netip.Addr, seg []byte) (icmpReply, error) {
 	if flags&tcpACK == 0 || flags&(tcpSYN|tcpRST) == 0 {
 		return icmpReply{}, errIgnored
 	}
-	ack := binary.BigEndian.Uint32(seg[8:])
-	return icmpReply{kind: kindTCPReply, key: probeKey{
+	seq := binary.BigEndian.Uint32(seg[8:]) - 1 // the ack acknowledges the SYN's seq + 1
+	return icmpReply{kind: kindTCPReply, seq: seq, key: probeKey{
 		dst: from.Unmap().WithZone(""), proto: protoTCP,
 		a: binary.BigEndian.Uint16(seg[2:]), // their destination port is our source port
 		b: binary.BigEndian.Uint16(seg[0:]),
-		c: uint16((ack - 1) >> 16),
+		c: uint16(seq >> 16),
 	}}, nil
 }
 
@@ -256,38 +279,49 @@ func parseICMPv4(from netip.Addr, b []byte) (icmpReply, error) {
 		if code != 0 { // code 1 is fragment reassembly time exceeded
 			return icmpReply{}, errIgnored
 		}
-		key, id, err := parseQuotedIPv4(b[8:])
-		return icmpReply{kind: kindTimeExceeded, key: key, ipID: id, quotedIPID: true}, err
+		return quotedReply(kindTimeExceeded, 0, b, parseQuotedIPv4)
 	case icmp4Unreachable:
-		key, id, err := parseQuotedIPv4(b[8:])
-		return icmpReply{kind: kindUnreachable, code: code, key: key, ipID: id, quotedIPID: true}, err
+		return quotedReply(kindUnreachable, code, b, parseQuotedIPv4)
 	default:
 		return icmpReply{}, errIgnored
 	}
 }
 
-// parseQuotedIPv4 returns the probe key of a quoted IPv4 packet and its
-// identification field.
-func parseQuotedIPv4(q []byte) (probeKey, uint16, error) {
+// quotedReply parses the packet quoted by ICMP error b with parse.
+func quotedReply(kind replyKind, code uint8, b []byte, parse func([]byte) (icmpReply, error)) (icmpReply, error) {
+	r, err := parse(b[8:])
+	if err != nil {
+		return icmpReply{}, err
+	}
+	r.kind, r.code = kind, code
+	r.l4Off += 8
+	return r, nil
+}
+
+// parseQuotedIPv4 returns the probe key of a quoted IPv4 packet, its
+// identification field and where its L4 packet lies in q.
+func parseQuotedIPv4(q []byte) (icmpReply, error) {
 	if len(q) < ipv4HeaderLen {
-		return probeKey{}, 0, errTruncated
+		return icmpReply{}, errTruncated
 	}
 	if q[0]>>4 != 4 {
-		return probeKey{}, 0, errMalformed
+		return icmpReply{}, errMalformed
 	}
 	ihl := int(q[0]&0x0f) * 4
 	if ihl < ipv4HeaderLen {
-		return probeKey{}, 0, errMalformed
+		return icmpReply{}, errMalformed
 	}
 	if binary.BigEndian.Uint16(q[6:])&0x1fff != 0 {
-		return probeKey{}, 0, errIgnored // non-first fragment, no L4 header
+		return icmpReply{}, errIgnored // non-first fragment, no L4 header
 	}
 	if len(q) < ihl+8 {
-		return probeKey{}, 0, errTruncated
+		return icmpReply{}, errTruncated
 	}
 	dst := netip.AddrFrom4([4]byte(q[16:20]))
-	key, err := quotedL4Key(dst, q[9], q[ihl:ihl+8])
-	return key, binary.BigEndian.Uint16(q[4:]), err
+	r, err := quotedL4(dst, q[9], q[ihl:], int(binary.BigEndian.Uint16(q[2:]))-ihl)
+	r.ipID, r.quotedIPID = binary.BigEndian.Uint16(q[4:]), true
+	r.l4Off = ihl
+	return r, err
 }
 
 // parseICMPv6 parses an ICMPv6 message received from from.
@@ -306,53 +340,84 @@ func parseICMPv6(from netip.Addr, b []byte) (icmpReply, error) {
 		if code != 0 { // code 1 is fragment reassembly time exceeded
 			return icmpReply{}, errIgnored
 		}
-		key, err := parseQuotedIPv6(b[8:])
-		return icmpReply{kind: kindTimeExceeded, key: key}, err
+		return quotedReply(kindTimeExceeded, 0, b, parseQuotedIPv6)
 	case icmp6Unreachable:
-		key, err := parseQuotedIPv6(b[8:])
-		return icmpReply{kind: kindUnreachable, code: code, key: key}, err
+		return quotedReply(kindUnreachable, code, b, parseQuotedIPv6)
 	default:
 		return icmpReply{}, errIgnored
 	}
 }
 
-func parseQuotedIPv6(q []byte) (probeKey, error) {
+func parseQuotedIPv6(q []byte) (icmpReply, error) {
 	if len(q) < ipv6HeaderLen {
-		return probeKey{}, errTruncated
+		return icmpReply{}, errTruncated
 	}
 	if q[0]>>4 != 6 {
-		return probeKey{}, errMalformed
+		return icmpReply{}, errMalformed
 	}
 	if len(q) < ipv6HeaderLen+8 {
-		return probeKey{}, errTruncated
+		return icmpReply{}, errTruncated
 	}
 	// Our probes carry no extension headers, so anything else in the
 	// next-header field is not ours.
 	dst := netip.AddrFrom16([16]byte(q[24:40]))
-	return quotedL4Key(dst, q[6], q[ipv6HeaderLen:ipv6HeaderLen+8])
+	r, err := quotedL4(dst, q[6], q[ipv6HeaderLen:], int(binary.BigEndian.Uint16(q[4:])))
+	r.l4Off = ipv6HeaderLen
+	return r, err
 }
 
-// quotedL4Key builds the probe key from the first 8 bytes of a quoted L4
-// header.
-func quotedL4Key(dst netip.Addr, proto uint8, l4 []byte) (probeKey, error) {
+// quotedL4 builds the probe key from the first 8 bytes of a quoted L4
+// packet l4 (at least 8 bytes, possibly followed by padding) whose IP header
+// states its length as n. l4Len is set to the bytes of l4 that belong to
+// the packet; a length shorter than the L4 header is ignored.
+func quotedL4(dst netip.Addr, proto uint8, l4 []byte, n int) (icmpReply, error) {
+	r := icmpReply{l4Len: len(l4)}
+	if n >= 8 && n < len(l4) {
+		r.l4Len = n
+	}
 	switch proto {
 	case protoICMP, protoICMPv6:
 		if (proto == protoICMP && l4[0] != icmp4EchoRequest) || (proto == protoICMPv6 && l4[0] != icmp6EchoRequest) {
-			return probeKey{}, errIgnored
+			return icmpReply{}, errIgnored
 		}
-		return probeKey{dst: dst, proto: proto,
-			a: binary.BigEndian.Uint16(l4[4:]), c: binary.BigEndian.Uint16(l4[6:])}, nil
+		r.key = probeKey{dst: dst, proto: proto,
+			a: binary.BigEndian.Uint16(l4[4:]), c: binary.BigEndian.Uint16(l4[6:])}
 	case protoUDP:
-		return probeKey{dst: dst, proto: proto,
+		r.key = probeKey{dst: dst, proto: proto,
 			a: binary.BigEndian.Uint16(l4[0:]), b: binary.BigEndian.Uint16(l4[2:]),
-			c: binary.BigEndian.Uint16(l4[6:])}, nil
+			c: binary.BigEndian.Uint16(l4[6:])}
 	case protoTCP:
-		return probeKey{dst: dst, proto: proto,
+		r.seq = binary.BigEndian.Uint32(l4[4:])
+		r.key = probeKey{dst: dst, proto: proto,
 			a: binary.BigEndian.Uint16(l4[0:]), b: binary.BigEndian.Uint16(l4[2:]),
-			c: uint16(binary.BigEndian.Uint32(l4[4:]) >> 16)}, nil
+			c: uint16(r.seq >> 16)}
 	default:
-		return probeKey{}, errIgnored
+		return icmpReply{}, errIgnored
 	}
+	return r, nil
+}
+
+// quoteMatches reports whether the payload an ICMP error quotes (l4 is the
+// quoted L4 packet, header included) agrees with data, the payload of the
+// probe it names. Only what was quoted is compared, since routers may quote
+// just the first 8 L4 bytes (RFC 792). With requireNonce (IPv6, where RFC
+// 4443 requires as much of the packet as fits) a quote too short to include
+// the nonce is refused. Without it, a quoted payload of zeros counts as not
+// quoted: RFC 4884 pads a quote to 128 bytes, also one that stopped after 8.
+func quoteMatches(l4, data []byte, requireNonce bool) bool {
+	var q []byte
+	if len(l4) > 8 {
+		q = l4[8:]
+	}
+	n := min(len(q), len(data))
+	if requireNonce && n < nonceEnd {
+		return false
+	}
+	q = q[:n]
+	if bytes.Equal(q, data[:n]) {
+		return true
+	}
+	return !requireNonce && !slices.ContainsFunc(q, func(c byte) bool { return c != 0 })
 }
 
 // RFC 4884 extension structure, RFC 4950 MPLS label stack object.

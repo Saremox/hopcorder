@@ -422,7 +422,11 @@ added in the commit that introduced it.
   technique): the first payload word is chosen so the checksum comes out to the
   id. This works identically for IPv4 and IPv6 (IPv6 has no IP ID) and the
   checksum is in the 8 quoted bytes. Demux key: (dst, proto, icmp id, seq) or
-  (dst, udp, sport, dport, checksum).
+  (dst, udp, sport, dport, checksum). Since round three of the security
+  review the ids are random (round two), and the 16 bits of the key are not
+  all a reply must match: ICMP and UDP payloads are `comp word | 4-byte
+  random nonce | "hopcorder\0"` (the paris word now compensates for seq and
+  the nonce), and the IPv4 IP ID is random on its own; see round three.
 - **`flow_id`** is the ICMP identifier (icmp) or UDP source port (udp),
   default 33434, constant across TTLs *and* cycles so paris keeps a target on
   one ECMP path over time; per-target configurable. Classic mode
@@ -448,7 +452,9 @@ added in the commit that introduced it.
 - **TCP SYN probing** (§4.3, done after M1 review): a SYN with an MSS option
   to `port` (default 443), source port `flow_id`. The probe id is the top 16
   bits of the sequence number (ECMP does not hash it; ICMP errors quote it;
-  SYN-ACK/RST acknowledge seq+1). Paris keeps both ports fixed; classic mode
+  SYN-ACK/RST acknowledge seq+1); since round three the low 16 bits are
+  random, and a reply must acknowledge exactly seq+1 (an ICMP error quote
+  all 32 bits). Paris keeps both ports fixed; classic mode
   walks the source port, since the destination port is the service being
   reached. The destination's SYN-ACK or RST is `reply`, as is an ICMP port
   unreachable from the destination itself (an iptables REJECT). Replies arrive
@@ -1444,7 +1450,9 @@ decisions:
   fake loop, or ended the path early, with one datagram per cycle, for UDP
   and for ICMP.
 - **ICMPv4 errors must quote the probe's IP ID.** The probe id is already
-  the IP ID of every IPv4 probe. Unprivileged sockets choose ports, the UDP
+  the IP ID of every IPv4 probe (corrected in round three: that added no
+  bits against someone guessing ids, so the IP ID is now drawn on its own).
+  Unprivileged sockets choose ports, the UDP
   checksum and the echo sequence, but not the IP ID. A mismatch is dropped
   and counted in `hopcorder_probe_mismatched_replies_total`. Trade-off: a
   middlebox that rewrites IP IDs makes every hop beyond it silent on IPv4.
@@ -1487,10 +1495,15 @@ decisions:
     `SO_REUSEADDR` the hold can be shared, so it would protect nothing.
   - Both checked on Linux 6.18.
   - The gain would have been small. Forged ICMP errors for UDP and TCP
-    probes fail the IP ID check. A SYN-ACK or RST cannot be provoked
-    without choosing the SYN's sequence number. With random ids, the ids
-    an unprivileged process can still observe say nothing about the
-    others.
+    probes fail the IP ID check. With random ids, the ids an unprivileged
+    process can still observe say nothing about the others.
+  - Corrected in round three: "a SYN-ACK or RST cannot be provoked without
+    choosing the SYN's sequence number" was wrong. A process that binds
+    the flow's TCP port and loops `connect()` to the target provokes them,
+    and the kernel's ISN is a free 16-bit guess at the probe id, since only
+    the top 16 bits were checked; the review got 2 of 38 cycles recorded as
+    `reached` that way. Replies must now acknowledge the exact 32-bit
+    sequence number; see round three.
   - So two processes on the same UDP or TCP flow still start, and the
     caveat stays for them.
 - **`flow_id` has a global default and a `--flow-id` flag**, so a `--once`
@@ -1848,7 +1861,72 @@ high-severity issue. Four fixes followed. The decisions:
     hops with 128 MiB per query; before: 502). `TestTopologyClickHouse`
     still checks the edges themselves.
 
-<!-- round three: agent -->
+- **A reply must match 32 to 48 random bits, not 16.** Round two's checks
+  rested on the 16-bit probe id: the IPv4 IP ID was the probe id itself,
+  the echo data was `^seq` and the magic, TCP compared the top 16 bits of
+  the ack, and IPv6 had no second check. An off-path sender guessing ids
+  hit a probe in flight with probability (probes in flight)/65534 per
+  packet. In the review's netns PoC, forged time exceeded at 20k pps put
+  4–12 fake hops (and a fake loop) into 11 of 13 UDP cycles, and forged echo
+  replies at 5k pps recorded a black-holed target as `reached` in 11 of 12
+  ICMP cycles: the outages hopcorder exists to record. Now:
+  - The IPv4 IP ID is drawn on its own (1..0xffff; for 0 Linux would pick
+    one), and ICMPv4 errors must still quote it.
+  - ICMP and UDP probes carry a random 4-byte nonce after the compensation
+    word (16 payload bytes, were 12). Echo replies must echo it. An ICMP
+    error must quote unchanged whatever it quotes of the payload, cut at
+    the length the quoted IP header states, so RFC 4884 padding is not
+    compared. On IPv4 a quote of 8 bytes (RFC 792's minimum), or one padded
+    with zeros right after them, still counts: the IP ID covers it.
+  - On IPv6, ICMP errors for ICMP and UDP probes must quote the nonce.
+    Checked only "where quoted", a spoofer would quote 8 bytes and face 16
+    bits again (IPv6 has no IP ID), and RFC 4443 requires as much of the
+    packet as fits in 1280 bytes. Trade-off: an IPv6 router that quotes
+    less stays silent, counted as mismatched, as an IP ID rewriting
+    middlebox does on IPv4.
+  - TCP SYNs carry 16 random bits in the low half of the sequence number;
+    a SYN-ACK or RST must acknowledge exactly seq+1, an ICMP error must
+    quote all 32 bits (`pendingProbe.seq`).
+  - Paris: the compensation word cancels seq and the nonce, so the ICMP
+    checksum stays constant per flow; ports, identifier and lengths do not
+    change (TestParisKeepsFlowConstant, TestInnerPath).
+  - Bits a forgery must guess: echo reply 48; ICMPv4 error 32, 48 if it
+    quotes the payload or for TCP; ICMPv6 error 48, 32 for TCP; TCP reply
+    32.
+  - Measured with the review's spoofer, rerun as TestRawNetns/spoof (every
+    hop and the target silent, 3 cycles of 30 TTLs per protocol, two
+    runs): before, at least 6 fake hops in every UDP cycle at 20k pps and
+    4–10 fake `reply` hops in every ICMP cycle at 10k pps; after, none,
+    while 28 and 14 forgeries hit a probe in flight and were counted as
+    mismatched.
+- **TCP replies can no longer be provoked by local processes** (corrects
+  round two, which said they cannot be provoked without choosing the
+  SYN's sequence number). An unprivileged process that binds the unheld
+  TCP flow port and loops `connect()` to the target gets SYN-ACKs or RSTs
+  for the kernel's ISN, and only its top 16 bits were compared: the review
+  got 2 of 38 cycles recorded as `reached` at about 270 connects/s as uid
+  65534. With the exact ack an attempt matches with probability N/2^32 for
+  N probes in flight; at that rate, with 30 probes in flight a fifth of the
+  time (1 s timeout, 5 s interval), about one forged reply per month of
+  continuous attack, at a random TTL of one cycle. The TCP source port is
+  still not held: round two's reasons stand (TIME_WAIT makes the bind fail
+  at random on busy hosts, and with `SO_REUSEADDR` the hold can be shared),
+  and against a 1-in-2^32 guess a hold would add little.
+- **Accepted:** forgeries still count in
+  `hopcorder_probe_mismatched_replies_total` (it measures attempts), and a
+  forgery for a timed-out probe's key counts as a late reply without the
+  further checks; neither reaches a record.
+- **Tests:** TestEngineForgedRepliesRefused (15 forgeries, one per check
+  and family; each forged reply is refused and counted, and the probe
+  stays pending for the genuine reply, which arrives 20 ms later). Undoing
+  any one fix in a scratch copy (IP ID = probe id; no quote check; top 16
+  bits of the ack; the old echo data) fails its cases. Also
+  TestEngineIPIDIndependentOfProbeID, TestEngineShortQuotes,
+  TestQuoteMatches, and golden bytes regenerated by an independent Python
+  script. TestRawNetns/spoof fails on the pre-fix code with fake hops in
+  every cycle. TestParisKeepsFlowConstant now checks ids for uniqueness
+  per key: classic mode varies a port, and the check failed about 1 run in
+  200.
 
 **CI, release and deployment**
 

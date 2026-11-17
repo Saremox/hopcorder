@@ -71,11 +71,18 @@ type engine struct {
 	mismatched atomic.Uint64
 }
 
+// pendingProbe is one probe in flight. Its key holds 16 random bits (the
+// probe id); the fields below hold more, drawn independently, which a reply
+// must also match so that an off-path sender guessing ids cannot pass for
+// one: ICMPv4 errors quote the IPv4 IP ID, echo replies echo the data (with
+// its nonce) and ICMP errors may quote it, TCP replies acknowledge the full
+// sequence number.
 type pendingProbe struct {
 	tr   *traceState
 	ttl  int
-	ipID uint16    // the IPv4 header's identification field
-	echo []byte    // an echo request's data, which the reply must carry
+	ipID uint16    // the IPv4 header's identification field, random
+	data []byte    // ICMP and UDP: the payload after the 8-byte header, with the nonce
+	seq  uint32    // TCP: the SYN's sequence number
 	sent time.Time // zero until the probe has been handed to the socket
 }
 
@@ -218,20 +225,25 @@ func (e *engine) trace(ctx context.Context, req TraceRequest) ([]HopResult, erro
 			e.finish(tr, keys[:i], probes[:i], false)
 			return nil, fmt.Errorf("trace %s: %w", target, err)
 		}
-		p.ipID = id
+		// Drawn independently of the id (the key), so a reply must match
+		// 16 more random bits on IPv4 and, wherever it carries the
+		// nonce or the full TCP sequence number, 32 more. 0 is not an
+		// IP ID: Linux would fill in one of its own.
+		p.ipID = uint16(1 + e.ids.IntN(0xffff)) //nolint:gosec // 1..0xffff
+		nonce := e.ids.Uint32()
+		probes[i] = &pendingProbe{tr: tr, ttl: ttl, ipID: p.ipID}
 		switch req.Protocol {
 		case ICMP:
-			p.l4 = buildEcho(src, target, req.FlowID, id, req.Paris)
+			p.l4 = buildEcho(src, target, req.FlowID, id, nonce, req.Paris)
+			probes[i].data = p.l4[8:]
 		case UDP:
-			p.l4 = buildUDP(src, target, a, b, id)
+			p.l4 = buildUDP(src, target, a, b, id, nonce)
+			probes[i].data = p.l4[8:]
 		case TCP:
-			p.l4 = buildTCPSyn(src, target, a, b, tcpSeq(id))
+			probes[i].seq = tcpSeq(id, uint16(nonce)) //nolint:gosec // the low 16 random bits
+			p.l4 = buildTCPSyn(src, target, a, b, probes[i].seq)
 		}
 		pkts[i], keys[i] = p, k
-		probes[i] = &pendingProbe{tr: tr, ttl: ttl, ipID: id}
-		if req.Protocol == ICMP {
-			probes[i].echo = p.l4[8:]
-		}
 		e.pending[k] = probes[i]
 		delete(e.tombs, k)
 	}
@@ -351,6 +363,32 @@ func (e *engine) handleTCP(from netip.Addr, seg []byte, at time.Time) {
 	}
 }
 
+// matches reports whether reply r (parsed from msg), which carries p's key,
+// also carries what else p was sent with. Otherwise it answers another
+// packet with the same key: one an off-path sender forged by guessing the
+// 16-bit probe id, another process's (an unprivileged one can choose ports,
+// UDP checksum and echo sequence, but not the IP ID, the nonce or the
+// sequence number the kernel gives its connections), or one a middlebox
+// rewrote (IP IDs, say).
+func (p *pendingProbe) matches(r icmpReply, msg []byte) bool {
+	if r.quotedIPID && r.ipID != p.ipID {
+		return false
+	}
+	switch {
+	case r.key.proto == protoTCP:
+		// A SYN-ACK or RST acknowledges exactly seq+1; an ICMP error
+		// quotes the SYN's whole sequence number.
+		return r.seq == p.seq
+	case r.kind == kindEchoReply:
+		// The destination echoes the request's data.
+		return len(msg) >= 8 && bytes.HasPrefix(msg[8:], p.data)
+	default:
+		// An ICMP error quoting an echo request or a UDP probe: what it
+		// quotes of the payload must be the probe's.
+		return quoteMatches(msg[r.l4Off:r.l4Off+r.l4Len], p.data, p.tr.target.Is6())
+	}
+}
+
 // resolve records reply r for its pending probe. msg is the ICMP message,
 // for extensions; nil for TCP replies.
 func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time, msg []byte) {
@@ -372,19 +410,7 @@ func (e *engine) resolve(from netip.Addr, r icmpReply, at time.Time, msg []byte)
 		// to it, though it was read afterwards. The probe stays pending.
 		return
 	}
-	if r.quotedIPID && r.ipID != p.ipID {
-		// An ICMP error quoting the probe's key but not its IPv4
-		// identification: someone else's packet (an unprivileged process
-		// can choose ports, UDP checksum and echo sequence, but not the IP
-		// ID), or a middlebox that rewrites IP IDs. Not an answer.
-		e.mismatched.Add(1)
-		return
-	}
-	if r.kind == kindEchoReply && (len(msg) < 8 || !bytes.HasPrefix(msg[8:], p.echo)) {
-		// The destination echoes the request's data; this reply carries
-		// other data, so it answers someone else's echo with the probe's
-		// identifier and sequence number (a ping run with a chosen
-		// identifier, say).
+	if !p.matches(r, msg) {
 		e.mismatched.Add(1)
 		return
 	}
