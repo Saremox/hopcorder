@@ -26,14 +26,12 @@ The section for a version is the text of its GitHub release.
   counted too few cycles. Every time parameter now names UTC. The official
   ClickHouse image (compose, the chart's bundled ClickHouse) runs in UTC
   and was not affected.
-
 - Grafana's read-only ClickHouse user may no longer use the hyperscan
   functions (`multiMatchAny`, `multiFuzzyMatchAny` and the like). ClickHouse
   keeps each compiled pattern set in a global cache, outside every query and
   user memory limit, for good: queries that each stayed under the user's
   400 MB grew ClickHouse by 95 to 140 MB apiece, and the tenth OOM-killed
   the chart's 2 GiB ClickHouse. No dashboard uses them.
-
 - Agent: two targets of one host with the same protocol and `flow_id`
   (IPv4 and IPv6 of one name, or two TCP ports, under the default
   `flow_id`) are refused at load. The server tells streams apart by host,
