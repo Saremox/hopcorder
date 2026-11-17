@@ -49,6 +49,11 @@ The section for a version is the text of its GitHub release.
 - Read API: every endpoint takes `flow_id`, so two flows of one target
   (IPv4 and IPv6, or two ports) can be read apart; without it, any flow,
   as before. `targets` also returns each stream's `last_af`.
+- UI: the two flows of one target are two streams. The list shows each
+  with its address family and `flow_id`, and each row opens its own view;
+  both opened one view of both flows (50% reached for a dual-stack name
+  with IPv6 down). A link without `flow_id` opens its stream if it
+  matches only one, else lists those it matches.
 
 **Security: server ingest**
 

@@ -2,7 +2,7 @@
 // The shell: header with the range picker, then the stream list or one
 // stream. All state lives in the URL hash (state.ts).
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { Client, apiBase } from './api'
+import { Client, apiBase, isOneStream, type StreamKey } from './api'
 import StreamList from './components/StreamList.vue'
 import StreamView from './components/StreamView.vue'
 import { PRESETS, formatHash, parseHash, type Preset, type Range, type ViewState } from './state'
@@ -51,6 +51,12 @@ function refresh() {
 const presets = Object.keys(PRESETS) as Preset[]
 const absolute = computed(() => (state.value.range.kind === 'absolute' ? state.value.range : null))
 const streamsLink = computed(() => formatHash({ view: 'streams', range: state.value.range }))
+/** The stream shown, if the hash names exactly one; a link that names none lists those it matches. */
+const oneStream = computed(() => (state.value.view === 'stream' && state.value.stream && isOneStream(state.value.stream) ? state.value.stream : undefined))
+const match = computed(() => (state.value.view === 'stream' && !oneStream.value ? state.value.stream : undefined))
+function openOnly(s: StreamKey) {
+  navigate({ ...state.value, stream: s }, true)
+}
 </script>
 
 <template>
@@ -78,15 +84,15 @@ const streamsLink = computed(() => formatHash({ view: 'streams', range: state.va
   </header>
   <main>
     <StreamView
-      v-if="state.view === 'stream' && state.stream"
+      v-if="oneStream"
       :client="client"
-      :stream="state.stream"
+      :stream="oneStream"
       :range="state.range"
       :at="state.at"
       :now="now"
       :theme="theme"
       @seek="(at) => navigate({ ...state, at }, true)"
     />
-    <StreamList v-else :client="client" :range="state.range" :now="now" />
+    <StreamList v-else :client="client" :range="state.range" :now="now" :match="match" @only="openOnly" />
   </main>
 </template>

@@ -3303,3 +3303,28 @@ findings are listed at the end, for the owner to decide on. The decisions:
     flows and no af) and TestDualStackStreams (ingest: on two flows no
     route change and one open IPv6 outage; on one flow, what the agent
     no longer sends, the review's 39 `target` changes and 20 outages).
+- **The UI's stream is (agent, target, protocol, flow).** `StreamKey` has
+  `flow`, the URL `flow_id`, the stream list's links carry it, and a
+  view's every request sends it, so the two rows of a dual-stack name open
+  two views. The list shows each stream's af (`last_af`) and flow, the
+  view's header its flow and the shown cycle's af.
+  - Links without `flow_id` or `protocol` (every link before) name no
+    single stream. They show the stream list narrowed to the streams they
+    match (`targets` with their agent, target and protocol) with a note,
+    and if that is one stream, it opens, the URL replaced by its full link
+    (range and moment kept). So the view that merged a target's protocols
+    when a link had none is gone: a view is one stream.
+  - Tests: Vitest (the URL round-trips `flow_id`, the two rows' links
+    differ and parse back to their flows, bad `flow_id`s are dropped;
+    every request of a view sends the flow; a link resolves to its only
+    stream, else none) and browser tests (two flows of one name are two
+    rows, IPv6 with 0% reached, no route change and one outage, IPv4 with
+    100%, none and none; a link without `flow_id` opens the only stream,
+    or lists both). The three new browser tests failed against a server
+    built from the commit before these fixes, run locally.
+  - Not changed: the Grafana dashboard's variables are agent, target and
+    protocol, so its per-target panels (reachability, path length, the
+    hop panels) merge a target's flows. Its route-change and outage
+    panels read the per-stream tables and are right. A `flow_id`
+    variable is left for the owner; another round-five fix changes
+    Grafana's side.

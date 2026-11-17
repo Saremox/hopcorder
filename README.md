@@ -754,7 +754,9 @@ rate-limited router flickering does not count.
 ## Web UI
 
 The server serves a UI at `/ui/` (behind the same reverse proxy as the read
-API; it works under any path prefix). Pick a stream, then:
+API; it works under any path prefix). Pick a stream: an agent's target with
+one protocol and `flow_id`, so the IPv4 and IPv6 targets of one name are two
+rows, each with its address family and flow. Then:
 
 - **The timeline** shows the share of cycles that missed the destination and
   its RTT, outage windows and route changes. Click or drag on it to select a
@@ -769,7 +771,9 @@ API; it works under any path prefix). Pick a stream, then:
 - **The cycle** hop by hop (address, name, AS, RTT, status, MPLS labels), and
   the range's route changes, outages and loops, each a click away.
 
-The URL holds the whole view, so links can be shared.
+The URL holds the whole view, so links can be shared. A link without a
+`flow_id` (from an earlier version) opens its stream if it matches only one,
+else lists the ones it matches.
 
 ![The topology UI at a route change](docs/images/ui.png)
 

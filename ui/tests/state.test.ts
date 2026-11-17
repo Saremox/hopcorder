@@ -1,17 +1,41 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_RANGE, formatHash, parseHash, parseRange, resolveRange, type ViewState } from '../src/state'
+import type { Stream } from '../src/api'
+import { DEFAULT_RANGE, formatHash, parseHash, parseRange, resolveRange, streamLink, type ViewState } from '../src/state'
 
 describe('hash state', () => {
   it('round-trips a stream view', () => {
     const s: ViewState = {
       view: 'stream',
-      stream: { agent: 'lab 1', target: 'dc1.example', protocol: 'udp' },
+      stream: { agent: 'lab 1', target: 'dc1.example', protocol: 'udp', flow: 33435 },
       range: { kind: 'absolute', from: 1763251200000, to: 1763337600000 },
       at: 1763300000123,
     }
     const h = formatHash(s)
-    expect(h).toBe('#/stream?agent=lab+1&target=dc1.example&protocol=udp&range=1763251200000-1763337600000&at=1763300000123')
+    expect(h).toBe('#/stream?agent=lab+1&target=dc1.example&protocol=udp&flow_id=33435&range=1763251200000-1763337600000&at=1763300000123')
     expect(parseHash(h)).toEqual(s)
+  })
+
+  it('links each flow of a target to its own view', () => {
+    // The review's two rows (round five): IPv4 and IPv6 of one name on two
+    // flows. Their links used to be the same, without flow_id.
+    const row = (flow_id: number, last_af: number): Stream => ({
+      agent_id: 'lab', target: 'dual.example', protocol: 'icmp', flow_id, last_af, last_ts: '', cycles: 20,
+      reach_ratio: 1, last_reached: true, last_path_len: 3, last_target_ip: '', last_path_hash: '',
+    })
+    const v4 = streamLink(row(33434, 4), DEFAULT_RANGE)
+    const v6 = streamLink(row(33435, 6), DEFAULT_RANGE)
+    expect(v4).toBe('#/stream?agent=lab&target=dual.example&protocol=icmp&flow_id=33434')
+    expect(v6).toBe('#/stream?agent=lab&target=dual.example&protocol=icmp&flow_id=33435')
+    expect(parseHash(v6).stream).toEqual({ agent: 'lab', target: 'dual.example', protocol: 'icmp', flow: 33435 })
+    expect(streamLink(row(0, 4), DEFAULT_RANGE)).toContain('&flow_id=0')
+  })
+
+  it('keeps links without a flow_id, which name no single stream', () => {
+    expect(parseHash('#/stream?agent=a&target=t&protocol=icmp').stream).toEqual({ agent: 'a', target: 't', protocol: 'icmp' })
+    for (const bad of ['', 'x', '-1', '65536', '1e3', '0x10', '123456']) {
+      expect(parseHash(`#/stream?agent=a&target=t&protocol=icmp&flow_id=${bad}`).stream?.flow).toBeUndefined()
+    }
+    expect(parseHash('#/stream?agent=a&target=t&protocol=icmp&flow_id=65535').stream?.flow).toBe(65535)
   })
 
   it('omits defaults', () => {
