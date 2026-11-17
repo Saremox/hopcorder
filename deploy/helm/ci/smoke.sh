@@ -36,6 +36,12 @@ for i in $(seq 90); do
         echo "ClickHouse's read-only user can write (or the check failed otherwise): $out"
         exit 1
       fi
+      # The image's passwordless default user is gone.
+      if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
+        ! grep -q 'Authentication failed' <<<"$out"; then
+        echo "ClickHouse's default user still logs in (or the check failed otherwise): $out"
+        exit 1
+      fi
       echo "smoke test passed"
       exit 0
     fi
