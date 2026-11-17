@@ -35,7 +35,12 @@ for i in $(seq 90); do
         exit 1
       fi
       curl -sf -H 'Host: 10.244.0.9:8080' http://127.0.0.1:18080/readyz >/dev/null
-      curl -sf -H 'Host: 10.244.0.9:8080' http://127.0.0.1:18080/metrics | grep -q '^hopcorder_server_host_refused_total 1$'
+      metrics=$(curl -sf -H 'Host: 10.244.0.9:8080' http://127.0.0.1:18080/metrics)
+      if ! grep -qx 'hopcorder_server_host_refused_total 1' <<<"$metrics"; then
+        echo "other requests were refused too (an agent or a probe?):"
+        grep '^hopcorder_server_host_refused_total' <<<"$metrics" || true
+        exit 1
+      fi
       ro=$(kubectl get secret hopcorder-server-clickhouse-readonly -o jsonpath='{.data.password}' | base64 -d)
       chq() { kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user grafana --password "$ro" --query "$1"; }
       if [ "$(chq 'SELECT count() > 0 FROM hopcorder.cycles')" != 1 ]; then
