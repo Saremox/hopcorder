@@ -64,7 +64,9 @@ data:
   # maxMemoryUsageForUser. The cancel setting needs readonly > 0. The
   # constraints stay for readonly = 2: the spill settings constant (with
   # one of them a query wrote temporary data to the data volume until it
-  # was full), the limits with MIN 1 (0 means "unlimited").
+  # was full), the limits with MIN 1 (0 means "unlimited"). No hyperscan:
+  # its compiled patterns stay in a global cache outside every memory
+  # limit (ten queries OOM-killed ClickHouse).
   readonly.xml: |
     <clickhouse>
         <profiles>
@@ -80,6 +82,7 @@ data:
                 <max_bytes_before_external_group_by>0</max_bytes_before_external_group_by>
                 <max_bytes_ratio_before_external_group_by>0</max_bytes_ratio_before_external_group_by>
                 <join_algorithm>direct,parallel_hash,hash</join_algorithm>
+                <allow_hyperscan>0</allow_hyperscan>
                 <constraints>
                     <readonly><const/></readonly>
                     <max_execution_time><min>1</min><max>300</max><changeable_in_readonly/></max_execution_time>
@@ -92,6 +95,7 @@ data:
                     <max_bytes_before_external_group_by><const/></max_bytes_before_external_group_by>
                     <max_bytes_ratio_before_external_group_by><const/></max_bytes_ratio_before_external_group_by>
                     <join_algorithm><const/></join_algorithm>
+                    <allow_hyperscan><const/></allow_hyperscan>
                 </constraints>
             </hopcorder_readonly>
         </profiles>

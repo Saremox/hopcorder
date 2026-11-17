@@ -27,7 +27,12 @@ The section for a version is the text of its GitHub release.
   ClickHouse image (compose, the chart's bundled ClickHouse) runs in UTC
   and was not affected.
 
-<!-- round five: grafana user -->
+- Grafana's read-only ClickHouse user may no longer use the hyperscan
+  functions (`multiMatchAny`, `multiFuzzyMatchAny` and the like). ClickHouse
+  keeps each compiled pattern set in a global cache, outside every query and
+  user memory limit, for good: queries that each stayed under the user's
+  400 MB grew ClickHouse by 95 to 140 MB apiece, and the tenth OOM-killed
+  the chart's 2 GiB ClickHouse. No dashboard uses them.
 
 <!-- round five: streams -->
 

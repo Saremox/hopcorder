@@ -72,13 +72,20 @@ for i in $(seq 90); do
         "log_processors_profiles = 0" "opentelemetry_start_trace_probability = 1" "log_query_threads = 1" \
         "log_query_views = 0" "log_queries = 0" "log_queries_min_type = 'EXCEPTION_WHILE_PROCESSING'" \
         "max_bytes_before_external_sort = 1000000" "max_bytes_ratio_before_external_group_by = 0.1" \
-        "join_algorithm = 'grace_hash'" "join_algorithm = 'partial_merge'"; do
+        "join_algorithm = 'grace_hash'" "join_algorithm = 'partial_merge'" "allow_hyperscan = 1"; do
         if out=$(chq "SELECT count() FROM numbers(10) SETTINGS $s" 2>&1) ||
           ! grep -Eq 'READONLY|SETTING_CONSTRAINT_VIOLATION' <<<"$out"; then
           echo "ClickHouse's read-only user may set $s (or the check failed otherwise): $out"
           exit 1
         fi
       done
+      # No hyperscan: its compiled patterns stay in ClickHouse's memory
+      # outside every limit.
+      if out=$(chq "SELECT multiFuzzyMatchAny('hopcorder', 1, ['hopcordr'])" 2>&1) ||
+        ! grep -q 'FUNCTION_NOT_ALLOWED' <<<"$out"; then
+        echo "ClickHouse's read-only user may run hyperscan functions (or the check failed otherwise): $out"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then

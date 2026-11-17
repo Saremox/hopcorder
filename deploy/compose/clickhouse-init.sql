@@ -49,6 +49,13 @@ GRANT SELECT ON hopcorder.* TO grafana;
 -- instead. join_algorithm keeps ClickHouse's default, the in-memory joins.
 -- The limits keep their MIN 1 for the same reason (0 means "unlimited" and
 -- is below any MAX).
+--
+-- No hyperscan (multiMatchAny, multiFuzzyMatchAny and the like): ClickHouse
+-- keeps each compiled pattern set in a global cache outside every query
+-- and user memory limit, for good. Each query of 1,500 fuzzy patterns
+-- stayed under max_memory_usage and left 95 to 140 MB behind; the tenth
+-- OOM-killed a 2 GiB ClickHouse (review round five). No dashboard uses
+-- them.
 CREATE SETTINGS PROFILE OR REPLACE grafana_limits SETTINGS
     readonly = 1 CONST,
     max_execution_time = 60 MIN 1 MAX 300 CHANGEABLE_IN_READONLY,
@@ -60,5 +67,6 @@ CREATE SETTINGS PROFILE OR REPLACE grafana_limits SETTINGS
     max_bytes_ratio_before_external_sort = 0 CONST,
     max_bytes_before_external_group_by = 0 CONST,
     max_bytes_ratio_before_external_group_by = 0 CONST,
-    join_algorithm = 'direct,parallel_hash,hash' CONST
+    join_algorithm = 'direct,parallel_hash,hash' CONST,
+    allow_hyperscan = 0 CONST
 TO grafana;
