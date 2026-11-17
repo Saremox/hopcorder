@@ -25,8 +25,9 @@ let dragging = false
 
 function seekAt(c: ECharts, x: number, y: number) {
   if (!c.containPixel('grid', [x, y])) return
-  const v = c.convertFromPixel({ gridIndex: 0 }, [x, y]) as number[]
-  const t = v[0]
+  // null while the chart is between options (a click during a reload)
+  const v = c.convertFromPixel({ gridIndex: 0 }, [x, y]) as number[] | null | undefined
+  const t = v?.[0]
   if (t !== undefined && Number.isFinite(t)) emit('seek', Math.min(Math.max(t, props.range.from), props.range.to))
 }
 

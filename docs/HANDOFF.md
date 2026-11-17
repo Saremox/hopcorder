@@ -690,7 +690,8 @@ added in the commit that introduced it.
 
 - **Plugin**: the official `grafana-clickhouse-datasource`, over ClickHouse's
   HTTP interface (port 8123, like the server; no native port needed). The
-  compose stack pins Grafana 12.2.1 and plugin 4.23.5. Queries are raw SQL
+  compose stack pins Grafana 13.3.1 (12.2.1 until a Dependabot update, which
+  CI's grafana job checked) and plugin 4.23.5. Queries are raw SQL
   (`editorType: sql`), formats 0 (time series) and 1 (table) as the plugin
   defines them.
 - **One dashboard**, `hopcorder-overview`, in three rows following the
