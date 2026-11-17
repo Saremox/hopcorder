@@ -467,6 +467,31 @@ func TestPathTracker(t *testing.T) {
 			{base(), false},
 			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "x:10.0.0.4", "r:"+dst)), true},
 		}},
+		// The destination's reply at TTL 4 was lost (or late) and TTL 5's
+		// arrived: once was two route changes, there and back (review,
+		// round six).
+		{"destination reply lost", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "*", "x:10.0.0.3", "*", "*", "r:"+dst)), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},
+			{base(), false},
+		}},
+		{"destination further behind a router past its distance", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "x:10.0.0.5", "r:"+dst)), true},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "x:10.0.0.5", "r:"+dst)), false},
+		}},
+		// A path that grew by a silent hop is no change until that hop
+		// answers, as with a router replaced while silent.
+		{"path grew by a silent hop", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "x:10.0.0.4", "r:"+dst)), true},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},
+		}},
 		{"destination moves behind a silent hop", []step{
 			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "*", "r:"+dst)), false},
 			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "r:"+dst)), true},
@@ -520,12 +545,20 @@ func TestPathTrackerChangeDetail(t *testing.T) {
 	if !ok || !reflect.DeepEqual(ch, want) {
 		t.Errorf("router change = %+v %v", ch, ok)
 	}
-	// Destination one hop further, behind silent hops: only the distance
-	// can tell. (Had TTL 3 answered as the destination, that would be a
-	// router change at TTL 3, which takes precedence.)
-	ch, ok = p.ObserveChange(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "*", "*", "r:"+dst)))
-	if !ok || ch.Reason != ReasonDistance || ch.PrevDistance != 4 || ch.Distance != 5 {
-		t.Errorf("distance change = %+v %v", ch, ok)
+	// Destination further away, behind a silent TTL 4 (its distance) and a
+	// router at TTL 5 nothing was known of: only the distance can tell.
+	// (Had TTL 4 answered as a router, that would be a router change at
+	// TTL 4, which takes precedence.)
+	ch, ok = p.ObserveChange(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "x:10.8.8.8", "*", "x:10.0.0.5", "r:"+dst)))
+	if !ok || ch.Reason != ReasonDistance || ch.PrevDistance != 4 || ch.Distance != 6 {
+		t.Errorf("distance change (further) = %+v %v", ch, ok)
+	}
+	// Closer, behind a TTL nothing was known of (silent before). The first
+	// of these is a change from distance 6 as well.
+	p.Observe(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "*", "r:"+dst)))
+	ch, ok = p.ObserveChange(rec(dst, hops("x:10.0.0.1", "x:10.7.7.7", "r:"+dst)))
+	if !ok || ch.Reason != ReasonDistance || ch.PrevDistance != 4 || ch.Distance != 3 {
+		t.Errorf("distance change (closer) = %+v %v", ch, ok)
 	}
 	ch, ok = p.ObserveChange(rec("192.0.2.10", hops("x:10.0.0.1", "r:192.0.2.10")))
 	if !ok || ch.Reason != ReasonTarget {
