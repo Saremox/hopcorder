@@ -27,6 +27,40 @@ app.kubernetes.io/name: {{ include "hopcorder-agent.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
+{{/*
+A Kubernetes quantity in bytes, (list name value): digits with an optional
+fraction and a k, M, G, T, Ki, Mi, Gi or Ti suffix.
+*/}}
+{{- define "hopcorder-agent.quantityBytes" -}}
+{{- $name := index . 0 }}
+{{- $v := toString (index . 1) }}
+{{- $num := "^[0-9]+(\\.[0-9]+)?" }}
+{{- if not (regexMatch (printf "%s(k|M|G|T|Ki|Mi|Gi|Ti)?$" $num) $v) }}
+{{- fail (printf "%s %q: write it in bytes or with a k, M, G, T, Ki, Mi, Gi or Ti suffix (the chart sizes the spool from it)" $name $v) }}
+{{- end }}
+{{- $unit := get (dict "" 1.0 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0) (regexReplaceAll $num $v "") }}
+{{- mulf (regexFind $num $v | float64) $unit | floor | int64 }}
+{{- end }}
+
+{{/*
+A size as the agent reads it (config.ByteSize) in bytes, (list name value):
+a whole number, with B, KB, MB, GB, TB, KiB, MiB, GiB or TiB after it.
+*/}}
+{{- define "hopcorder-agent.sizeBytes" -}}
+{{- $name := index . 0 }}
+{{- $v := index . 1 }}
+{{- if or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v) }}
+{{- $v | int64 }}
+{{- else }}
+{{- $s := trim (toString $v) }}
+{{- if not (regexMatch "^[0-9]+ *(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)?$" $s) }}
+{{- fail (printf "%s %q: a size such as 768MiB or 1GiB" $name $s) }}
+{{- end }}
+{{- $unit := get (dict "" 1 "B" 1 "KB" 1000 "MB" 1000000 "GB" 1000000000 "TB" 1000000000000 "KiB" 1024 "MiB" 1048576 "GiB" 1073741824 "TiB" 1099511627776) (regexReplaceAll "^[0-9]+ *" $s "") }}
+{{- mul (regexFind "^[0-9]+" $s | int64) $unit }}
+{{- end }}
+{{- end }}
+
 {{/* The configuration file: the user's config plus what the chart owns. */}}
 {{- define "hopcorder-agent.config" -}}
 {{- if not .Values.config.targets }}
@@ -59,6 +93,28 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $cfg := deepCopy .Values.config }}
 {{- $spool := default dict $cfg.spool }}
 {{- $_ := set $spool "dir" "/var/lib/hopcorder" }}
+{{- /* The spool's bound on its volume (review, round six): the spool file
+  grows to max_bytes and no further, and the file system needs the rest.
+  Unset, 75% of persistence.size, at most the agent's default (1GiB); set,
+  at most 90% of it. mode: daemonset has no volume to check. */}}
+{{- if eq .Values.mode "statefulset" }}
+{{- $vol := include "hopcorder-agent.quantityBytes" (list "persistence.size" .Values.persistence.size) | int64 }}
+{{- if $spool.max_bytes }}
+{{- $mb := include "hopcorder-agent.sizeBytes" (list "config.spool.max_bytes" $spool.max_bytes) | int64 }}
+{{- if lt $mb 1048576 }}
+{{- fail (printf "config.spool.max_bytes %v: at least 1MiB (the agent refuses less)" $spool.max_bytes) }}
+{{- end }}
+{{- if gt (mul $mb 10) (mul $vol 9) }}
+{{- fail (printf "config.spool.max_bytes %v is more than 90%% of persistence.size %v: the spool file grows to max_bytes, and the file system needs the rest. Lower max_bytes (or leave it unset: 75%% of the volume), or give new volumes more (persistence.size)" $spool.max_bytes .Values.persistence.size) }}
+{{- end }}
+{{- else }}
+{{- $mib := min 1024 (div (mul $vol 3) (mul 4 1048576)) }}
+{{- if lt $mib 1 }}
+{{- fail (printf "persistence.size %v: too small for the spool (at least 2Mi)" .Values.persistence.size) }}
+{{- end }}
+{{- $_ := set $spool "max_bytes" (printf "%dMiB" $mib) }}
+{{- end }}
+{{- end }}
 {{- $_ := set $cfg "spool" $spool }}
 {{- $out := default dict $cfg.outputs }}
 {{- $http := default dict $out.http }}

@@ -205,8 +205,10 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   generated Secret. Whoever can query Grafana's data source can still crash
   ClickHouse (see [Dashboards](#dashboards)): give only trusted users access to it.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
-  after their pods, each with its own spool volume; `mode: daemonset` runs one
-  agent per node, named after the node, with its spool on the node.
+  after their pods, each with its own spool volume (`persistence.size`, 1Gi;
+  `config.spool.max_bytes` is 75% of it unless set, at most 1GiB, and the
+  chart refuses more than 90%); `mode: daemonset` runs one agent per node,
+  named after the node, with its spool on the node.
   `hostNetwork: true` traces from the node's network. The pods run as root
   with `NET_RAW`, which Pod Security `baseline` does not allow: give the
   agent a namespace of its own at the `privileged` level. Credentials for the

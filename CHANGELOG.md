@@ -108,7 +108,11 @@ The section for a version is the text of its GitHub release.
   **Upgrading:** the same `max_bytes` now keeps half to two thirds as many
   records (`hopcorder_spool_bytes` stays the records' bytes). A spool file
   larger than `max_bytes` keeps its size, with at most `max_bytes` of it in
-  use.
+  use. The agent chart sets `config.spool.max_bytes`, unless given, to 75%
+  of `persistence.size` (at most 1GiB): 768MiB for the default 1Gi volume.
+  It refuses a `max_bytes` above 90% of the volume, so a release that set
+  `max_bytes: 1GiB` with the 1Gi volume fails to upgrade until it lowers
+  or removes it (`persistence.size` applies only to new volumes).
 
 **Security: server ingest**
 

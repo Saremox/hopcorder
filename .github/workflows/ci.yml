@@ -323,6 +323,20 @@ jobs:
           # hostNetwork pods.
           refused "${agent[@]}" --set networkPolicy.enabled=true
           refused deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml -f deploy/helm/ci/agent-netpol-values.yaml
+          # The spool fits its volume (review, round six): its file grows
+          # to max_bytes, by default 75% of persistence.size (at most the
+          # agent's 1GiB); more than 90% is refused. The DaemonSet's spool
+          # is on the node, with the agent's default.
+          spool() { helm template a "$@" --show-only templates/configmap.yaml | sed -n 's/^ *max_bytes: //p'; }
+          test "$(spool "${agent[@]}")" = 768MiB
+          test "$(spool "${agent[@]}" --set persistence.size=10Gi)" = 1024MiB
+          test "$(spool "${agent[@]}" --set persistence.size=2Gi --set config.spool.max_bytes=1GiB)" = 1GiB
+          test "$(spool "${agent[@]}" --set config.spool.max_bytes=900MiB)" = 900MiB
+          test -z "$(spool deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml)"
+          for v in config.spool.max_bytes=1GiB config.spool.max_bytes=1073741824 config.spool.max_bytes=1000MiB \
+            config.spool.max_bytes=512KiB config.spool.max_bytes=lots persistence.size=1Gb persistence.size=1Mi; do
+            refused "${agent[@]}" --set "$v"
+          done
           refused deploy/helm/hopcorder-server --set config.clickhouse.password=x
           refused deploy/helm/hopcorder-server --set networkPolicy.enabled=true
           # Names that go into the bundled ClickHouse's XML configuration.

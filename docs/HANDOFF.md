@@ -925,8 +925,10 @@ added in the commit that introduced it.
   reschedule. `mode: daemonset` uses the node's name as `--agent-id` and a
   hostPath spool, so an agent keeps its identity and spool on its node.
   `hostNetwork` traces from the node's network namespace. The chart owns
-  `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`;
-  the rest of `values.config` is the agent's config file.
+  `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`,
+  and in `mode: statefulset` sets `spool.max_bytes` from `persistence.size`
+  unless it is given (round six); the rest of `values.config` is the agent's
+  config file.
 - **Tested in CI** (`helm` job, kind): the server chart with its bundled
   ClickHouse (and the read-only user), two StatefulSet agents and a
   hostNetwork DaemonSet agent tracing the server's Service over TCP; the job
@@ -3631,6 +3633,15 @@ decisions:
   - `hopcorder_spool_bytes` is still the stored record bytes, now half to
     two thirds of `max_bytes` at the bound; the dropped counter's help says
     it counts drops for room on a full disk too.
+  - Chart: `persistence.size` stays 1Gi: a StatefulSet's
+    `volumeClaimTemplates` cannot change, so a new default would fail every
+    upgrade. `config.spool.max_bytes`, unset, is 75% of the volume, at most
+    1GiB (768MiB by default); set, the chart refuses more than 90% of it,
+    less than 1MiB, and sizes it cannot read. Upgrading: a release that kept
+    the default gets 768MiB instead of 1GiB (a spool file already larger
+    keeps its size, at most 768 MiB of it in use); one that set
+    `max_bytes: 1GiB` with the 1Gi volume is refused with that message. The
+    DaemonSet's spool is on the node's disk: no check, the agent's default.
   - Tests: TestSizeBoundIsTheFile (a 1 MiB bound, 2 MB appended, nothing
     acknowledged: every append succeeds, the newest kept, the rest counted,
     the file within 1 MiB; before, the file was 2 MiB with 1.65 MB in use),
@@ -3642,7 +3653,9 @@ decisions:
     restart, and growth past 2 MiB once the limit is raised; before, append
     995 of 2000 failed, "file too large", none dropped), TestFullTmpfs (root
     only, in CI's `rawsock` job: a 4 MiB tmpfs that another file fills while
-    the spool grows; before, the first append after failed with ENOSPC). The
+    the spool grows; before, the first append after failed with ENOSPC), and
+    the helm job (the default 768MiB, where the previous chart rendered
+    1GiB, 1024MiB for 10Gi, the refusals). The
     damage corpus is built as before (`buildSpool` keeps the bytes bbolt
     alone wrote, not the space allocated ahead): the 64 cases' outcomes are
     the ones before, compared case by case.
