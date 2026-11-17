@@ -2121,6 +2121,12 @@ high-severity issue. Four fixes followed. The decisions:
     pushed the tag. So `gh attestation verify … --signer-workflow
     Saremox/hopcorder/.github/workflows/images.yml --source-ref
     refs/tags/vX.Y.Z` tells a replaced file or image from a released one.
+    (Round four: not with these flags. gh matches `--signer-workflow` as a
+    regex anchored at the start only, so `images.yml.evil.yml` passed, and
+    `--source-ref` ignoring case, so a tag `VX.Y.Z` passed; and without
+    `--source-digest` any commit did. README and the notes now use
+    `--cert-identity …/images.yml@refs/tags/vX.Y.Z`, compared exactly,
+    and the tag's commit; see round four.)
     It detects replacement, it does not prevent it, and helps only users
     who verify.
   - **Digests in the release notes**: `scripts/release-notes.sh` appends
@@ -2277,7 +2283,10 @@ high-severity issue. Four fixes followed. The decisions:
     update and deletion, bypassed only by the Repository admin role, not by
     GitHub Actions or an app. It keeps stray tags out of the Go module
     proxy and the release workflow, and makes `--source-ref refs/tags/v…`
-    mean a maintainer's tag.
+    mean a maintainer's tag. (Round four: gh compares `--source-ref`
+    ignoring case, and whether `v*` also matches `V…` was not checked, so
+    README now names the tag in `--cert-identity`, compared exactly; a
+    ruleset on all tags is recommended.)
   - Immutable releases: a published release's files and tag can no longer
     change (and `gh release verify` / `gh release verify-asset` check
     GitHub's attestation of the release).
@@ -2628,4 +2637,47 @@ decisions:
 
 **CI, release and deployment**
 
-<!-- round four: deployment -->
+- **Verifying names the workflow file, the tag and the commit exactly.**
+  README's command (`--signer-workflow …/images.yml --source-ref
+  refs/tags/vX.Y.Z`, no `--source-digest`) let a collaborator's build pass,
+  as gh 2.89 reads the flags (its source, with sigstore-go 1.1.4):
+  `--signer-workflow` becomes the regex `^https://github.com/<value>`,
+  anchored at the start only and with unescaped dots, so a workflow
+  `images.yml.evil.yml` (or `imagesXyml.yml`) of any tagged commit passed;
+  `--source-ref` and `--source-digest` are compared ignoring case, so a tag
+  `V0.1.2` at their own commit, whose `images.yml` triggers on `V*`, passed
+  for `v0.1.2` (if the `v*` ruleset does not cover `V*`, which the review
+  could not check); and an empty `--source-digest` checks nothing. Then
+  ghcr Write let them repoint `:0.1.2`, `:latest` and the chart. Now:
+  - `--cert-identity
+    https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/vX.Y.Z`
+    (sigstore-go compares the certificate's SAN with `!=`: exact, case
+    included), `--source-ref refs/tags/vX.Y.Z`, `--source-digest <commit>`
+    and `--deny-self-hosted-runners`, for files and `oci://` images, in
+    README (in full, as a shell function `verify`) and in the notes
+    (`scripts/release-notes.sh`).
+  - README takes the commit from the tag, not from the notes, which belong
+    to the release (anyone with write access can create a release of a
+    pushed tag before `publish` does):
+    `git ls-remote … 'refs/tags/vX.Y.Z^{}'`, keeping exactly that ref, since
+    ls-remote matches patterns against the end of ref names and also lists
+    a tag `a/refs/tags/vX.Y.Z^{}`; `${commit:?}` refuses to verify without
+    one.
+  - The SAN's spelling (`Saremox/hopcorder`, as `github.repository` has it)
+    and the flags were checked against gh's source, not against a real
+    attestation: v0.1.1 has none. The first release after this is the test.
+  - `scripts/verify_test.go` runs the notes' commands and README's blocks
+    with a fake `gh` and `git` and checks every `gh attestation verify`
+    against a model of gh 2.89's checks: the release's certificate passes;
+    a `V` tag, `images.yml.evil.yml`, `imagesXyml.yml`, a branch, another
+    commit and another repository fail; no verify runs without the commit;
+    round three's flags accept the `V` certificate, as the review found.
+- **Install: download, check, unpack without owners.** README piped
+  v0.1.1's archive into `tar -xz`. Its entries belong to 1001/1001 (round
+  three's root-owned archives start with the next release), so unpacked as
+  root uid 1001 owned the binary, and nothing was saved to check. Now
+  `curl -fLO`, `sha256sum -c SHA256SUMS` (v0.1.1 has no attestations; README
+  says this checks the download, not who built it) or `verify` for later
+  releases, then `tar --no-same-owner -xzf`; `TestReadmeInstall` fails if a
+  README block pipes into tar, unpacks without `--no-same-owner` or before
+  a check. Move the examples to v0.1.2 once it is out.

@@ -41,26 +41,54 @@ are fixed: it is a try-out, not a deployment.
 
 Releases ([GitHub releases](https://github.com/Saremox/hopcorder/releases),
 changes in [`CHANGELOG.md`](CHANGELOG.md)) have static Linux binaries for
-amd64 and arm64, with the example configs and systemd units:
+amd64 and arm64, with the example configs and systemd units. Download the
+archive, check it, then unpack it; `--no-same-owner` gives the files to
+whoever unpacks them, not to the owner stored in the archive (v0.1.1's
+entries belong to uid 1001, which GNU tar run as root restores):
 
 ```bash
-curl -fsSL https://github.com/Saremox/hopcorder/releases/download/v0.1.1/hopcorder_0.1.1_linux_amd64.tar.gz | tar -xz
+v=0.1.1
+curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/hopcorder_${v}_linux_amd64.tar.gz"
+curl -fLO "https://github.com/Saremox/hopcorder/releases/download/v$v/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar --no-same-owner -xzf "hopcorder_${v}_linux_amd64.tar.gz"
 ```
 
-Releases after v0.1.1 also carry signed build provenance for every file and
-both images, and their notes list the image digests. Check an archive with
-the [GitHub CLI](https://cli.github.com/) before you install it (the notes
-of each release have the exact commands):
+v0.1.1 has no attestations: its `SHA256SUMS` shows that the download is
+intact, not who built it (anyone with write access to the repository could
+have replaced both). Releases after v0.1.1 carry signed build provenance for
+every file and both images, and their notes list the image digests. Check a
+file or image with the [GitHub CLI](https://cli.github.com/) (2.89 checked;
+one too old for a flag fails) before you use it:
 
 ```bash
-gh attestation verify hopcorder_X.Y.Z_linux_amd64.tar.gz --repo Saremox/hopcorder \
-  --signer-workflow Saremox/hopcorder/.github/workflows/images.yml --source-ref refs/tags/vX.Y.Z
+v=X.Y.Z  # the release
+# The commit of the tag, from the repository (exactly this ref: ls-remote
+# also lists any tag whose name ends in it).
+commit=$(git ls-remote https://github.com/Saremox/hopcorder "refs/tags/v$v^{}" |
+  awk -v ref="refs/tags/v$v^{}" '$2 == ref {print $1}')
+verify() {
+  gh attestation verify "$1" --repo Saremox/hopcorder --deny-self-hosted-runners \
+    --cert-identity "https://github.com/Saremox/hopcorder/.github/workflows/images.yml@refs/tags/v$v" \
+    --source-ref "refs/tags/v$v" --source-digest "${commit:?no such tag}"
+}
+verify "hopcorder_${v}_linux_amd64.tar.gz"
+digest=sha256:…  # the agent image's, from the release notes
+verify "oci://ghcr.io/saremox/hopcorder-agent@$digest"
 ```
 
-That proves the file was built by this repository's `images` workflow for
-the tag `vX.Y.Z`; anyone with write access to the repository can still
-replace a release's files and images, which the attestation then no longer
-matches (see [Releasing](#releasing)).
+That proves the file or image was built by this repository's
+`.github/workflows/images.yml` for the tag `vX.Y.Z`, from the commit the tag
+names. Use these flags, not looser ones: gh compares `--cert-identity`
+exactly, while `--signer-workflow` accepts any workflow file whose name
+starts with `images.yml`, and `--source-ref` and `--source-digest` ignore
+case (so a tag `VX.Y.Z` would pass), and an empty `--source-digest` checks
+nothing. The release notes print the same commands with the commit filled
+in, but take the commit from the tag as above: the notes are part of the
+release, which someone else may have created (see [Releasing](#releasing)).
+`gh release verify-asset` is no substitute: it shows that a file is part of
+the release, not who built it. Anyone with write access to the repository
+can still replace the images, which the attestation then no longer matches.
 
 Or build a release; requires Linux and Go 1.27+:
 
@@ -91,7 +119,7 @@ Tags: releases (`v*` tags) are `<version>` (e.g. `0.1.1`), `<major>.<minor>`
 and `latest`, built without caches; `main` and `sha-<commit>` follow the
 `main` branch. Tags can be moved; for a fixed image use the digest from the
 release notes (`ghcr.io/saremox/hopcorder-agent:X.Y.Z@sha256:…`, which
-`gh attestation verify oci://…` checks like a file).
+`verify oci://…` above checks like a file).
 
 ```bash
 docker run -d --name hopcorder-agent --network host --cap-drop ALL --cap-add NET_RAW \
