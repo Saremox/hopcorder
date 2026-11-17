@@ -5,8 +5,12 @@
 #   install -m 0644 deploy/hopcorder-server.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now hopcorder-server
 #
-# The server needs no capabilities. It listens on 127.0.0.1:8080 by default:
-# put a reverse proxy in front for authentication (it does none itself).
+# The server needs no capabilities. It does no authentication: put a reverse
+# proxy in front. By default it listens on 127.0.0.1:8080, which every local
+# user can reach without the proxy; to admit only the proxy, install
+# deploy/hopcorder-server.socket as well (a unix socket for the proxy's group)
+# and set listen: systemd. With listen: systemd the server refuses to start
+# without that socket, and with the socket active it refuses any other listen.
 # StateDirectory (/var/lib/hopcorder-server) holds the cached ASN database.
 
 [Unit]

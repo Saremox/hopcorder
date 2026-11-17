@@ -1538,4 +1538,51 @@ high-severity issue. Four fixes followed. The decisions:
 
 **CI, release and deployment**
 
-<!-- round three: deployment -->
+- **The server can listen on a unix socket, its own or systemd's.** On a
+  systemd host the docs put the server on 127.0.0.1 behind the reverse
+  proxy, but every local user reached that port without the proxy's
+  authentication: they could read everything and inject records, among
+  them round two's `seq` 2^64−1, which leaves an agent refused with 409
+  until the manual recovery.
+  - `listen: systemd` takes the socket systemd passes (socket activation:
+    `LISTEN_FDS`/`LISTEN_PID`, fd 3, read with `os.NewFile` and
+    `net.FileListener`, no dependency). `deploy/hopcorder-server.socket`
+    creates `/run/hopcorder-server.sock`, `root:<SocketGroup>`, mode 0660,
+    so only root and the proxy's group connect. Exactly one socket; the
+    variables are unset once used, and ignored when `LISTEN_PID` is another
+    process (inherited).
+  - `listen: systemd` without a passed socket fails at start, and so does a
+    passed socket with any other `listen`: the server would listen
+    elsewhere, and the socket's connections would wait forever.
+  - The unit ships `SocketGroup=hopcorder-proxy`, a group that does not
+    exist, so the socket fails to start until the admin names the proxy's
+    group (or creates that one). Every process with the group reaches the
+    server unauthenticated, and on Debian nginx's `www-data` is often
+    shared with PHP-FPM and the like; hence the advice of a group of its own.
+  - `listen: unix:<absolute path>` creates the socket itself (outside
+    systemd, or with a sidecar proxy sharing a volume), mode 0660 after the
+    bind. Between bind and chmod it has the mode the umask leaves
+    (accepted; the docs say to use a directory only the server and proxy
+    can enter). A stale socket (connection refused) is replaced, a live one
+    or any other file is not; a clean shutdown removes it. Abstract sockets
+    (`unix:@name`) are refused: they have no permissions. Paths are at most
+    107 bytes.
+  - The Host allowlist: on a unix socket there is no check unless
+    `allowed_hosts` lists names. DNS rebinding needs a TCP listener the
+    browser can reach, which is now the proxy's, and the proxy
+    authenticates and picks the Host header it sends (nginx's `unix:`
+    upstream sends `localhost`, Caddy the client's). Accepted: a proxy that
+    admits clients by address rather than by credentials would forward a
+    rebinding page's request; the docs say to list its names then. A TCP
+    socket from systemd is judged by its address, like a configured
+    `listen` (127.0.0.1 gets the localhost names).
+  - `/healthz`, `/readyz` and `/metrics` are served on the socket as well;
+    Prometheus scrapes through the proxy. The default stays
+    `127.0.0.1:8080` (containers, the charts, quick installs; the server
+    chart owns `listen`).
+  - Tests: a socket in a temporary directory (mode, stale, live and
+    regular files, removal), `serve` on a socket (health, metrics, the Host
+    check with and without `allowed_hosts`), socket activation in a child
+    test binary that gets a listening socket as fd 3, and the refusals.
+    Checked by hand with `systemd-socket-activate` (unix and TCP) and
+    `systemd-analyze verify`.

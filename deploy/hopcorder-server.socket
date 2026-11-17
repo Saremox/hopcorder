@@ -1,0 +1,43 @@
+# systemd socket for the hopcorder ingest server (socket activation). systemd
+# creates the socket and hands it to hopcorder-server.service, so only root
+# and the members of SocketGroup (the reverse proxy) can connect. On
+# 127.0.0.1:8080 every local user reaches the server without the proxy's
+# authentication.
+#
+#   install -m 0644 deploy/hopcorder-server.socket /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl edit hopcorder-server.socket     # set SocketGroup, see below
+#   # in /etc/hopcorder/server.yaml: listen: systemd
+#   systemctl enable --now hopcorder-server.socket
+#   systemctl restart hopcorder-server
+#
+# Then point the proxy at the socket, e.g. Caddy
+# `reverse_proxy unix//run/hopcorder-server.sock`, nginx
+# `proxy_pass http://unix:/run/hopcorder-server.sock;`. Health and metrics are
+# on the socket too:
+#   curl --unix-socket /run/hopcorder-server.sock http://localhost/healthz
+# (Prometheus cannot scrape a unix socket: let it scrape through the proxy.)
+# Without allowed_hosts the server checks no Host header on a unix socket: if
+# the proxy admits clients by address instead of credentials, list its
+# public names there (DNS rebinding).
+
+[Unit]
+Description=hopcorder network path recorder (ingest server socket)
+Documentation=https://github.com/Saremox/hopcorder
+
+[Socket]
+ListenStream=/run/hopcorder-server.sock
+SocketUser=root
+# The group the reverse proxy runs as, e.g. caddy, www-data (Debian's nginx
+# and Apache) or nginx (Fedora's): everything running with it reaches the
+# server unauthenticated, so prefer a group only the proxy has. This one
+# does not exist, so the socket fails to start until you either set your
+# proxy's group (`systemctl edit hopcorder-server.socket`, then
+# [Socket] SocketGroup=caddy) or create it and add the proxy's user to it
+# (`groupadd --system hopcorder-proxy && usermod -a -G hopcorder-proxy caddy`,
+# then restart the proxy).
+SocketGroup=hopcorder-proxy
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

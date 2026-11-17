@@ -451,6 +451,32 @@ Point agents at it with `outputs.http.url`. For production use
 hopcorder does **no authentication**: it listens on localhost by default; put a
 reverse proxy in front and secure the path prefixes separately.
 
+**Only the proxy.** Every local user can reach `127.0.0.1:8080` around the
+proxy, and so read everything and send records. To admit only the proxy,
+listen on a unix socket: under systemd, install
+[`deploy/hopcorder-server.socket`](deploy/hopcorder-server.socket) too and set
+`listen: systemd`. systemd then creates `/run/hopcorder-server.sock` with
+mode 0660 for the group in `SocketGroup=` (the proxy's; the shipped
+`hopcorder-proxy` does not exist, so the socket does not start until you set
+it) and hands it to the server:
+
+```bash
+sudo install -m 0644 deploy/hopcorder-server.socket /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl edit hopcorder-server.socket   # [Socket] SocketGroup=caddy (your proxy's group)
+# /etc/hopcorder/server.yaml: listen: systemd
+sudo systemctl enable --now hopcorder-server.socket && sudo systemctl restart hopcorder-server
+curl --unix-socket /run/hopcorder-server.sock http://localhost/healthz
+```
+
+Point the proxy at it (Caddy `reverse_proxy unix//run/hopcorder-server.sock`,
+nginx `proxy_pass http://unix:/run/hopcorder-server.sock;`). Health and metrics
+are on the socket too; Prometheus scrapes through the proxy. Without systemd,
+`listen: unix:/path/to.sock` creates the socket itself, with mode 0660 for its
+owner and group. On a unix socket the server checks no `Host` header unless
+`allowed_hosts` lists names: list the proxy's public names if it admits
+clients by address rather than by credentials.
+
 **Host names.** So that a web page cannot reach a server on localhost or an
 internal address through DNS rebinding (its own name resolving to the
 server's address), the server answers only requests whose `Host` header is in

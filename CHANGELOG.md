@@ -29,7 +29,12 @@ The section for a version is the text of its GitHub release.
 
 **Security: CI, release and deployment**
 
-<!-- round three: deployment -->
+- systemd: the server can take its socket from systemd
+  (`deploy/hopcorder-server.socket` with `listen: systemd`), a unix socket
+  that only the reverse proxy's group may open. On `127.0.0.1:8080` every
+  local user reached the server around the proxy. Without systemd,
+  `listen: unix:<path>` creates a socket with mode 0660. The default stays
+  `127.0.0.1:8080`.
 
 ## v0.1.1
 

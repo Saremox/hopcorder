@@ -28,7 +28,7 @@ for arch in amd64 arm64; do
   CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
     -ldflags "-s -w -X main.version=v${version}" -o "build/$d/hopcorder" ./cmd/hopcorder
   cp LICENSE README.md deploy/agent.example.yaml deploy/server.example.yaml \
-    deploy/hopcorder.service deploy/hopcorder-server.service "build/$d/"
+    deploy/hopcorder.service deploy/hopcorder-server.service deploy/hopcorder-server.socket "build/$d/"
   tar -C build -czf "dist/$d.tar.gz" "$d"
 done
 out=$("build/hopcorder_${version}_linux_amd64/hopcorder" version)
