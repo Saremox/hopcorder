@@ -193,6 +193,10 @@ func prototypeQueries(t *testing.T) []string {
 			"'target-b'", "'dc2.example'",
 			"$__timeFilter(ts)", "ts >= now() - INTERVAL 3650 DAY",
 		).Replace(stmt)
+		// The queries look back from now() (1 or 3 days), and the seeded
+		// cycles are at the fixed t0: "now" is an hour after t0, or the
+		// test failed a day after t0 (review, round seven).
+		q = strings.ReplaceAll(q, "now()", seedNow)
 		if strings.Contains(q, "neighbor(") {
 			// The prototype's Q3 fails on ClickHouse 25.8 even against its
 			// own netpath.path_probes table: "min(ts) AS ts" shadows the
@@ -207,6 +211,10 @@ func prototypeQueries(t *testing.T) []string {
 	}
 	return out
 }
+
+// seedNow is the time the prototype's queries run at: an hour after the
+// seeded cycles (t0), whatever the clock says.
+var seedNow = fmt.Sprintf("toDateTime64('%s', 3, 'UTC')", t0.Add(time.Hour).Format("2006-01-02 15:04:05.000"))
 
 // seedTwoTargets ingests cycles of agent "lab" to dc1.example and
 // dc2.example: a stable path, a loop (dc1), an outage on both and a route
