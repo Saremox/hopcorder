@@ -4,9 +4,13 @@ package server
 
 import (
 	"log/slog"
+	"net/netip"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/saremox/hopcorder/internal/clickhouse"
 	"github.com/saremox/hopcorder/internal/record"
 )
 
@@ -53,5 +57,55 @@ func TestRestoreWindowClickHouse(t *testing.T) {
 	}
 	if n := count(t, c, "SELECT count() AS n FROM outages FINAL WHERE end_ts IS NULL"); n != 0 {
 		t.Errorf("%d outages left open", n)
+	}
+}
+
+// hops_mv copied a cycle's loops onto every hop row to look up each hop's
+// loop TTLs: an 8 MiB insert of valid records with 255 hops and 255 loops
+// of 255 TTLs needed over 1.6 GiB in ClickHouse 25.8 and failed. The TTLs
+// now come with each hop, and an insert is sized by what the view writes
+// too: the same records need a few tens of MiB, and the hop rows are as
+// before.
+func TestLoopRecordsInsertClickHouse(t *testing.T) {
+	c := testClickHouse(t)
+	in := NewIngester(c, nil, slog.New(slog.DiscardHandler), nil)
+	spec := make([]string, record.MaxHops)
+	ttls := make([]int, record.MaxHops)
+	text := make([]string, record.MaxHops)
+	for i := range spec {
+		spec[i], ttls[i], text[i] = "198.18.120.1", i+1, strconv.Itoa(i+1)
+	}
+	var recs []*record.Record
+	for seq := uint64(1); seq <= 20; seq++ {
+		r := mk("lab", seq, spec...)
+		r.Loops = make([]record.Loop, record.MaxHops)
+		for i := range r.Loops {
+			r.Loops[i] = record.Loop{IP: netip.MustParseAddr("198.18.120.1"), TTLs: ttls}
+		}
+		recs = append(recs, r)
+	}
+	if _, err := in.Ingest(t.Context(), recs); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, c, "SELECT count() AS n FROM path_probes WHERE is_loop = 1 AND loop_ttls = '"+
+		strings.Join(text, ",")+"'"); n != 20*record.MaxHops {
+		t.Errorf("%d looping hop rows, want %d", n, 20*record.MaxHops)
+	}
+	if err := c.ExecServer(t.Context(), "SYSTEM FLUSH LOGS"); err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		N   int   `json:"n"`
+		Mem int64 `json:"mem"`
+	}
+	rows, err := clickhouse.QueryInto[row](t.Context(), c, `SELECT count() AS n, max(memory_usage) AS mem
+		FROM system.query_log WHERE current_database = currentDatabase() AND type = 'QueryFinish'
+		AND query LIKE 'INSERT INTO `+"`cycles`"+`%'`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("cycles inserts: %+v", rows)
+	if len(rows) != 1 || rows[0].N < 2 || rows[0].Mem > 256<<20 {
+		t.Errorf("cycles inserts: %+v (want at least 2, each under 256 MiB)", rows)
 	}
 }

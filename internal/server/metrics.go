@@ -55,11 +55,12 @@ func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
 		unrestored: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hopcorder_server_unrestored_cycles_total",
 			Help: "Stored cycles that derived no events because their stream's state was not restored in time " +
-				"(the stream is restored with its next batch).",
+				"(the stream is restored with its next batch) or there was no room for it " +
+				"(ingest.max_streams, max_streams_per_agent).",
 		}),
 		evictedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_server_state_evictions_total",
-			Help: "Agent and stream states dropped beyond ingest.max_agents and ingest.max_streams (not idle ones).",
+			Help: "Agent and stream states dropped at ingest.max_agents and ingest.max_streams (not idle ones).",
 		}, []string{"kind"}),
 	}
 	for _, r := range []string{"accepted", "duplicate", "rejected"} {

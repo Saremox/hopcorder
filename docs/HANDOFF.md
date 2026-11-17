@@ -640,8 +640,10 @@ added in the commit that introduced it.
   only the database name changed. `TestPrototypeQueriesRun` (clickhouse tag)
   runs all seven, read straight from the file.
 - **`is_loop` / `loop_ttls` on `hops`**: the prototype keeps loops on the
-  per-hop rows; `hops_mv` now fills both from the cycle's loops. Rows stored
-  before the migration keep the defaults (`loop_events` has every loop).
+  per-hop rows; `hops_mv` now fills both from the cycle's loops (since
+  migration 0003 from each hop's loop TTLs, which the server sends with the
+  cycle; security review, round three). Rows stored before migration 0002
+  keep the defaults (`loop_events` has every loop).
 - **Retention**: the prototype expires data after 90 days.
   `clickhouse.retention_days` (default 90, 0 = forever) sets a TTL on every
   data table on each start (`agent_seq` never expires; it guards dedup).
@@ -1223,8 +1225,8 @@ decisions:
   a PTR it controls at every TTL): one 19 KiB request (31 MiB decoded) held
   507 MiB at insert time, now 65 MiB. An agent's normal batch (1 MiB) is
   still one insert. The zstd decoder (and its window) is closed before the
-  records are stored. A request being processed holds about twice
-  `max_decoded_bytes`.
+  records are stored. A request being processed holds up to about three
+  times `max_decoded_bytes` (corrected in round three; this said twice).
 - **The Go memory limit follows the cgroup's**: at start, unless GOMEMLIMIT
   is set, the server sets it to 90% of the memory limit of its cgroup (v2:
   the lowest `memory.max` from its own cgroup up; v1:
@@ -1350,9 +1352,10 @@ decisions:
   (golangci-lint, helm) and govulncheck are also updated by hand.
 - **Server chart: the server's ingest limits.** `values.yaml` had set
   `max_body_bytes` 64 MiB and `max_decoded_bytes` 512 MiB, written before
-  the review lowered the defaults. A request holds up to about twice its
-  decompressed size while it is parsed (measured: 255 MiB of NDJSON held
-  507 MiB of records). So one 119 KiB zstd body that expands to 512 MiB
+  the review lowered the defaults. A request holds up to about three times
+  its decompressed size while it is parsed (measured: 255 MiB of NDJSON held
+  507 MiB of records; up to three times for silent hops, round three). So
+  one 119 KiB zstd body that expands to 512 MiB
   went past the pod's 1 GiB limit. The block is gone: the defaults apply,
   with a comment to raise the memory limit together with
   `max_decoded_bytes × max_concurrent`.
@@ -1546,7 +1549,134 @@ high-severity issue. Four fixes followed. The decisions:
 
 **Ingest and storage**
 
-<!-- round three: ingest -->
+- **Stream state is bounded however busy an agent is.** A sweep cannot
+  touch an agent that a request holds locked, and it skipped those; nothing
+  else bounded the streams. One agent_id with two requests always in flight
+  (4096 new streams each) was never swept, so its state grew without bound
+  (256k streams and 503 MiB after 41 s in the review; 17,800 streams in
+  0.13 s against `max_streams` 2000 in the test), and since the count stayed
+  over the limit, every sweep (every second) dropped every other agent's
+  streams: an agent with 300 streams lost the events of 44 cycles (beyond
+  the restore budget) in every batch. Now:
+  - A stream gets state only while there is room: fewer than `max_streams`
+    in all (checked and counted in one compare-and-swap) and fewer than the
+    new `ingest.max_streams_per_agent` of its agent, by default 4096 (what
+    one request may carry) or half of `max_streams` if less, so that no one
+    agent can fill the state (at most `max_streams`). Cycles of a stream
+    without room are stored but derive no events, and are counted
+    (`hopcorder_server_unrestored_cycles_total`) and warned about once per
+    batch like unrestored ones; the stream is restored once there is room.
+  - At `max_streams` the sweep frees 10% from the agents with the most
+    streams: it finds the level that cutting every agent above it to it
+    frees enough, counting all agents, and cuts those, least recently used
+    streams first. A locked agent above the level is given it and cuts
+    itself under its own lock when its request ends. So the agent with more
+    than its share pays, and an agent below the level loses nothing.
+    Before, the excess was taken from every agent that could be swept, by
+    age.
+  - Accepted: many agent_ids are still many agents. A flood of new ones,
+    each with fewer streams than a real agent, still makes the real agents
+    the largest and cuts them (the agent LRU and authentication at the
+    proxy, §2, bound that). When the other agents' streams plus one agent's
+    share exceed `max_streams`, that agent can keep the state full, so new
+    streams of others get none until a sweep cuts it back (existing ones
+    stay): keep `max_streams` above the real streams plus one share. A real
+    agent with more streams than its share derives no events for the rest
+    (the warning names the option).
+  - Tests: `TestLockedAgentStreamsBounded`; `TestLockedAgentDoesNotEvictOthers`
+    (the other agent's cycles without events per batch during the attack:
+    `[44 0 0 0 0 0]`, as without one, was `[44 44 44 44 44 44]`);
+    `TestHeavyAgentPaysAtMaxStreams` (five agents of 240 streams keep them
+    all while a locked agent fills the rest; also fails if the level leaves
+    locked agents out); `TestStreamsPerAgentBound`, `TestWaterLevel`,
+    `TestServerStreamsPerAgent`.
+- **`hops_mv` no longer copies a cycle's loops onto every hop row**
+  (migration 0003). It looked up each hop's loop TTLs with
+  `indexOf(loops.ip, hops.ip)` after `ARRAY JOIN hops`, and ARRAY JOIN
+  copies every column still needed onto each row: the cycle's whole
+  `loops.ip` and `loops.ttls`, per hop, hops x loops per cycle (and loops
+  need not match the hops). Peak memory of one 8 MiB cycles insert (25.8):
+  255 hops without loops 101 MiB; one loop of 255 TTLs (the review's
+  record) 388 MiB; IPv6 hops each seen twice, 127 loops of two TTLs (what
+  `DetectLoops` makes of such a path) 617 MiB; 255 loops of 255 TTLs over
+  1.6 GiB, failing with code 241. Now the server sends each hop's loop TTLs
+  with the cycle (`hops.loop_ttls Array(Array(UInt8))` in `cycles`: those of
+  the first loop with the hop's address, as the view chose them, else
+  empty), and the view only formats them, row by row (`is_loop` is
+  `notEmpty`). `hops` and `path_probes` get the same values as before
+  (prototype compatibility; `TestPrototypeQueriesRun` unchanged).
+- **The size of an insert counts what the view writes.** Parts were sized
+  by the cycles JSON alone, while the view writes the loop's TTLs as text on
+  every hop row (911 bytes on each of 255 hops, 232 KB a record, none of it
+  in the cycles row). A row now counts its JSON (which carries the per-hop
+  TTLs), and for each hop row 64 bytes (the cycle's columns repeated on it
+  and the hop's own fixed-size ones; ClickHouse writes about 80) plus its
+  `loop_ttls` text. The largest 8 MiB part of each shape above now peaks at
+  20 MiB without loops (also for 255 silent hops), 30 MiB for the IPv6
+  pairs, 45 MiB for 255 x 255 and 68 MiB for one 255-TTL loop.
+  - Accepted: loop-heavy batches go in many small parts. The review's
+    23 KB zstd request (31 MiB decoded) is 60 inserts of about 100 ms
+    instead of 3, and still writes 478 MiB into `hops` (2.4 MiB on disk):
+    that is the prototype's per-hop `loop_ttls`. Batches of long paths take
+    about twice as many parts as before; an agent's normal batch is still
+    one insert.
+  - Upgrade: cycles stored before the migration read as empty lists (their
+    hop rows came from the old view). A server of the previous version
+    inserting during a rolling upgrade sends no `hops.loop_ttls`; the
+    column's default (an empty list per hop) keeps its inserts working, and
+    their hop rows get no loop marks (`loop_events` has the loops).
+  - Tests: `TestInsertPartsCountHopRows` (each insert's JSON plus the hop
+    rows, estimated from the rows sent, within the budget; before, one
+    insert of 40 such records came to 10.5 MB), `TestCycleRowHopLoopTTLs`,
+    `TestLoopRecordsInsertClickHouse` (clickhouse tag: 20 records of 255
+    loops of 255 TTLs took 821 MiB in one insert, now 27 MiB in two; their
+    hop rows carry the TTLs).
+- **A body reserves its read-buffer chunks at once.** Readers took 64 KiB
+  chunks one at a time as data came, plus a one-byte one to see the end of
+  the body, and kept them until the handler returned. So readers could hold
+  every chunk between them, each waiting for one more: seven max-size
+  bodies at full speed (129 chunks each, 512 in the pool) mostly did, and
+  from `max_body_bytes` 16 MiB two could. All of them then stalled until
+  the 20 s read timeout (408 or 503), and every other request waited
+  behind them. Now a body reserves all it may need before it reads: by its
+  Content-Length, or `max_body_bytes` without one (what it did not fill
+  goes back once read). Reservations are granted in arrival order (a large
+  one is not passed over) by a small weighted semaphore of the standard
+  library (`chunkPool`), so every holder has all it needs and finishes or
+  times out: no set of readers can deadlock. The end of a body is checked
+  with a one-byte read into the stack. Chunks go back as soon as the body
+  is decoded rather than when the handler returns (they were held through
+  the inserts, the body long garbage). The bounds are unchanged: 64
+  readers, 20 s each, a pool of the larger of 32 MiB and twice
+  `max_body_bytes`, 503 when no chunks free up in time, 408 for a body not
+  received in time.
+  - Accepted: a client that announces a max-size body and sends nothing
+    now holds its whole reservation (128 chunks by default) until its read
+    timeout, so four such connections hold the default pool for 20 s;
+    before, four that sent 8 MiB each and stalled did the same. A buffering
+    reverse proxy removes both. A large reservation waiting first holds
+    back smaller ones behind it.
+  - Tests: `TestReadBufferNoDeadlock` (two bodies of four chunks sent in
+    halves, six chunks in the pool: both 503 at the 3 s timeout before, both
+    200 at once now), `TestReadBufferManyMaxBodies` (ten 8 MiB bodies and an
+    agent's batch: `[503 200 503 408 200 200 408 200 503 408]` after 4 s
+    before, all 200 in 0.5 s now), `TestChunkPoolOrder`;
+    `TestReadBufferBounded` and `TestSlowBodiesHoldNoIngestSlot` adapted.
+- **A request holds up to about three times `max_decoded_bytes`, not
+  twice** (corrected here, in round two's text, `server.example.yaml` and
+  the chart's `values.yaml`). A hop is 88 bytes in memory for as little as
+  31 of JSON (a silent one), so decoded records take up to 3.0 times their
+  NDJSON (255 silent hops a record; 1.6 times for answering hops, whose
+  addresses lengthen the JSON). The decoder also left slices with the spare
+  capacity of growing them by doubling: records of 9 silent hops took 3.6
+  times. A record now keeps only what it holds (`compact`), 2.3 times for
+  those. While a request is stored, one insert's rows and request body come
+  on top, up to about 24 MiB: a whole request of 31 MiB of 255 silent hops
+  peaked at 114 MiB (3.6 times). So ingest needs about `max_concurrent x
+  (3 x max_decoded_bytes + 24 MiB)`, plus the stream state and the read
+  buffer: with the defaults 480 + 170 + 32 MiB, within the chart's 1 GiB.
+  Test: `TestDecodedRecordsMemory` (at most 3.2 times for records of 9 and
+  of 255 silent hops; 3.6 before).
 
 **Read side, enrichment and the browser**
 - **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in

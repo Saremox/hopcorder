@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/saremox/hopcorder/internal/clickhouse"
@@ -52,11 +53,20 @@ type cycleRow struct {
 	HopASName []string             `json:"hops.as_name"`
 	HopName   []string             `json:"hops.name"`
 	HopMPLS   [][]record.MPLSLabel `json:"hops.mpls"`
+	// HopLoopTTLs are, for each hop, the TTLs of the first loop with its
+	// address (empty if none), which hops_mv writes on the hop's row as
+	// is_loop and loop_ttls. The view used to look them up itself, which
+	// made ClickHouse copy the cycle's loops onto every hop row first.
+	HopLoopTTLs [][]int `json:"hops.loop_ttls"`
 }
 
+var noTTLs = []int{}
+
 // buildCycleRow converts a validated record into a cycles row. Every slice
-// is non-nil: ClickHouse rejects null for array columns.
-func buildCycleRow(rec *record.Record, en Enricher) ([]byte, error) {
+// is non-nil: ClickHouse rejects null for array columns. cost is what the
+// row counts towards maxInsertBytes: its JSON, and for each hop row
+// hops_mv makes of it hopRowBytes plus its loop_ttls text.
+func buildCycleRow(rec *record.Record, en Enricher) (b []byte, cost int, err error) {
 	n := len(rec.Hops)
 	row := cycleRow{
 		AgentID: rec.AgentID, Seq: rec.Seq, TS: clickhouse.Time(rec.TS), Target: rec.Target,
@@ -66,11 +76,31 @@ func buildCycleRow(rec *record.Record, en Enricher) ([]byte, error) {
 		HopTTL: make([]int, n), HopStatus: make([]string, n), HopIP: make([]string, n),
 		HopRTT: make([]uint32, n), HopCode: make([]int, n), HopASN: make([]uint32, n),
 		HopASName: make([]string, n), HopName: make([]string, n), HopMPLS: make([][]record.MPLSLabel, n),
+		HopLoopTTLs: make([][]int, n),
 	}
+	// The first loop of each address, with the length of its TTLs as text
+	// ("2,4"), as the view used to pick them (indexOf(loops.ip, hops.ip)).
+	type loop struct {
+		ttls    []int
+		textLen int
+	}
+	var loopOf map[netip.Addr]loop
 	for _, l := range rec.Loops {
 		row.LoopIP = append(row.LoopIP, l.IP.String())
 		row.LoopTTLs = append(row.LoopTTLs, l.TTLs)
+		if _, ok := loopOf[l.IP]; ok {
+			continue
+		}
+		if loopOf == nil {
+			loopOf = map[netip.Addr]loop{}
+		}
+		textLen := len(l.TTLs) - 1
+		for _, ttl := range l.TTLs {
+			textLen += len(strconv.Itoa(ttl))
+		}
+		loopOf[l.IP] = loop{l.TTLs, textLen}
 	}
+	cost = n * hopRowBytes
 	for i, h := range rec.Hops {
 		row.HopTTL[i] = h.TTL
 		row.HopStatus[i] = string(h.Status)
@@ -79,18 +109,24 @@ func buildCycleRow(rec *record.Record, en Enricher) ([]byte, error) {
 		if row.HopMPLS[i] == nil {
 			row.HopMPLS[i] = []record.MPLSLabel{}
 		}
+		row.HopLoopTTLs[i] = noTTLs
 		if h.Code != nil {
 			row.HopCode[i] = *h.Code
 		}
 		if !h.IP.IsValid() {
 			continue
 		}
+		if l, ok := loopOf[h.IP]; ok {
+			row.HopLoopTTLs[i] = l.ttls
+			cost += l.textLen
+		}
 		row.HopIP[i] = h.IP.String()
 		row.HopRTT[i] = uint32(min(h.RTTMicros, math.MaxUint32)) //nolint:gosec // clamped, validated non-negative
 		row.HopASN[i], row.HopASName[i] = en.ASN(h.IP)
 		row.HopName[i] = en.Name(h.IP)
 	}
-	return json.Marshal(row)
+	b, err = json.Marshal(row)
+	return b, cost + len(b), err
 }
 
 // pathChangeRow is one row of the path_changes table.

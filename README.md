@@ -563,9 +563,9 @@ the content types a web page can send without a CORS preflight are refused),
 bodies up to `ingest.max_body_bytes` (8 MiB) and `max_decoded_bytes` (32 MiB),
 at most 16 agents and 4096 streams per request, and `ingest.max_concurrent`
 requests at once. A body is read in full (within 20 s, at most 64 at once,
-buffering together at most 32 MiB or twice `max_body_bytes`) before its
-request waits for one of the `max_concurrent` slots, so slow clients hold
-none. Records are validated against the schema's limits: `agent_id` from
+each first reserving its size in a buffer of 32 MiB or twice
+`max_body_bytes`, whichever is larger) before its request waits for one of
+the `max_concurrent` slots, so slow clients hold none. Records are validated against the schema's limits: `agent_id` from
 `[A-Za-z0-9._:-]` (at most 128 characters), targets from `[A-Za-z0-9._:%-]`
 (255; an IPv6 zone at most 15 characters from `[A-Za-z0-9._-]`), protocol
 `icmp`, `udp` or `tcp`, at most 255 hops and 16 MPLS labels per hop, hop and
@@ -573,11 +573,15 @@ loop addresses of the record's address family and without a zone, and `ts`
 at most `ingest.max_record_age` (30 days) old and at most a day ahead of the
 server's clock. Errors reported for rejected records are at most 200 bytes and
 never quote the record. The server keeps state for at most
-`ingest.max_streams` streams (20,000; 1 to 9 KiB each) and `ingest.max_agents`
-agents (10,000), drops idle ones after `stream_idle_timeout`, and the least
-recently used beyond the limits; they are restored from ClickHouse when they
-return, at most 256 per request within 5 s (the rest with their next batch,
-counted in `hopcorder_server_unrestored_cycles_total`). Running in a cgroup
+`ingest.max_streams` streams (20,000; 1 to 9 KiB each), at most
+`ingest.max_streams_per_agent` of one agent (4096, or half of `max_streams` if
+less), and `ingest.max_agents` agents (10,000). It drops idle ones after
+`stream_idle_timeout`; at `max_streams` the agents with the most streams drop
+their least recently used, beyond `max_agents` the least recently used agents
+go. Dropped ones are restored from ClickHouse when they return, at most 256
+per request within 5 s (the rest with their next batch); the cycles of a
+stream without state derive no events and are counted in
+`hopcorder_server_unrestored_cycles_total`. Running in a cgroup
 with a memory limit (a container, or a systemd unit with `MemoryMax=`), the
 server sets the Go memory limit to 90% of it unless `GOMEMLIMIT` is set.
 Read-API queries are limited to `query.max_concurrent` at once and to

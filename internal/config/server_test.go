@@ -21,7 +21,8 @@ func TestServerDefaults(t *testing.T) {
 		!*c.Metrics || !*c.Enrich.RDNS.Enabled || *c.Enrich.ASN.URL != DefaultASNURL ||
 		c.Enrich.ASN.Refresh.D() != 24*time.Hour || c.Ingest.MaxBodyBytes != DefaultMaxBodyBytes ||
 		*c.ClickHouse.RetentionDays != 90 || !*c.UI || c.Ingest.MaxConcurrent != 4 || c.Query.MaxConcurrent != 8 ||
-		c.Ingest.MaxStreams != 20000 || c.Ingest.MaxAgents != 10000 || c.Ingest.StreamIdleTimeout.D() != time.Hour ||
+		c.Ingest.MaxStreams != 20000 || c.Ingest.MaxStreamsPerAgent != 4096 || c.Ingest.MaxAgents != 10000 ||
+		c.Ingest.StreamIdleTimeout.D() != time.Hour ||
 		c.Ingest.MaxRecordAge.D() != 30*24*time.Hour {
 		t.Errorf("defaults %+v", c)
 	}
@@ -72,6 +73,32 @@ enrich:
 	}
 	if err := c.Finalize(); err == nil || !strings.Contains(err.Error(), "not in the URL") || strings.Contains(err.Error(), "s3cret") {
 		t.Errorf("credentials in the URL: %v", err)
+	}
+}
+
+// One agent may hold at most max_streams_per_agent streams: by default 4096
+// or half of max_streams, so that one agent can never fill the state.
+func TestServerStreamsPerAgent(t *testing.T) {
+	for _, tc := range []struct {
+		yaml string
+		want int
+		err  bool
+	}{
+		{`ingest: {max_streams: 1000}`, 500, false},
+		{`ingest: {max_streams: 1}`, 1, false},
+		{`ingest: {max_streams: 1000, max_streams_per_agent: 1000}`, 1000, false},
+		{`ingest: {max_streams: 1000, max_streams_per_agent: 1001}`, 0, true},
+		{`ingest: {max_streams_per_agent: -1}`, 0, true},
+	} {
+		c, err := ParseServer([]byte(tc.yaml))
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = c.Finalize()
+		if (err != nil) != tc.err || (err != nil && !strings.Contains(err.Error(), "ingest.max_streams_per_agent")) ||
+			(!tc.err && c.Ingest.MaxStreamsPerAgent != tc.want) {
+			t.Errorf("%s: max_streams_per_agent %d, %v", tc.yaml, c.Ingest.MaxStreamsPerAgent, err)
+		}
 	}
 }
 

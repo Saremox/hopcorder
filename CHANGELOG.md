@@ -17,7 +17,32 @@ The section for a version is the text of its GitHub release.
 
 **Security: server ingest**
 
-<!-- round three: ingest -->
+- One agent can no longer crowd the others out of the stream state. An agent
+  kept busy by back-to-back requests was never swept, so it escaped
+  `ingest.max_streams` without bound and made every sweep drop every other
+  agent's streams, whose cycles then derived no path changes or outages. The
+  limit now always holds, the new `ingest.max_streams_per_agent` (4096, or
+  half of `max_streams` if less) bounds one agent, and at the limit the
+  agents with the most streams give theirs up first. Cycles of streams
+  beyond the limits are stored, and counted in
+  `hopcorder_server_unrestored_cycles_total`.
+- Loops can no longer blow up inserts in ClickHouse. The per-hop view copied
+  a cycle's loops onto each of its hop rows, so one 8 MiB insert of valid
+  records could need 1.6 GiB and fail. The server now sends each hop's loop
+  TTLs with the cycle (migration 0003, applied on start; `hops` and
+  `path_probes` keep their columns and values), and the size of an insert
+  counts the hop rows the view writes. During a rolling upgrade, cycles that
+  a server of the previous version stores get no loop marks on their hop
+  rows (`loop_events` has the loops).
+- Concurrent large uploads can no longer stall ingest. A body took its part
+  of the read buffer chunk by chunk, so a few bodies of `max_body_bytes`
+  (seven with the defaults, two from 16 MiB) could hold all of it between
+  them, each waiting for more, until their read timeout. A body now reserves
+  what it needs at once, in turn, and gives it back once it is decoded.
+- Memory sizing, corrected: a request being processed holds up to about
+  three times `max_decoded_bytes` (not twice), plus about 24 MiB while it is
+  stored; plan for `max_concurrent` of them. Decoded records no longer keep
+  spare capacity, which made it up to 3.6 times.
 
 **Security: read side and Grafana**
 
