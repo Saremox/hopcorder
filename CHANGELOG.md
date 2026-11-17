@@ -46,6 +46,9 @@ The section for a version is the text of its GitHub release.
   does not start, and a reload keeps the running configuration. Their
   earlier cycles stay in one stream under the old `flow_id`. Every other
   config keeps its `flow_id`s and records.
+- Read API: every endpoint takes `flow_id`, so two flows of one target
+  (IPv4 and IPv6, or two ports) can be read apart; without it, any flow,
+  as before. `targets` also returns each stream's `last_af`.
 
 **Security: server ingest**
 

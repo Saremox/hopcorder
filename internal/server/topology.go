@@ -51,9 +51,9 @@ func timelineBucket(from, to time.Time) time.Duration {
 // consecutive answering hops within a cycle (edges; silent TTLs in between
 // are skipped, so an edge can span several TTLs), and reachability per
 // time bucket (timeline; rtt_p50_us is 0 in a bucket without a reached
-// cycle). agent and target are required; give protocol too,
-// or streams of several protocols are merged. limit is ignored: nodes and
-// edges are capped, and so are the bytes of the whole response
+// cycle). agent and target are required; give protocol and flow_id too,
+// or streams of several protocols or flows are merged. limit is ignored:
+// nodes and edges are capped, and so are the bytes of the whole response
 // (MaxResponseBytes; parts after the one that filled it stay empty);
 // truncated: true says so. Beyond topologyMaxGroups distinct nodes (or
 // edges) in the window, they are the busiest of the first ones ClickHouse

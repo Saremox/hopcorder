@@ -631,9 +631,9 @@ var (
 
 const maxQuerySpan = topologyMaxBuckets * 24 * time.Hour
 
-// parseQuery reads agent, target, protocol, from, to (RFC 3339 or Unix
-// milliseconds; default the last 24 hours, at most 400 days, within
-// 1970-2262) and limit.
+// parseQuery reads agent, target, protocol, flow_id, from, to (RFC 3339 or
+// Unix milliseconds; default the last 24 hours, at most 400 days, within
+// 1970-2262) and limit. Without flow_id, the flow parameter is -1: any flow.
 func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 	q := r.URL.Query()
 	now := time.Now()
@@ -664,11 +664,18 @@ func parseQuery(r *http.Request, needTarget bool) (queryParams, error) {
 			return queryParams{}, errors.New("limit must be 1..10000")
 		}
 	}
+	flow := -1
+	if v := q.Get("flow_id"); v != "" {
+		if flow, err = strconv.Atoi(v); err != nil || flow < 0 || flow > 0xffff {
+			return queryParams{}, errors.New("flow_id must be 0..65535")
+		}
+	}
 	if needTarget && (q.Get("agent") == "" || q.Get("target") == "") {
 		return queryParams{}, errors.New("agent and target are required")
 	}
 	return queryParams{limit: limit, from: from, to: to, params: clickhouse.Params{
 		"agent": q.Get("agent"), "target": q.Get("target"), "protocol": q.Get("protocol"),
+		"flow": strconv.Itoa(flow),
 		"from": clickhouse.Time(from), "to": clickhouse.Time(to), "limit": strconv.Itoa(limit),
 	}}, nil
 }
@@ -683,9 +690,14 @@ func parseTime(s string, def time.Time) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, s)
 }
 
+// streamFilter selects by the parameters parseQuery reads, each optional.
+// A stream is (agent, target, protocol, flow_id): two targets of one host
+// (IPv4 and IPv6, or two ports) are two flows of it, so a view of one
+// stream needs flow_id too (review round five).
 const streamFilter = `({agent:String} = '' OR agent_id = {agent:String})
 	AND ({target:String} = '' OR target = {target:String})
-	AND ({protocol:String} = '' OR protocol = {protocol:String})`
+	AND ({protocol:String} = '' OR protocol = {protocol:String})
+	AND ({flow:Int32} < 0 OR flow_id = {flow:Int32})`
 
 // runQuery streams the rows of q as {"rows": [...], "truncated": false},
 // row by row, within MaxResponseBytes ("truncated": true when rows were
@@ -746,7 +758,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 	s.runQuery(w, r, `SELECT agent_id, target, protocol, flow_id, max(ts) AS last_ts, count() AS cycles,
 		countIf(reached) / count() AS reach_ratio, argMax(reached, ts) AS last_reached,
 		argMax(path_len, ts) AS last_path_len, argMax(target_ip, ts) AS last_target_ip,
-		argMax(path_hash, ts) AS last_path_hash
+		argMax(af, ts) AS last_af, argMax(path_hash, ts) AS last_path_hash
 		FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND `+streamFilter+`
 		GROUP BY agent_id, target, protocol, flow_id ORDER BY agent_id, target, protocol, flow_id
 		LIMIT {limit:UInt32}
@@ -828,9 +840,13 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	// a protocol, streams of several protocols are merged, which needs a
 	// sort: a first query finds the times of the cycles to return, so that
 	// the sort gets only those. 1000 of 10,000 maximal cycles took 765 MiB
-	// (round four); now 52 MiB, 82 MiB without a protocol.
-	const window = `FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')}
+	// (round four); now 52 MiB, 82 MiB without a protocol. flow_id is not
+	// in the sort key: it only filters what is read in that order.
+	window := `FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')}
 		AND agent_id = {agent:String} AND target = {target:String}`
+	if qp.params["flow"] != "-1" {
+		window += ` AND flow_id = {flow:Int32}`
+	}
 	stream, cut := ` AND protocol = {protocol:String}`, ""
 	if qp.params["protocol"] == "" {
 		n, last, err := s.rowsThatFit(r.Context(), `SELECT ts, 0 AS bytes `+window+`

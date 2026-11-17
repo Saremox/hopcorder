@@ -657,7 +657,7 @@ answer every host.
 | Path | For | |
 | --- | --- | --- |
 | `POST /api/v1/ingest` | agents | zstd/gzip/plain NDJSON of wire records |
-| `GET /api/v1/query/targets` | readers | streams seen, with last state and reach ratio |
+| `GET /api/v1/query/targets` | readers | streams seen (agent, target, protocol, `flow_id`), with last state (address, `last_af`) and reach ratio |
 | `GET /api/v1/query/cycles` | readers | full cycles with enriched hops (`agent`, `target` required) |
 | `GET /api/v1/query/path-changes` | readers | route changes with the TTLs and addresses that changed |
 | `GET /api/v1/query/loops` | readers | looping addresses per cycle |
@@ -666,10 +666,14 @@ answer every host.
 | `GET /ui/` | readers | the web UI (`ui: false` turns it off) |
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
-Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
+Query parameters: `agent`, `target`, `protocol`, `flow_id` (0 to 65535;
+without it, any flow), `from`, `to` (RFC 3339 or Unix
 ms; default the last 24h; within 1970 to 2262 and at most 400 days apart,
 else 400), `limit` (default 1000, max 10000; for `cycles`
-max 1000). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
+max 1000). A stream is one agent's target with one protocol and `flow_id`:
+two targets of one host (IPv4 and IPv6, or two ports) are two flows of it,
+so give `protocol` and `flow_id` to read one stream (`cycles` and
+`topology` merge whatever matches). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
 address that answered at each TTL (`nodes`), every pair of consecutive
 answering hops within a cycle (`edges`, which skip silent TTLs), and
 reachability per time bucket (`timeline`, at most 400 buckets); nodes and

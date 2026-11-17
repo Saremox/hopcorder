@@ -3281,3 +3281,25 @@ findings are listed at the end, for the owner to decide on. The decisions:
     refused and the running targets keep probing; with their own
     `flow_id`s both flows run). All three failed before: the configs
     loaded, and the reload ran them.
+- **The read API reads one flow.** Every endpoint takes `flow_id` (0 to
+  65535, else 400 before any query; without it, any flow, as before, so
+  older links and clients keep working). `streamFilter` has it, `cycles`
+  adds it to its window as an equality, and `targets` returns `last_af`
+  (the last cycle's, like `last_target_ip`).
+  - Why: with their own `flow_id`s the events were already right (the
+    stream key has the flow), but nothing could read one flow: the
+    review's two rows in the stream list opened one view, which merged
+    IPv4 and IPv6 nodes and showed 50% reached.
+  - `flow_id` is not in the `cycles` sort key (agent_id, target, protocol,
+    ts), so it only filters the rows read in that order; the round-four
+    read-in-order path is unchanged.
+  - Tests: TestReadFilterByFlow (each endpoint, with and without
+    `protocol`, passes the flow and selects by it; malformed and
+    out-of-range values are 400 without a query; before, ignored),
+    TestDualStackStreamsClickHouse (the review's 40 alternating cycles on
+    two flows, stored in ClickHouse: `targets` gives two rows with their
+    af and reach, and `cycles`, `outages` and `topology` of one flow give
+    that flow only, without `flow_id` both; before, every read gave both
+    flows and no af) and TestDualStackStreams (ingest: on two flows no
+    route change and one open IPv6 outage; on one flow, what the agent
+    no longer sends, the review's 39 `target` changes and 20 outages).
