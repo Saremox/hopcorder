@@ -918,13 +918,24 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 	restored.replay(recs)
 	if len(recs) == 0 || !recs[len(recs)-1].Reached {
 		// The stream may have been down when its state was lost (or its
-		// last cycles lie beyond the window): resume its open outage. Not
-		// bounded by time: an outage can be older than any window, and
-		// outages has a row per outage, not per cycle.
+		// last cycles lie beyond the window): resume its open outage. It
+		// started after the last replayed cycle that reached the
+		// destination, if there is one. Otherwise it is not bounded: an
+		// outage can be older than any window, and a stream that was down
+		// for the whole replay has a row there per outage, not per cycle (a
+		// stream that flaps has one per two cycles, so the bound matters).
+		after := uint64(0)
+		for _, r := range slices.Backward(recs) {
+			if r.Reached {
+				after = r.Seq
+				break
+			}
+		}
 		open, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
 			toString(start_ts) AS start_ts, end_seq, NULL AS end_ts, cycles, last_hop_ttl, last_hop_ip, version
 			FROM outages FINAL WHERE `+where+` AND end_ts IS NULL AND start_seq < {before:UInt64}
-			ORDER BY start_seq DESC LIMIT 1`, params)
+			AND start_seq > {after:UInt64} ORDER BY start_seq DESC LIMIT 1`,
+			withParam(params, "after", strconv.FormatUint(after, 10)))
 		if err != nil {
 			return fmt.Errorf("find open outage: %w", err)
 		}

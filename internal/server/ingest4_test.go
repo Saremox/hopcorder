@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/saremox/hopcorder/internal/clickhouse"
 	"github.com/saremox/hopcorder/internal/record"
 )
 
@@ -175,6 +176,53 @@ func (c *commitFailStore) InsertJSON(ctx context.Context, table string, rows [][
 		return errors.New("clickhouse: code 241: memory limit exceeded: while pushing to view hops_mv")
 	}
 	return nil
+}
+
+// paramStore is a fakeStore that keeps the parameters of its queries.
+type paramStore struct {
+	*fakeStore
+	mu     sync.Mutex
+	params map[string][]clickhouse.Params // by query
+}
+
+func (p *paramStore) Query(ctx context.Context, q string, params clickhouse.Params, row func(json.RawMessage) error) error {
+	p.mu.Lock()
+	p.params[q] = append(p.params[q], params)
+	p.mu.Unlock()
+	return p.fakeStore.Query(ctx, q, params, row)
+}
+
+// A restore looks for the stream's open outage only after the last cycle
+// it replayed that reached the destination: the outage started after it.
+// The lookup used to read every outage of the stream, one per two cycles
+// for a stream that flaps (or that someone makes flap).
+func TestRestoreOutageLookupBounded(t *testing.T) {
+	st := &paramStore{fakeStore: newFakeStore(), params: map[string][]clickhouse.Params{}}
+	in := NewIngester(st, nil, quietLogger(), nil)
+	ingestOK := func(recs ...*record.Record) {
+		t.Helper()
+		if _, err := in.Ingest(t.Context(), recs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ingestOK(mk("lab", 1, pathA...), mk("lab", 2, brokenA...), mk("lab", 3, pathA...), mk("lab", 4, brokenA...),
+		mk("lab", 5, brokenA...))
+	in = NewIngester(st, nil, quietLogger(), nil) // a restart: the outage open since 4 is restored
+	ingestOK(mk("lab", 6, brokenA...), mk("lab", 7, pathA...))
+	var lookups []clickhouse.Params
+	for q, ps := range st.params {
+		for _, p := range ps {
+			if strings.Contains(q, "FROM outages FINAL") && p["before"] == "6" {
+				lookups = append(lookups, p)
+			}
+		}
+	}
+	if len(lookups) != 1 || lookups[0]["after"] != "3" {
+		t.Errorf("open-outage lookups %v, want one after seq 3", lookups)
+	}
+	if got := outagesOf(st.table("outages")); got[4] != "end 7, 3 cycles" || len(got) != 2 {
+		t.Errorf("outages %v", got)
+	}
 }
 
 // outagesOf returns the latest version of each outage, as FINAL reads them.

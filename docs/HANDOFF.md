@@ -1217,8 +1217,11 @@ decisions:
   (measured: unbounded 199k rows, 30 days 118k, one day 27k for a 60-day
   stream). The outage-cycle count is bounded by the outage's start. The
   open-outage lookup is not bounded by time: an outage can be older than
-  any window, and `outages` holds a row per outage, not per cycle. A change
-  across a gap longer than `max_record_age` is not reported.
+  any window, and `outages` holds a row per outage, not per cycle. (Round
+  four: a stream that flaps every cycle has a row per two cycles, so the
+  lookup is now bounded by the last replayed cycle that reached the
+  destination, when there is one.) A change across a gap longer than
+  `max_record_age` is not reported.
 - **Restores have their own budget**: at most 256 per request, within 5 s
   of its first restore, separate from the 30 s insert budget; storing a
   batch's events has its own 10 s. Before, one request with 4096 new
@@ -2634,8 +2637,14 @@ decisions:
   checks at every start that `hops_mv` and `loop_events_mv` exist and
   `agent_seq_mv` does not, and keeps the server unready otherwise, naming
   the migration to recreate a view from. Test: `TestMigrateChecksViews`.
-
-<!-- round four: ingest -->
+- **The restore's open-outage lookup is bounded by the last replayed cycle
+  that reached the destination** (the outage started after it), when there
+  is one. Round two left it unbounded because "outages holds a row per
+  outage, not per cycle"; a stream that flaps every cycle, an attacker's
+  own for instance, has one per two cycles (review: 1M rows read, 45 to
+  78 ms per restore with 2M cycles). A stream down for the whole replay is
+  still looked up without a bound. Test: `TestRestoreOutageLookupBounded`
+  (default run).
 
 **Agent**
 

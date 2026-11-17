@@ -80,8 +80,9 @@ The section for a version is the text of its GitHub release.
   stopped between dropping and recreating a view, followed by a rollback,
   stored every cycle without hop rows from then on. Later view changes use
   `ALTER TABLE ... MODIFY QUERY`.
-
-<!-- round four: ingest -->
+- Restoring a stream's state after a restart reads its outages only after
+  the last cycle that reached the destination, not all of them (a flapping
+  stream has one per two cycles).
 
 **Security: read side and Grafana**
 
