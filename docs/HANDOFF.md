@@ -3203,7 +3203,27 @@ findings are listed at the end, for the owner to decide on. The decisions:
 
 **Grafana's ClickHouse user**
 
-<!-- round five: grafana user -->
+- **No hyperscan for Grafana's user** (compose profile `grafana_limits` and
+  the chart's `hopcorder_readonly`: `allow_hyperscan = 0`, constant for the
+  readonly = 2 case). `readonly = 1` bounds the settings, not the
+  functions: `multiFuzzyMatchAny(s, 2, [1,500 patterns of 100 characters])`
+  took 380 MiB and 47 s inside the 400 MB query limit, and left its compiled
+  database in ClickHouse's global hyperscan cache, outside every query and
+  user limit and without expiry. Each distinct pattern set added 95 to 140
+  MB: on the chart's configuration ClickHouse grew from 212 MB to 1.36 GB
+  over nine queries and the tenth OOM-killed it (review, round five), with
+  the server's reads at 502 and ingest at 503 meanwhile. With the setting
+  the functions fail with FUNCTION_NOT_ALLOWED; no dashboard uses them.
+  - Tests: `TestGrafanaUserClickHouse` runs `multiFuzzyMatchAny` and
+    `multiMatchAny` as the compose user (FUNCTION_NOT_ALLOWED; before: both
+    ran) and refuses `allow_hyperscan = 1`; `smoke.sh` does the same as the
+    chart's user, and the helm job checks the rendered `readonly.xml`.
+  - Accepted: other global caches a viewer's queries fill are capped by
+    ClickHouse (compiled expressions 128 MiB, the query condition cache 100
+    MiB) and not counted in the chart's cache figures; a viewer can still
+    keep ClickHouse's CPUs busy within the limits (16 concurrent queries of
+    up to 300 s slowed topology from 60 ms to 1.2 s; ingest was not slowed).
+    Keep untrusted users away from Grafana (round four).
 
 **One stream per target**
 

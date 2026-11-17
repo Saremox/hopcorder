@@ -79,7 +79,8 @@ func refused(err error) bool {
 // use_concurrency_control = 0), pin memory in the query cache for good, fill
 // the disk with ClickHouse's own logs (the profilers, log_*) or hide a query
 // from query_log; earlier, the spill settings filled the data volume with
-// temporary data. The Helm chart's read-only user has the same profile in
+// temporary data. Hyperscan is off: its compiled patterns stay in a global
+// cache outside every memory limit. The Helm chart's read-only user has the same profile in
 // XML; deploy/helm/ci/smoke.sh checks that one.
 func TestGrafanaUserClickHouse(t *testing.T) {
 	c := testClickHouse(t)
@@ -231,6 +232,9 @@ func TestGrafanaUserClickHouse(t *testing.T) {
 		"max_bytes_ratio_before_external_sort = 0.1",
 		"max_bytes_before_external_group_by = 1000000",
 		"max_bytes_ratio_before_external_group_by = 0.1",
+		// Hyperscan, whose compiled patterns stay in a global cache
+		// outside every memory limit (below).
+		"allow_hyperscan = 1",
 	}
 	for _, alg := range []string{"grace_hash", "partial_merge", "auto", "full_sorting_merge", "prefer_partial_merge", "hash,grace_hash"} {
 		settings = append(settings, "join_algorithm = '"+alg+"'")
@@ -246,6 +250,26 @@ func TestGrafanaUserClickHouse(t *testing.T) {
 		k, v, _ := strings.Cut(s, "=")
 		if _, err := g.query(t.Context(), "SELECT 1", url.Values{k: {v}}); !refused(err) {
 			t.Errorf("parameter %s as the Grafana user: %v, want READONLY or SETTING_CONSTRAINT_VIOLATION", s, err)
+		}
+	}
+
+	// No hyperscan function runs: ClickHouse keeps each compiled pattern
+	// set in a global cache, outside every query and user memory limit, for
+	// good; ten queries of 1,500 fuzzy patterns each OOM-killed a 2 GiB
+	// ClickHouse while every one stayed under max_memory_usage.
+	for _, q := range []string{
+		"SELECT multiFuzzyMatchAny('hopcorder', 1, ['hopcordr', 'agent'])",
+		"SELECT multiMatchAny('hopcorder', ['hop.*', 'server'])",
+		"SELECT multiSearchAnyCaseInsensitiveUTF8('hopcorder', ['HOP'])", // not hyperscan: allowed
+	} {
+		err := query(q)
+		var ce *clickhouse.Error
+		hyperscan := !strings.Contains(q, "multiSearch")
+		switch {
+		case hyperscan && !(errors.As(err, &ce) && ce.Code == "446"):
+			t.Errorf("%s as the Grafana user: %v, want FUNCTION_NOT_ALLOWED", q, err)
+		case !hyperscan && err != nil:
+			t.Errorf("%s as the Grafana user: %v", q, err)
 		}
 	}
 

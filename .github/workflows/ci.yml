@@ -361,13 +361,14 @@ jobs:
           # server more than half of what ClickHouse may use.
           ch=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml --show-only templates/clickhouse.yaml)
           grep -qF '<readonly>1</readonly>' <<<"$ch" || { echo "readonly.xml: not readonly = 1"; exit 1; }
+          grep -qF '<allow_hyperscan>0</allow_hyperscan>' <<<"$ch" || { echo "readonly.xml: hyperscan is allowed"; exit 1; }
           if [ "$(grep -c '<changeable_in_readonly/>' <<<"$ch")" != 1 ] ||
             ! grep -qF '<max_execution_time><min>1</min><max>300</max><changeable_in_readonly/></max_execution_time>' <<<"$ch"; then
             echo "readonly.xml: a query may change settings other than max_execution_time (1 to 300 s)"; exit 1
           fi
           for s in readonly cancel_http_readonly_queries_on_client_close max_bytes_before_external_sort \
             max_bytes_ratio_before_external_sort max_bytes_before_external_group_by \
-            max_bytes_ratio_before_external_group_by join_algorithm; do
+            max_bytes_ratio_before_external_group_by join_algorithm allow_hyperscan; do
             grep -qF "<$s><const/></$s>" <<<"$ch" || { echo "readonly.xml: $s is not constant"; exit 1; }
           done
           for s in '<max_memory_usage>200000000<' '<max_memory_usage_for_user>300000000<' \
