@@ -504,6 +504,7 @@ func TestChunkPoolOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := make(chan string, 3)
+	queued := 0
 	wait := func(name string, ctx context.Context, n int) {
 		go func() {
 			if err := p.acquire(ctx, n); err != nil {
@@ -512,7 +513,13 @@ func TestChunkPoolOrder(t *testing.T) {
 			}
 			got <- name
 		}()
-		time.Sleep(20 * time.Millisecond) // queued in this order
+		// Queued in this order: wait until this one is in line.
+		queued++
+		for deadline := time.Now().Add(5 * time.Second); p.waiting() < queued; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s never queued", name)
+			}
+		}
 	}
 	cancelled, cancel := context.WithCancel(t.Context())
 	wait("big", cancelled, 4) // first in line, does not fit
@@ -533,6 +540,13 @@ func TestChunkPoolOrder(t *testing.T) {
 	if err := p.acquire(t.Context(), 5); err == nil {
 		t.Error("a reservation larger than the pool was granted")
 	}
+}
+
+// waiting returns how many reservations are queued.
+func (p *chunkPool) waiting() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.waiters.Len()
 }
 
 // The records of a request take about three times its decoded size, not
