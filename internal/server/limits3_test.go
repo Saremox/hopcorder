@@ -40,6 +40,8 @@ func (nullStore) Query(context.Context, string, clickhouse.Params, func(json.Raw
 	return nil
 }
 
+func (nullStore) Exec(context.Context, string, clickhouse.Params) error { return nil }
+
 // lockedAgent keeps agent "x" locked, as the review's attack did: two
 // requests always in flight for it, each with 4096 streams it has not sent
 // before (from a set of 40,000, so that a test that fails holds bounded
@@ -563,6 +565,7 @@ func TestDecodedRecordsMemory(t *testing.T) {
 		for i := range hops {
 			r.Hops = append(r.Hops, record.Hop{TTL: i + 1, Status: record.StatusNoReply})
 		}
+		r.PathHash = record.PathHash(r.Hops)
 		var b bytes.Buffer
 		for seq := uint64(1); b.Len() < 4<<20; seq++ {
 			r.Seq = seq

@@ -44,6 +44,11 @@ The section for a version is the text of its GitHub release.
   stored; plan for `max_concurrent` of them. Decoded records no longer keep
   spare capacity, which made it up to 3.6 times.
 
+- Records whose `reached`, `path_hash` or `loops` contradict their hops, or
+  that go on past the destination's reply, are rejected; agents never send
+  such records (`reached: true` without a reply was the flood's cheapest
+  form).
+
 <!-- round four: ingest -->
 
 **Security: read side and Grafana**

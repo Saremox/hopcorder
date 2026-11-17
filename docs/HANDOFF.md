@@ -2469,6 +2469,16 @@ decisions:
 
 **Ingest and storage**
 
+- **Records must be what `Finalize` makes of their hops** (`record.Validate`):
+  the path ends at its first `reply` or `unreachable`, `reached` says
+  whether a reply came, and `path_hash` and `loops` are those of the hops.
+  `reached: true` without a reply hop was accepted, the flood's cheapest
+  form. Every agent sends records as `Finalize` made them (its rules have
+  not changed since before the spool existed), so only records no agent
+  produces are refused; the checks are one SHA-1 and one loop scan per
+  record. Tests: `TestValidateRejects` (eight new cases, all accepted
+  before), `TestFlipRecordsValid`.
+
 <!-- round four: ingest -->
 
 **Agent**

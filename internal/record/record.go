@@ -269,7 +269,8 @@ func isAlnum(c rune) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
-// Validate checks that r is a well-formed schema-1 record.
+// Validate checks that r is a well-formed schema-1 record, finalized: its
+// derived fields are those Finalize gives its hops.
 func (r *Record) Validate() error {
 	var errs []error
 	if r.Schema != SchemaVersion {
@@ -327,7 +328,35 @@ func (r *Record) Validate() error {
 			errs = append(errs, fmt.Errorf("hops[%d]: ttl %d, want %d", i, h.TTL, i+1))
 		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(errs, r.validateDerived()...)...)
+}
+
+// validateDerived checks what Finalize derives from the hops, which every
+// agent sends as Finalize made it (security review, round four): the path
+// ends at its first reply or unreachable (Trim), reached says whether the
+// destination answered, and path_hash and loops are the hops'. Otherwise a
+// record could claim to reach its destination without a reply, and records
+// flipping reached at no cost made the server derive an outage from each.
+func (r *Record) validateDerived() []error {
+	var errs []error
+	for i, h := range r.Hops[:max(len(r.Hops)-1, 0)] {
+		if h.Status == StatusReply || h.Status == StatusUnreachable {
+			errs = append(errs, fmt.Errorf("hops[%d]: status %s before the end of the path", i, h.Status))
+			break
+		}
+	}
+	if r.Reached != Reached(r.Hops) {
+		errs = append(errs, errors.New("reached does not match the hops (a reply from the destination)"))
+	}
+	if r.PathHash != PathHash(r.Hops) {
+		errs = append(errs, errors.New("path_hash does not match the hops"))
+	}
+	if !slices.EqualFunc(r.Loops, DetectLoops(r.Hops), func(x, y Loop) bool {
+		return x.IP == y.IP && slices.Equal(x.TTLs, y.TTLs)
+	}) {
+		errs = append(errs, errors.New("loops do not match the hops (addresses that expired the TTL at more than one TTL)"))
+	}
+	return errs
 }
 
 // validateLoops checks that loops could have come from hops hops of address
