@@ -26,15 +26,32 @@ The section for a version is the text of its GitHub release.
   counted too few cycles. Every time parameter now names UTC. The official
   ClickHouse image (compose, the chart's bundled ClickHouse) runs in UTC
   and was not affected.
-
 - Grafana's read-only ClickHouse user may no longer use the hyperscan
   functions (`multiMatchAny`, `multiFuzzyMatchAny` and the like). ClickHouse
   keeps each compiled pattern set in a global cache, outside every query and
   user memory limit, for good: queries that each stayed under the user's
   400 MB grew ClickHouse by 95 to 140 MB apiece, and the tenth OOM-killed
   the chart's 2 GiB ClickHouse. No dashboard uses them.
-
-<!-- round five: streams -->
+- Agent: two targets of one host with the same protocol and `flow_id`
+  (IPv4 and IPv6 of one name, or two TCP ports, under the default
+  `flow_id`) are refused at load. The server tells streams apart by host,
+  protocol and `flow_id`, so it recorded both as one: their cycles
+  alternated, and 40 of them with IPv6 down gave 39 route changes and 20
+  one-cycle outages instead of one outage. **Upgrading:** a config that
+  relied on round four's warning about such targets no longer loads until
+  each has its own `flow_id` (`targets[1] (…): same host, protocol and
+  flow_id (33434) as targets[0] …; give each its own flow_id`): the agent
+  does not start, and a reload keeps the running configuration. Their
+  earlier cycles stay in one stream under the old `flow_id`. Every other
+  config keeps its `flow_id`s and records.
+- Read API: every endpoint takes `flow_id`, so two flows of one target
+  (IPv4 and IPv6, or two ports) can be read apart; without it, any flow,
+  as before. `targets` also returns each stream's `last_af`.
+- UI: the two flows of one target are two streams. The list shows each
+  with its address family and `flow_id`, and each row opens its own view;
+  both opened one view of both flows (50% reached for a dual-stack name
+  with IPv6 down). A link without `flow_id` opens its stream if it
+  matches only one, else lists those it matches.
 
 **Security: server ingest**
 

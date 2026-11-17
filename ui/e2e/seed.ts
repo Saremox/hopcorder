@@ -38,7 +38,17 @@ export function specFor(i: number): Spec {
   return spec
 }
 
-export function record(agent: string, seq: number, ts: number, spec: Spec) {
+/** What a record names its stream and destination by. */
+interface Dest {
+  target: string
+  target_ip: string
+  af: number
+  flow_id: number
+}
+
+const demo: Dest = { target: TARGET, target_ip: DEST, af: 4, flow_id: 33434 }
+
+export function record(agent: string, seq: number, ts: number, spec: Spec, dest: Dest = demo) {
   const hops: Hop[] = spec.map((s, k) => {
     const ttl = k + 1
     if (s === null) return { ttl, status: 'no-reply' }
@@ -60,11 +70,11 @@ export function record(agent: string, seq: number, ts: number, spec: Spec) {
     agent_id: agent,
     seq,
     ts: new Date(ts).toISOString(),
-    target: TARGET,
-    target_ip: DEST,
-    af: 4,
+    target: dest.target,
+    target_ip: dest.target_ip,
+    af: dest.af,
     protocol: 'icmp',
-    flow_id: 33434,
+    flow_id: dest.flow_id,
     reached: hops.some((h) => h.status === 'reply'),
     path_len: hops.length,
     path_hash: pathHash,
@@ -80,11 +90,35 @@ export async function seed(baseURL: string, agent: string, end: number): Promise
     const ts = end - (CYCLES - 1 - i) * STEP_MS
     lines.push(JSON.stringify(record(agent, i + 1, ts, specFor(i))))
   }
+  await ingest(baseURL, lines)
+}
+
+// The review's dual-stack target (round five): IPv4 and IPv6 of one name,
+// each on its own flow as the agent now requires, alternating cycles, IPv6
+// down after its second hop.
+export const DUAL = 'dual.example'
+export const DUAL_CYCLES = 40
+const dualV4: Dest = { target: DUAL, target_ip: '203.0.113.20', af: 4, flow_id: 33434 }
+const dualV6: Dest = { target: DUAL, target_ip: '2001:db8::20', af: 6, flow_id: 33435 }
+
+/** Ingests the two streams of the dual-stack target; the last cycle is at `end`. */
+export async function seedDualStack(baseURL: string, agent: string, end: number): Promise<void> {
+  const lines: string[] = []
+  for (let i = 0; i < DUAL_CYCLES; i++) {
+    const ts = end - (DUAL_CYCLES - 1 - i) * STEP_MS
+    const v6 = i % 2 === 1
+    const spec: Spec = v6 ? ['2001:db8:1::1', '2001:db8:2::1', null, null] : ['192.168.1.1', '198.51.100.1', `=${dualV4.target_ip}`]
+    lines.push(JSON.stringify(record(agent, i + 1, ts, spec, v6 ? dualV6 : dualV4)))
+  }
+  await ingest(baseURL, lines)
+}
+
+async function ingest(baseURL: string, lines: string[]): Promise<void> {
   const resp = await fetch(new URL('api/v1/ingest', baseURL), {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-ndjson' },
     body: `${lines.join('\n')}\n`,
   })
   const body = (await resp.json()) as { accepted?: number }
-  if (!resp.ok || body.accepted !== CYCLES) throw new Error(`ingest: ${resp.status} ${JSON.stringify(body)}`)
+  if (!resp.ok || body.accepted !== lines.length) throw new Error(`ingest: ${resp.status} ${JSON.stringify(body)}`)
 }

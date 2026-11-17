@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// One stream (agent, target, protocol) over the range: the timeline with the
+// One stream (agent, target, protocol, flow) over the range: the timeline with the
 // time scrubber, the hop graph, the selected cycle and the range's events.
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import type { Client, Cycle, LoopEvent, Outage, PathChange, StreamKey, Topology } from '../api'
@@ -73,12 +73,13 @@ function loadCycle() {
   }, 120)
 }
 
-watch(() => [props.stream.agent, props.stream.target, props.stream.protocol, tr.value.from, tr.value.to], loadRange, { immediate: true })
-watch(() => [props.stream.agent, props.stream.target, props.stream.protocol, props.at, props.at === undefined ? tr.value.to : 0], loadCycle, {
+const key = () => [props.stream.agent, props.stream.target, props.stream.protocol, props.stream.flow]
+watch(() => [...key(), tr.value.from, tr.value.to], loadRange, { immediate: true })
+watch(() => [...key(), props.at, props.at === undefined ? tr.value.to : 0], loadCycle, {
   immediate: true,
 })
 watch(
-  () => [props.stream.agent, props.stream.target, props.stream.protocol],
+  key,
   () => {
     selectedNode.value = null
   },
@@ -151,8 +152,8 @@ function onKey(ev: KeyboardEvent) {
     <header class="stream-head">
       <h1>
         <span class="mono">{{ stream.target }}</span>
-        <span class="proto">{{ stream.protocol || 'all protocols' }}</span>
-        <span class="muted">from {{ stream.agent }}</span>
+        <span class="proto">{{ stream.protocol }}</span>
+        <span class="muted">{{ cycle ? `IPv${cycle.af} · ` : '' }}flow {{ stream.flow }} from {{ stream.agent }}</span>
       </h1>
       <dl class="stats">
         <div><dt>Cycles</dt><dd>{{ summary.cycles }}</dd></div>

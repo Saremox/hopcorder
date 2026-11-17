@@ -556,6 +556,90 @@ func TestReloadRefusesBadMetricsPath(t *testing.T) {
 	}
 }
 
+// Targets the server would record as one stream (same host, protocol and
+// flow_id: here two TCP ports) are a configuration error: a reload to them
+// keeps the running configuration, and once each has its own flow_id they
+// run as two streams. Before, the reload was taken and both targets'
+// records went out with one flow_id.
+func TestReloadRefusesTargetsSharingAStream(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath, out := dir+"/agent.yaml", dir+"/out.jsonl"
+	write := func(targets string) {
+		writeTestFile(t, cfgPath, fmt.Sprintf("agent_id: r\ninterval: 100ms\ntimeout: 50ms\nspool: {dir: %q}\n"+
+			"targets:%s\noutputs: {jsonl: {path: %q}}\n", dir+"/spool", targets, out))
+	}
+	loaded := make(chan error, 1)
+	load := func() (*config.Config, error) {
+		c, err := config.Load(cfgPath)
+		if err == nil {
+			err = c.Finalize(config.FinalizeOptions{})
+		}
+		select {
+		case loaded <- err:
+		default:
+		}
+		return c, err
+	}
+	write(" [{host: 192.0.2.1}]")
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() { done <- superviseDaemon(ctx, cfg, fakeNetwork(), reload, load, quiet) }()
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) >= 2 }, "records")
+
+	write("\n  - {host: 192.0.2.2, protocol: tcp, port: 443}\n  - {host: 192.0.2.2, protocol: tcp, port: 8443}")
+	reload <- syscall.SIGHUP
+	select {
+	case err := <-loaded:
+		if err == nil || !strings.Contains(err.Error(), "give each its own flow_id") {
+			t.Errorf("reload to targets sharing a stream: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("not loaded")
+	}
+	n := len(readRecords(t, out))
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) > n+2 }, "records after the refused reload")
+	running(t, done)
+	for _, r := range readRecords(t, out) {
+		if r.Target != "192.0.2.1" {
+			t.Fatalf("record of %s %s: the refused configuration ran", r.Target, r.Protocol)
+		}
+	}
+
+	write("\n  - {host: 192.0.2.2, protocol: tcp, port: 443}\n  - {host: 192.0.2.2, protocol: tcp, port: 8443, flow_id: 33435}")
+	reload <- syscall.SIGHUP
+	flows := func() map[int]bool {
+		m := map[int]bool{}
+		for _, r := range readRecords(t, out) {
+			if r.Target == "192.0.2.2" {
+				m[r.FlowID] = true
+			}
+		}
+		return m
+	}
+	waitFor(t, 5*time.Second, func() bool { f := flows(); return f[33434] && f[33435] }, "records of both flows")
+	running(t, done)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("supervisor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+}
+
 func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
 	dir := t.TempDir()
 	good := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")

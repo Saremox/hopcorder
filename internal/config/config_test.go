@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -150,6 +151,63 @@ outputs: {jsonl: {path: "-"}}
 `, FinalizeOptions{}); err == nil ||
 		!strings.Contains(err.Error(), "flow_id 70000") {
 		t.Errorf("global flow_id 70000: err = %v", err)
+	}
+}
+
+// Two targets the server cannot tell apart (same host, protocol and
+// flow_id; the record has neither port nor the af asked for) are refused,
+// with a hint to give each its own flow_id. Before, the default flow_id put
+// one host's IPv4 and IPv6 targets, or two TCP ports, into one stream.
+func TestTargetsNeedTheirOwnStream(t *testing.T) {
+	const tail = "spool: {dir: /tmp/x}\noutputs: {jsonl: {path: \"-\"}}\n"
+	for name, targets := range map[string]string{
+		"dual-stack": `
+  - {host: dual.example, af: 4}
+  - {host: dual.example, af: 6}`,
+		"two tcp ports": `
+  - {host: 192.0.2.1, protocol: tcp, port: 443}
+  - {host: 192.0.2.1, protocol: tcp, port: 8443}`,
+		"explicit flow_id equal to the inherited one": `
+  - {host: dual.example, af: 4}
+  - {host: example.org}
+  - {host: dual.example, af: 6, flow_id: 40000}`,
+	} {
+		_, err := finalize(t, "flow_id: 40000\ntargets:"+targets+"\n"+tail, FinalizeOptions{})
+		if err == nil || !strings.Contains(err.Error(), "flow_id (40000) as targets[0]") ||
+			!strings.Contains(err.Error(), "give each its own flow_id") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+		// The same with --once: what it prints is records of streams too.
+		if _, err := finalize(t, "flow_id: 40000\ntargets:"+targets+"\n", FinalizeOptions{Once: true}); err == nil {
+			t.Errorf("%s: accepted with --once", name)
+		}
+	}
+
+	// Each with its own flow_id: accepted, and the flow_ids are as written
+	// (the first keeps the default).
+	c, err := finalize(t, `
+targets:
+  - {host: dual.example, af: 4}
+  - {host: dual.example, af: 6, flow_id: 33435}
+  - {host: 192.0.2.1, protocol: tcp, port: 443}
+  - {host: 192.0.2.1, protocol: tcp, port: 8443, flow_id: 33436}
+  - {host: 192.0.2.1, protocol: udp}
+`+tail, FinalizeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	for _, tg := range c.Targets {
+		got = append(got, tg.FlowID)
+	}
+	if want := []int{33434, 33435, 33434, 33436, 33434}; !slices.Equal(got, want) {
+		t.Errorf("flow_ids %v, want %v", got, want)
+	}
+
+	// An exact duplicate is reported as one, once.
+	_, err = finalize(t, "targets: [{host: a.example}, {host: a.example}]\n"+tail, FinalizeOptions{})
+	if err == nil || strings.Count(err.Error(), "targets[1]") != 1 || !strings.Contains(err.Error(), "duplicates targets[0]") {
+		t.Errorf("duplicate: err = %v", err)
 	}
 }
 

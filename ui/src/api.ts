@@ -11,6 +11,7 @@ export interface Stream {
   last_reached: boolean
   last_path_len: number
   last_target_ip: string
+  last_af: number
   last_path_hash: string
 }
 
@@ -133,11 +134,31 @@ export interface LoopEvent {
   ttls: number[]
 }
 
-/** One traced path: what the stream list links to. */
+/**
+ * One traced path, what the stream list links to: an agent's target with one
+ * protocol and flow_id. Two targets of one host (IPv4 and IPv6, or two
+ * ports) are two flows of it, so a key without protocol or flow (a link
+ * from before flows were part of it) names no single stream.
+ */
 export interface StreamKey {
   agent: string
   target: string
   protocol: string
+  flow?: number
+}
+
+export function streamKeyOf(s: Stream): StreamKey {
+  return { agent: s.agent_id, target: s.target, protocol: s.protocol, flow: s.flow_id }
+}
+
+/** Whether k names exactly one stream. */
+export function isOneStream(k: StreamKey): boolean {
+  return k.agent !== '' && k.target !== '' && k.protocol !== '' && k.flow !== undefined
+}
+
+/** The stream a key that names none matches, if it matches only one. */
+export function onlyStream(rows: Stream[]): StreamKey | undefined {
+  return rows.length === 1 && rows[0] ? streamKeyOf(rows[0]) : undefined
 }
 
 export interface TimeRange {
@@ -198,11 +219,13 @@ export class Client {
   }
 
   private static stream(s: StreamKey, r: TimeRange) {
-    return { agent: s.agent, target: s.target, protocol: s.protocol, from: Math.floor(r.from), to: Math.ceil(r.to) }
+    return { agent: s.agent, target: s.target, protocol: s.protocol, flow_id: s.flow, from: Math.floor(r.from), to: Math.ceil(r.to) }
   }
 
-  targets(r: TimeRange, signal?: AbortSignal): Promise<Stream[]> {
-    return this.rows('targets', { from: Math.floor(r.from), to: Math.ceil(r.to), limit: 10000 }, signal)
+  /** The streams with cycles in the range; with match, those it matches (empty fields match any). */
+  targets(r: TimeRange, signal?: AbortSignal, match?: StreamKey): Promise<Stream[]> {
+    const m = match ? Client.stream(match, r) : { from: Math.floor(r.from), to: Math.ceil(r.to) }
+    return this.rows('targets', { ...m, limit: 10000 }, signal)
   }
 
   topology(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<Topology> {

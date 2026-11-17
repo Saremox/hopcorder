@@ -431,6 +431,8 @@ added in the commit that introduced it.
   default 33434, constant across TTLs *and* cycles so paris keeps a target on
   one ECMP path over time; per-target configurable. Classic mode
   (`paris: false`) varies the ICMP checksum or walks the UDP destination port.
+  (Since round five of the review, two targets of one host and protocol
+  need different ones: the server tells streams apart by it.)
 - **Sockets** (Linux only; other OSes get a stub that fails clearly): IPv4
   sends through one `IPPROTO_RAW` (`IP_HDRINCL`) socket, so TTL and IP ID are
   per packet with no `setsockopt` races between targets; one ICMP socket
@@ -2970,6 +2972,12 @@ decisions:
   - Tests: TestFlowInUseCountsTheSeriesTargets (two targets on one series:
     one refused, the other's cycle leaves the gauge at 1; before, 0) and
     TestWarnSharedSeries.
+  - Corrected in round five: with one `flow_id`, which the config allowed
+    and is the default, such targets were not only one series but one
+    stream on the server, whose route changes and outages were wrong
+    (every cycle a `target` change). They are still what operators want to
+    record, but each now needs its own `flow_id`, and the agent refuses
+    them otherwise; see round five. Their metrics still share series.
 
 **CI, release and deployment**
 
@@ -3227,4 +3235,96 @@ findings are listed at the end, for the owner to decide on. The decisions:
 
 **One stream per target**
 
-<!-- round five: streams -->
+- **The agent refuses targets the server would record as one stream.** A
+  target with the same host, protocol and `flow_id` as an earlier one is a
+  configuration error: `targets[1] (dual.example): same host, protocol and
+  flow_id (33434) as targets[0], so the server would record both as one
+  stream; give each its own flow_id`. A start fails (status 2, before
+  anything runs), a reload keeps the running configuration, and `--once`
+  refuses them too. Round four's duplicate check (host, protocol, port,
+  af) stays; an exact duplicate is reported as that, once.
+  - Why: a record names its target by the configured host, protocol and
+    `flow_id`; the port and the af asked for are not on it (§3.1, locked),
+    so the server's stream (agent, target, protocol, flow_id; M2) is all
+    it can tell apart. Round four allowed one host twice with another
+    `af` or `port` under one `flow_id` (the default) and only warned that
+    their metrics share series. On the server their cycles alternated in
+    one stream. The review fed 40 alternating IPv4/IPv6 cycles of
+    `dual.example` with IPv6 down through ingest: 39 `target` route
+    changes and 20 one-cycle outages instead of one ongoing IPv6 outage,
+    and the UI said "Route changes 39, Outages 20, Reached 50%".
+  - Not changed instead: the server's stream key. The port would have to
+    be added to the locked wire record, and an `af` in the key would split
+    a target whose name moves between families (af 0 prefers IPv4 and
+    falls back to IPv6), which is one target with a `target` route change
+    today.
+  - Not chosen: deriving a `flow_id` for the second of two such targets
+    (the review's alternative). The `flow_id` is the stream's name on the
+    server and the ICMP identifier or source port on the host, which each
+    hopcorder process needs its own of. A derived one depends on the order
+    of the list (reordering it swaps two streams' histories), can collide
+    silently with another process's `--flow-id` or another configured
+    flow, and names a stream by a value nobody wrote. Refusing changes
+    nothing for a config that loaded without round four's warning: same
+    `flow_id`s, same records.
+  - Accepted: configs that relied on that warning no longer load until
+    each such target has its own `flow_id` (upgrade note in CHANGELOG);
+    the targets' earlier cycles stay in one stream under the old
+    `flow_id`. Agents of earlier versions still send them so; the server
+    cannot take them apart. Their metrics still share series, and the
+    agent still warns about that.
+  - Tests: TestTargetsNeedTheirOwnStream (dual-stack, two TCP ports, an
+    own `flow_id` equal to the inherited one, each also with `--once`;
+    with their own `flow_id`s they load and keep them),
+    TestBuildConfigRefusesTargetsSharingAStream (`--flow-id` makes them
+    collide) and TestReloadRefusesTargetsSharingAStream (the reload is
+    refused and the running targets keep probing; with their own
+    `flow_id`s both flows run). All three failed before: the configs
+    loaded, and the reload ran them.
+- **The read API reads one flow.** Every endpoint takes `flow_id` (0 to
+  65535, else 400 before any query; without it, any flow, as before, so
+  older links and clients keep working). `streamFilter` has it, `cycles`
+  adds it to its window as an equality, and `targets` returns `last_af`
+  (the last cycle's, like `last_target_ip`).
+  - Why: with their own `flow_id`s the events were already right (the
+    stream key has the flow), but nothing could read one flow: the
+    review's two rows in the stream list opened one view, which merged
+    IPv4 and IPv6 nodes and showed 50% reached.
+  - `flow_id` is not in the `cycles` sort key (agent_id, target, protocol,
+    ts), so it only filters the rows read in that order; the round-four
+    read-in-order path is unchanged.
+  - Tests: TestReadFilterByFlow (each endpoint, with and without
+    `protocol`, passes the flow and selects by it; malformed and
+    out-of-range values are 400 without a query; before, ignored),
+    TestDualStackStreamsClickHouse (the review's 40 alternating cycles on
+    two flows, stored in ClickHouse: `targets` gives two rows with their
+    af and reach, and `cycles`, `outages` and `topology` of one flow give
+    that flow only, without `flow_id` both; before, every read gave both
+    flows and no af) and TestDualStackStreams (ingest: on two flows no
+    route change and one open IPv6 outage; on one flow, what the agent
+    no longer sends, the review's 39 `target` changes and 20 outages).
+- **The UI's stream is (agent, target, protocol, flow).** `StreamKey` has
+  `flow`, the URL `flow_id`, the stream list's links carry it, and a
+  view's every request sends it, so the two rows of a dual-stack name open
+  two views. The list shows each stream's af (`last_af`) and flow, the
+  view's header its flow and the shown cycle's af.
+  - Links without `flow_id` or `protocol` (every link before) name no
+    single stream. They show the stream list narrowed to the streams they
+    match (`targets` with their agent, target and protocol) with a note,
+    and if that is one stream, it opens, the URL replaced by its full link
+    (range and moment kept). So the view that merged a target's protocols
+    when a link had none is gone: a view is one stream.
+  - Tests: Vitest (the URL round-trips `flow_id`, the two rows' links
+    differ and parse back to their flows, bad `flow_id`s are dropped;
+    every request of a view sends the flow; a link resolves to its only
+    stream, else none) and browser tests (two flows of one name are two
+    rows, IPv6 with 0% reached, no route change and one outage, IPv4 with
+    100%, none and none; a link without `flow_id` opens the only stream,
+    or lists both). The three new browser tests failed against a server
+    built from the commit before these fixes, run locally.
+  - Not changed: the Grafana dashboard's variables are agent, target and
+    protocol, so its per-target panels (reachability, path length, the
+    hop panels) merge a target's flows. Its route-change and outage
+    panels read the per-stream tables and are right. A `flow_id`
+    variable is left for the owner; another round-five fix changes
+    Grafana's side.

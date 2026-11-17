@@ -33,6 +33,11 @@ targets:                        # required: at least one
   # - host: dual-stack.example.net
   #   af: 6
   #   interval: 30s
+  # One host twice with one protocol (IPv4 and IPv6, or two ports) needs a
+  # flow_id each: the server tells streams apart by host, protocol, flow_id.
+  # - host: dual-stack.example.net
+  #   af: 4
+  #   flow_id: 33435
 
 outputs:                        # at least one
   jsonl:

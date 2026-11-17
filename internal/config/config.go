@@ -267,6 +267,7 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 		fail("targets: at least one target is required")
 	}
 	seen := map[string]int{}
+	streams := map[streamKey]int{}
 	for i := range c.Targets {
 		t := &c.Targets[i]
 		c.defaultTarget(t)
@@ -274,10 +275,17 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 			fail("targets[%d] (%s): %w", i, t.Host, err)
 		}
 		key := fmt.Sprintf("%s|%s|%d|%d", t.Host, t.Protocol, t.Port, t.AF)
+		sk := streamKey{t.Host, t.Protocol, t.FlowID}
 		if j, dup := seen[key]; dup {
 			fail("targets[%d] (%s): duplicates targets[%d]", i, t.Host, j)
+		} else if j, same := streams[sk]; same {
+			fail("targets[%d] (%s): same host, protocol and flow_id (%d) as targets[%d], so the server "+
+				"would record both as one stream; give each its own flow_id", i, t.Host, t.FlowID, j)
 		}
 		seen[key] = i
+		if _, ok := streams[sk]; !ok {
+			streams[sk] = i
+		}
 	}
 
 	if !o.Once {
@@ -315,6 +323,20 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// streamKey is what the server tells an agent's targets apart by: a record
+// carries the configured host, the protocol and the flow_id, but neither
+// the port nor the address family it asked for. Two targets with the same
+// key (one host over IPv4 and IPv6, or on two TCP ports, with the default
+// flow_id) made one stream there: their cycles alternated, so every cycle
+// was a route change and the IPv6 outage a new one-cycle outage each time
+// (review round five). Such targets are refused rather than given derived
+// flow_ids: a flow_id is the stream's name on the server and the ICMP
+// identifier or source port on the host, which the operator picks for both.
+type streamKey struct {
+	host, protocol string
+	flowID         int
 }
 
 // maxMetricsPathLen bounds outputs.metrics.path.

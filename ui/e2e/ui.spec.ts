@@ -1,14 +1,16 @@
 import { expect, test, type Page } from '@playwright/test'
-import { CYCLES, DEST, TARGET, seed } from './seed'
+import { CYCLES, DEST, DUAL, DUAL_CYCLES, TARGET, seed, seedDualStack } from './seed'
 
 // Runs against a server with the embedded UI, ClickHouse behind it and
 // e2e/asn.tsv as its ASN database (see the ui job in .github/workflows/ci.yml).
 
 const agent = `e2e-${Date.now().toString(36)}`
-const streamHash = `#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&range=6h`
+const dualAgent = `e2d-${Date.now().toString(36)}` // not a match for the filter by agent
+const streamHash = `#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&flow_id=33434&range=6h`
 
 test.beforeAll(async ({ baseURL }) => {
   await seed(baseURL ?? 'http://127.0.0.1:8080/', agent, Date.now() - 60_000)
+  await seedDualStack(baseURL ?? 'http://127.0.0.1:8080/', dualAgent, Date.now() - 60_000)
 })
 
 /** Fails the test on any console error, e.g. a Content-Security-Policy violation. */
@@ -104,6 +106,49 @@ test('topology, scrubber and events', async ({ page }) => {
   await expect(page).not.toHaveURL(/at=/)
 
   expect(errors).toEqual([])
+})
+
+// IPv4 and IPv6 of one name on two flows are two rows, each opening its own
+// view: the IPv6 one a single ongoing outage and no route change. (On one
+// flow the review counted 39 route changes and 20 outages; on two, both
+// rows opened one view with both flows, 50% reached.)
+test('two flows of one target are two streams', async ({ page }) => {
+  const errors = watchErrors(page)
+  await page.goto('./')
+  const rows = page.locator('.stream-table tbody tr')
+  const stats = page.locator('.stats')
+  for (const [i, flow, af, reached, outages] of [
+    [1, 33435, 6, '0%', 1],
+    [0, 33434, 4, '100%', 0],
+  ] as const) {
+    await page.getByLabel('Filter streams').fill(dualAgent)
+    await expect(rows).toHaveCount(2)
+    await expect(rows.nth(i)).toContainText(`IPv${af} · flow ${flow}`)
+    await rows.nth(i).getByRole('link', { name: DUAL }).click()
+    await expect(page).toHaveURL(new RegExp(`flow_id=${flow}`))
+    await expect(stats).toContainText(`Cycles${DUAL_CYCLES / 2}`)
+    await expect(stats).toContainText(`Reached${reached}`)
+    await expect(stats).toContainText('Route changes0')
+    await expect(stats).toContainText(`Outages${outages}`)
+    await expect(page.locator('.stream-head h1')).toContainText(`IPv${af} · flow ${flow}`)
+    await page.goBack()
+  }
+  expect(errors).toEqual([])
+})
+
+// Links from before flows were part of a stream have no flow_id.
+test('a link without flow_id opens its only stream', async ({ page }) => {
+  await page.goto(`./ui/#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&range=6h`)
+  await expect(page).toHaveURL(/flow_id=33434/)
+  await expect(page.locator('.stats')).toContainText(`Cycles${CYCLES}`)
+})
+
+test('a link without flow_id lists the flows it matches', async ({ page }) => {
+  await page.goto(`./ui/#/stream?agent=${dualAgent}&target=${DUAL}&protocol=icmp&range=6h`)
+  await expect(page.getByRole('heading', { name: 'Streams' })).toBeVisible()
+  await expect(page.locator('.match-note')).toContainText(`names no single stream of ${DUAL}`)
+  await expect(page.locator('.stream-table tbody tr')).toHaveCount(2)
+  await expect(page).not.toHaveURL(/flow_id/)
 })
 
 test('an incomplete stream link shows the list', async ({ page }) => {

@@ -48,6 +48,35 @@ func TestAgentRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+// A start with targets the server would record as one stream fails in
+// buildConfig, before anything runs (runAgent then exits with status 2),
+// and says what to change; also when --flow-id makes a target's inherited
+// flow_id equal to another's own.
+func TestBuildConfigRefusesTargetsSharingAStream(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(p, []byte(`
+spool: {dir: `+dir+`/spool}
+targets:
+  - {host: dual.example, af: 4}
+  - {host: dual.example, af: 6, flow_id: 40000}
+outputs: {jsonl: {path: "-"}}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, f, targets := parseAgentFlags(t, "-config", p)
+	if _, err := buildConfig(fs, f, targets); err != nil {
+		t.Fatalf("own flow_ids: %v", err)
+	}
+	fs, f, targets = parseAgentFlags(t, "-config", p, "-flow-id", "40000")
+	_, err := buildConfig(fs, f, targets)
+	if err == nil || !strings.Contains(err.Error(), "invalid configuration") ||
+		!strings.Contains(err.Error(), "targets[1] (dual.example): same host, protocol and flow_id (40000) as targets[0]") ||
+		!strings.Contains(err.Error(), "give each its own flow_id") {
+		t.Errorf("err = %v", err)
+	}
+}
+
 func parseAgentFlags(t *testing.T, args ...string) (*flag.FlagSet, *agentFlags, []string) {
 	t.Helper()
 	var f agentFlags

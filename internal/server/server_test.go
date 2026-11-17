@@ -337,6 +337,69 @@ func TestEvents(t *testing.T) {
 	}
 }
 
+// dualStack is the review's scenario (round five): n cycles of one agent
+// alternating between the IPv4 target of dual.example (odd seqs, reached)
+// and its IPv6 target (even seqs, IPv6 down after the second hop), on the
+// given flows.
+func dualStack(n, flow4, flow6 int) []*record.Record {
+	var recs []*record.Record
+	for seq := 1; seq <= n; seq++ {
+		var r *record.Record
+		if seq%2 == 1 {
+			r = mk("lab", uint64(seq), pathA...)
+			r.FlowID = flow4
+		} else {
+			r = mk("lab", uint64(seq), "2001:db8:1::1", "2001:db8:2::1", "*", "*")
+			r.TargetIP, r.AF, r.FlowID = netip.MustParseAddr("2001:db8::9"), 6, flow6
+		}
+		r.Target = "dual.example"
+		recs = append(recs, r)
+	}
+	return recs
+}
+
+// Two targets of one host on their own flows are two streams with their
+// own events: the IPv6 one an outage from its first cycle, neither a route
+// change. On one flow (what the agent sent before it refused such targets)
+// the server has no way to tell them apart, and the review's numbers come
+// out: every cycle after the first a "target" route change, every IPv6
+// cycle a new outage.
+func TestDualStackStreams(t *testing.T) {
+	ingest := func(flow6 int) *fakeStore {
+		st := newFakeStore()
+		in := NewIngester(st, nil, quietLogger(), nil)
+		if _, err := in.Ingest(t.Context(), dualStack(40, 33434, flow6)); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	starts := func(st *fakeStore) map[uint64]bool {
+		m := map[uint64]bool{}
+		for _, o := range st.table("outages") {
+			m[num(o["start_seq"])] = true
+		}
+		return m
+	}
+
+	st := ingest(33435)
+	if ch := st.table("path_changes"); len(ch) != 0 {
+		t.Errorf("own flows: %d route changes, want none: %v", len(ch), ch)
+	}
+	out := st.table("outages")
+	if len(out) != 1 || num(out[0]["flow_id"]) != 33435 || num(out[0]["start_seq"]) != 2 || out[0]["end_ts"] != nil {
+		t.Errorf("own flows: outages %v, want one open from seq 2 on flow 33435", out)
+	}
+
+	st = ingest(33434)
+	ch := st.table("path_changes")
+	if len(ch) != 39 || ch[0]["reason"] != "target" {
+		t.Errorf("one flow: %d route changes, want 39 target changes: %v", len(ch), ch)
+	}
+	if n := len(starts(st)); n != 20 {
+		t.Errorf("one flow: %d outages, want 20", n)
+	}
+}
+
 func TestRestoreAfterRestart(t *testing.T) {
 	st := newFakeStore()
 	in := NewIngester(st, nil, quietLogger(), nil)

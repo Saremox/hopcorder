@@ -436,7 +436,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
 | `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
-| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own |
+| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own, and so does every target of one host and protocol |
 | `paris` | `true` | `--paris` | Flow-stable probing |
 | `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
@@ -452,6 +452,10 @@ for TCP), `af` (`4` or
 `6`; names with both prefer IPv4 unless set; `--af` applies to targets given as
 arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
 `interval`, `timeout`, `max_ttl`, `probe_past`.
+Two targets of one `host` and `protocol` (IPv4 and IPv6 of a name, or two
+ports) need a `flow_id` each: the server tells an agent's streams apart by
+host, protocol and `flow_id` (a record has no port), so the agent refuses
+them otherwise.
 
 **Outputs** (at least one):
 
@@ -500,8 +504,9 @@ hop addresses.
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 
-Two targets with the same `host` and `protocol` (another `port` or `af`)
-share their per-target series, as the labels are only configured values:
+Two targets with the same `host` and `protocol` (another `port` or `af`,
+and each its own `flow_id`) share their per-target series, as the labels
+are only configured values:
 counters count both, the RTT histogram mixes them, `hopcorder_path_length`
 is the last cycle's, and `hopcorder_flow_in_use` counts those not probed.
 The agent warns at start. To tell them apart, give one an address or
@@ -652,7 +657,7 @@ answer every host.
 | Path | For | |
 | --- | --- | --- |
 | `POST /api/v1/ingest` | agents | zstd/gzip/plain NDJSON of wire records |
-| `GET /api/v1/query/targets` | readers | streams seen, with last state and reach ratio |
+| `GET /api/v1/query/targets` | readers | streams seen (agent, target, protocol, `flow_id`), with last state (address, `last_af`) and reach ratio |
 | `GET /api/v1/query/cycles` | readers | full cycles with enriched hops (`agent`, `target` required) |
 | `GET /api/v1/query/path-changes` | readers | route changes with the TTLs and addresses that changed |
 | `GET /api/v1/query/loops` | readers | looping addresses per cycle |
@@ -661,10 +666,14 @@ answer every host.
 | `GET /ui/` | readers | the web UI (`ui: false` turns it off) |
 | `GET /healthz`, `/readyz`, `/metrics` | operators | liveness, readiness (schema applied, ClickHouse up), Prometheus |
 
-Query parameters: `agent`, `target`, `protocol`, `from`, `to` (RFC 3339 or Unix
+Query parameters: `agent`, `target`, `protocol`, `flow_id` (0 to 65535;
+without it, any flow), `from`, `to` (RFC 3339 or Unix
 ms; default the last 24h; within 1970 to 2262 and at most 400 days apart,
 else 400), `limit` (default 1000, max 10000; for `cycles`
-max 1000). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
+max 1000). A stream is one agent's target with one protocol and `flow_id`:
+two targets of one host (IPv4 and IPv6, or two ports) are two flows of it,
+so give `protocol` and `flow_id` to read one stream (`cycles` and
+`topology` merge whatever matches). Results are newest first; `cycles` also takes `order=asc`. `topology` returns every
 address that answered at each TTL (`nodes`), every pair of consecutive
 answering hops within a cycle (`edges`, which skip silent TTLs), and
 reachability per time bucket (`timeline`, at most 400 buckets); nodes and
@@ -745,7 +754,9 @@ rate-limited router flickering does not count.
 ## Web UI
 
 The server serves a UI at `/ui/` (behind the same reverse proxy as the read
-API; it works under any path prefix). Pick a stream, then:
+API; it works under any path prefix). Pick a stream: an agent's target with
+one protocol and `flow_id`, so the IPv4 and IPv6 targets of one name are two
+rows, each with its address family and flow. Then:
 
 - **The timeline** shows the share of cycles that missed the destination and
   its RTT, outage windows and route changes. Click or drag on it to select a
@@ -760,7 +771,9 @@ API; it works under any path prefix). Pick a stream, then:
 - **The cycle** hop by hop (address, name, AS, RTT, status, MPLS labels), and
   the range's route changes, outages and loops, each a click away.
 
-The URL holds the whole view, so links can be shared.
+The URL holds the whole view, so links can be shared. A link without a
+`flow_id` (from an earlier version) opens its stream if it matches only one,
+else lists the ones it matches.
 
 ![The topology UI at a route change](docs/images/ui.png)
 

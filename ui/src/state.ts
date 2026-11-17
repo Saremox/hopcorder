@@ -1,9 +1,11 @@
 // What the page shows, kept in the URL hash so every view can be bookmarked
-// and shared: #/ for the stream list, #/stream?agent=…&target=…&protocol=…
+// and shared: #/ for the stream list, #/stream?agent=…&target=…&protocol=…&flow_id=…
 // for one stream, with range=24h (relative to now) or range=<from>-<to>
-// (Unix ms), and at=<Unix ms> for the selected moment.
+// (Unix ms), and at=<Unix ms> for the selected moment. A stream link without
+// protocol or flow_id (from before flows were part of a stream) opens the
+// stream it matches if there is one, else the list of those it matches.
 
-import type { StreamKey, TimeRange } from './api'
+import { streamKeyOf, type Stream, type StreamKey, type TimeRange } from './api'
 
 export const PRESETS = {
   '1h': 3_600_000,
@@ -51,6 +53,13 @@ export function resolveRange(r: Range, now: number): TimeRange {
   return r.kind === 'relative' ? { from: now - PRESETS[r.preset], to: now } : { from: r.from, to: r.to }
 }
 
+/** A flow_id as the URL gives it, if it is one (0..65535). */
+function parseFlow(s: string | null): number | undefined {
+  if (s === null || !/^\d{1,5}$/.test(s)) return undefined
+  const n = Number(s)
+  return n <= 65535 ? n : undefined
+}
+
 export function parseHash(hash: string): ViewState {
   const h = hash.replace(/^#/, '')
   const q = h.indexOf('?')
@@ -62,7 +71,10 @@ export function parseHash(hash: string): ViewState {
   if (path === '/stream' && agent && target) {
     const atRaw = params.get('at')
     const at = atRaw && /^\d{10,16}$/.test(atRaw) ? Number(atRaw) : undefined
-    return { view: 'stream', stream: { agent, target, protocol: params.get('protocol') ?? '' }, range, at }
+    const stream: StreamKey = { agent, target, protocol: params.get('protocol') ?? '' }
+    const flow = parseFlow(params.get('flow_id'))
+    if (flow !== undefined) stream.flow = flow
+    return { view: 'stream', stream, range, at }
   }
   return { view: 'streams', range }
 }
@@ -73,9 +85,15 @@ export function formatHash(s: ViewState): string {
     p.set('agent', s.stream.agent)
     p.set('target', s.stream.target)
     if (s.stream.protocol) p.set('protocol', s.stream.protocol)
+    if (s.stream.flow !== undefined) p.set('flow_id', String(s.stream.flow))
   }
   if (formatRange(s.range) !== formatRange(DEFAULT_RANGE)) p.set('range', formatRange(s.range))
   if (s.view === 'stream' && s.at !== undefined) p.set('at', String(Math.round(s.at)))
   const qs = p.toString()
   return `#/${s.view === 'stream' ? 'stream' : ''}${qs ? `?${qs}` : ''}`
+}
+
+/** The link to one row of the stream list. */
+export function streamLink(s: Stream, range: Range): string {
+  return formatHash({ view: 'stream', stream: streamKeyOf(s), range })
 }

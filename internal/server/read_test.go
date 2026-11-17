@@ -237,18 +237,20 @@ func TestReadGroupLimits(t *testing.T) {
 	}
 }
 
-// paramStore answers with rows(query, params) and records every query's
-// params.
+// paramStore answers with rows(query, params) and records every query and
+// its params.
 type paramStore struct {
 	*fakeStore
-	mu     sync.Mutex
-	params []clickhouse.Params
-	rows   func(q string, p clickhouse.Params) []string
+	mu      sync.Mutex
+	params  []clickhouse.Params
+	queries []string
+	rows    func(q string, p clickhouse.Params) []string
 }
 
 func (p *paramStore) Query(_ context.Context, q string, params clickhouse.Params, row func(json.RawMessage) error) error {
 	p.mu.Lock()
 	p.params = append(p.params, maps.Clone(params))
+	p.queries = append(p.queries, q)
 	p.mu.Unlock()
 	for _, r := range p.rows(q, params) {
 		if err := row(json.RawMessage(r)); err != nil {
@@ -457,5 +459,60 @@ func TestHostCheck(t *testing.T) {
 	open.ServeHTTP(rec, r)
 	if rec.Code != 200 {
 		t.Errorf("without allowed hosts: %d", rec.Code)
+	}
+}
+
+// A stream is (agent, target, protocol, flow_id), and every read endpoint
+// takes flow_id, so two flows of one target (IPv4 and IPv6 of a name, or two
+// ports) are read apart; without it, any flow (links and clients from
+// before). Before, flow_id was ignored and the flows' rows came back merged.
+// What the filter selects is checked against ClickHouse
+// (TestDualStackStreamsClickHouse).
+func TestReadFilterByFlow(t *testing.T) {
+	st := &paramStore{fakeStore: newFakeStore(), rows: func(string, clickhouse.Params) []string { return nil }}
+	ts := readServer(t, st, Options{})
+	const stream = "?agent=lab&target=dual.example"
+	for _, ask := range []struct{ query, flow string }{
+		{"&flow_id=33435", "33435"}, {"&protocol=icmp&flow_id=0", "0"}, {"&flow_id=65535", "65535"},
+		{"", "-1"}, {"&protocol=icmp", "-1"},
+	} {
+		for _, p := range []string{"targets", "cycles", "path-changes", "loops", "outages", "topology"} {
+			st.mu.Lock()
+			st.params, st.queries = nil, nil
+			st.mu.Unlock()
+			var body map[string]any
+			if code := getJSON(t, ts.URL+"/api/v1/query/"+p+stream+ask.query, &body); code != http.StatusOK {
+				t.Errorf("%s%s: %d %v", p, ask.query, code, body)
+				continue
+			}
+			st.mu.Lock()
+			if len(st.queries) == 0 {
+				t.Errorf("%s%s: no query", p, ask.query)
+			}
+			for i, q := range st.queries {
+				if st.params[i]["flow"] != ask.flow {
+					t.Errorf("%s%s: flow parameter %q, want %q", p, ask.query, st.params[i]["flow"], ask.flow)
+				}
+				if ask.flow != "-1" && !strings.Contains(q, "flow_id = {flow:Int32}") {
+					t.Errorf("%s%s: query does not select the flow:\n%s", p, ask.query, q)
+				}
+			}
+			st.mu.Unlock()
+		}
+	}
+	st.mu.Lock()
+	st.queries = nil
+	st.mu.Unlock()
+	for _, bad := range []string{"x", "-1", "65536", "1.5", "0x10", "33434%20"} {
+		var e errorBody
+		if code := getJSON(t, ts.URL+"/api/v1/query/cycles"+stream+"&flow_id="+bad, &e); code != http.StatusBadRequest ||
+			e.Error != "flow_id must be 0..65535" {
+			t.Errorf("flow_id=%s: %d %q", bad, code, e.Error)
+		}
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.queries) != 0 {
+		t.Errorf("%d queries for invalid flow_ids", len(st.queries))
 	}
 }
