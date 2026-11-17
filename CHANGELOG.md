@@ -64,6 +64,12 @@ The section for a version is the text of its GitHub release.
   setting takes effect when the ClickHouse container is recreated
   (`docker compose up -d`).
 
+<!-- round six: distance -->
+
+<!-- round six: tcp flows -->
+
+<!-- round six: spool volume -->
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent

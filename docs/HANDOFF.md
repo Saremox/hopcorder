@@ -3362,3 +3362,15 @@ decisions:
   - Compose: an existing ClickHouse container takes the new config when it
     is recreated (`docker compose up -d`).
 
+**Route changes**
+
+<!-- round six: distance -->
+
+**TCP flows**
+
+<!-- round six: tcp flows -->
+
+**Spool and its volume**
+
+<!-- round six: spool volume -->
+
