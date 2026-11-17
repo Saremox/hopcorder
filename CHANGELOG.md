@@ -94,7 +94,28 @@ The section for a version is the text of its GitHub release.
   `flow_id`. A connection from the port that closed less than a minute
   before the agent starts (TIME_WAIT) delays them by up to that minute.
 
-<!-- round six: spool volume -->
+- The agent's spool no longer loses its newest records when its disk
+  fills. `spool.max_bytes` counted only the stored records, and the spool
+  file is about 1.5 times that, so the agent chart's volume (1Gi, with
+  `max_bytes` 1GiB) filled first during a long outage: from then on every
+  record was lost, the oldest kept, and nothing was counted as dropped.
+  `max_bytes` now bounds the spool file itself, records and database
+  together. At the bound, and on a disk that fills before it (shared with
+  other files, or `max_bytes` larger than the disk), the oldest records are
+  dropped and counted in `hopcorder_spool_records_dropped_total`; the spool
+  keeps a little space allocated ahead of its pages for that, and grows
+  again once there is room. Acknowledgements work on a full disk too.
+  **Upgrading:** the same `max_bytes` now keeps half to two thirds as many
+  records (`hopcorder_spool_bytes` stays the records' bytes). A spool file
+  larger than `max_bytes` keeps its size, with at most `max_bytes` of it in
+  use. The agent chart sets `config.spool.max_bytes`, unless given, to 75%
+  of `persistence.size` (at most 1GiB): 768MiB for the default 1Gi volume.
+  It refuses a `max_bytes` above 90% of the volume, so a release that set
+  `max_bytes: 1GiB` with the 1Gi volume fails to upgrade until it lowers
+  or removes it (`persistence.size` applies only to new volumes). That
+  includes `helm upgrade --reuse-values` and values files copied from an
+  earlier chart, which carry its default `max_bytes: 1GiB`: add `--set
+  config.spool.max_bytes=null` (or use `--reset-then-reuse-values`).
 
 **Security: server ingest**
 

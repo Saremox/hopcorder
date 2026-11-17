@@ -522,9 +522,11 @@ added in the commit that introduced it.
   need. Layout: `meta` (next seq, byte and record counters), `records` (8-byte
   big-endian seq → 8-byte timestamp + zstd-compressed JSON, compressed per
   record), `cursors` (output name → last delivered seq). Trade-off: a bbolt
-  file never shrinks; it reuses freed pages, so disk usage tracks the high-water
-  mark of `max_bytes` (which bounds the stored compressed bytes) plus B+tree
-  overhead.
+  file never shrinks; it reuses freed pages, so disk usage tracks the
+  high-water mark of the pages in use. Since round six of the review
+  `max_bytes` bounds the file, B+tree included (see there); before, it
+  bounded the stored compressed bytes, and the file grew to about 1.5 times
+  that, which a volume as large as `max_bytes` did not hold.
 - **Spool consumers**: every shipping output (`jsonl`, `http`) is a spool
   consumer with its own cursor and drain loop, so `jsonl` is crash-safe too
   (it may repeat lines after a crash; dedup on `(agent_id, seq)`). Metrics are
@@ -923,8 +925,10 @@ added in the commit that introduced it.
   reschedule. `mode: daemonset` uses the node's name as `--agent-id` and a
   hostPath spool, so an agent keeps its identity and spool on its node.
   `hostNetwork` traces from the node's network namespace. The chart owns
-  `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`;
-  the rest of `values.config` is the agent's config file.
+  `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`,
+  and in `mode: statefulset` sets `spool.max_bytes` from `persistence.size`
+  unless it is given (round six); the rest of `values.config` is the agent's
+  config file.
 - **Tested in CI** (`helm` job, kind): the server chart with its bundled
   ClickHouse (and the read-only user), two StatefulSet agents and a
   hostNetwork DaemonSet agent tracing the server's Service over TCP; the job
@@ -3568,5 +3572,112 @@ decisions:
 
 **Spool and its volume**
 
-<!-- round six: spool volume -->
+- **`max_bytes` bounds the spool file, and a full disk drops the oldest
+  records** (`internal/spool/room.go`). The bound counted the stored
+  (compressed) record bytes, and bbolt's file is about 1.5 times that (its
+  leaves end up about two thirds full, half full with records of about a
+  quarter page: it splits no leaf of up to four elements). The agent
+  chart's volume was as large as the bound
+  (`persistence.size` 1Gi, `max_bytes` 1GiB), so an outage storing 0.65 to
+  0.7 of the volume filled it, and from then on every Append failed with
+  ENOSPC: the newest records lost, the oldest kept (the reverse of §5.2),
+  `hopcorder_spool_records_dropped_total` 0, until ingest came back. A
+  large Ack failed too: bbolt writes every change, a deletion included, to
+  newly allocated pages, and reuses the pages a transaction frees only after
+  it commits. Measured in the review: on a 2 MiB tmpfs with `max_bytes`
+  2MiB, 6,148 records lost in 40 s; on 24 MiB, 0 of 5,000 appends after it
+  filled, and none after a restart. §5.2 (locked) is kept: bounded by size
+  and age, oldest first, counted; what the size is of changed.
+  - bbolt's `MaxSize` is `max_bytes`: the file never grows past it (an
+    allocation that would fails with `ErrMaxSizeReached`). Its `AllocSize`,
+    the step it grows the file in, is the spool's reserve: a 64th of
+    `max_bytes`, at least 16 pages, at most 1 MiB (and a quarter of
+    `max_bytes`).
+  - The pages in use (the high water mark less the free and pending pages
+    bbolt counts as each write transaction ends) are kept two reserves below
+    `max_bytes`: bbolt refuses growth within one `AllocSize` of `MaxSize`,
+    and one stays allocatable, so that every transaction, those that delete
+    included, finds the pages it needs. An Append beyond that rolls back
+    (`errNoRoom`), and the oldest records go in a transaction of their own
+    (`dropOldest`: half a reserve of stored bytes, 1 to 1024 records;
+    undelivered ones counted as dropped), then it runs again. Concurrent
+    appends re-check in the drop's transaction, so one drop serves all. At
+    the bound that is one more commit per half reserve of records (with 1
+    GiB, about every 1,000 records of 500 bytes).
+  - A full file system: as transactions begin, the spool allocates a
+    reserve ahead of the high water mark (Linux `fallocate`, mode 0: up to
+    two reserves ahead, never past `max_bytes`). When the file system cannot
+    give it (ENOSPC, EDQUOT, EFBIG), the spool keeps to the file it has: the
+    allocated size becomes the bound, the reserve allocated while there was
+    room carries the transactions that drop records, and once a minute it
+    tries to allocate again and, given room, may grow to `max_bytes` again.
+    Without `fallocate` (another OS, or a file system that refuses it) the
+    first failed commit marks the disk full at the high water mark; the
+    drops then use the pages the last commits freed, and a minute later the
+    file may try to grow again.
+  - Any operation that still finds no room (`errNoRoom`, `ErrMaxSizeReached`,
+    ENOSPC, EDQUOT or EFBIG, also in bbolt's "file resize error" text, which
+    it formats with `%s`) drops the oldest records and runs again, 16 times
+    at most; other errors (EIO) drop nothing. Deleting delivered records and
+    the age bound also take at most 1024 records a transaction: Ack deletes
+    the rest in transactions of its own (if those fail, the next Ack or
+    start does), open (`settle`) too, and brings a file whose pages in use
+    exceed the bound under it. A transaction with nothing to delete rolls
+    back: an empty commit rewrites the freelist, and changed the damage
+    corpus's layout.
+  - A file larger than `max_bytes` (an earlier version's, or a lower
+    setting) keeps its size: bbolt's `MaxSize` is then its high water mark
+    plus two reserves, and at most `max_bytes` of it is in use.
+    `spool.Open` refuses a `MaxBytes` below 1 MiB (the config did already).
+    An Append's encode may run more than once, with the same seq.
+  - `hopcorder_spool_bytes` is still the stored record bytes, now half to
+    two thirds of `max_bytes` at the bound; the dropped counter's help says
+    it counts drops for room on a full disk too.
+  - Chart: `persistence.size` stays 1Gi: a StatefulSet's
+    `volumeClaimTemplates` cannot change, so a new default would fail every
+    upgrade. `config.spool.max_bytes`, unset, is 75% of the volume, at most
+    1GiB (768MiB by default); set, the chart refuses more than 90% of it,
+    less than 1MiB, and sizes it cannot read. Upgrading: a release that kept
+    the default gets 768MiB instead of 1GiB (a spool file already larger
+    keeps its size, at most 768 MiB of it in use); one that set
+    `max_bytes: 1GiB` with the 1Gi volume is refused with that message. So
+    is an upgrade that carries the earlier chart's values, whose default
+    was `max_bytes: 1GiB` (`helm upgrade --reuse-values`, which replaces the
+    new chart's defaults with the old ones, or a copied values file): the
+    message names `--set config.spool.max_bytes=null` and
+    `--reset-then-reuse-values`, and the helm job checks both. Refusing is
+    kept over taking the value: the spool now survives a full disk, but a
+    bound the volume cannot hold is a configuration error to see. The
+    DaemonSet's spool is on the node's disk: no check, the agent's default.
+  - Tests: TestSizeBoundIsTheFile (a 1 MiB bound, 2 MB appended, nothing
+    acknowledged: every append succeeds, the newest kept, the rest counted,
+    the file within 1 MiB; before, the file was 2 MiB with 1.65 MB in use),
+    TestLowerMaxBytes (a 4 MiB spool reopened with 1 MiB; before, 1.66 MB in
+    use), TestFullFileSystem (a child process with RLIMIT_FSIZE at 2 MiB,
+    which fails writes, `fallocate` and truncate with EFBIG as a full disk
+    fails them with ENOSPC, under a 16 MiB bound, with and without
+    `fallocate`: an outage of 2.6 MB, one Ack of everything, appends, a
+    restart, and growth past 2 MiB once the limit is raised; before, append
+    995 of 2000 failed, "file too large", none dropped), TestFullTmpfs (root
+    only, in CI's `rawsock` job: a 4 MiB tmpfs that another file fills while
+    the spool grows; before, the first append after failed with ENOSPC), and
+    the helm job (the default 768MiB, where the previous chart rendered
+    1GiB, 1024MiB for 10Gi, the refusals). The
+    damage corpus is built as before (`buildSpool` keeps the bytes bbolt
+    alone wrote, not the space allocated ahead): the 64 cases' outcomes are
+    the ones before, compared case by case.
+  - Accepted: on a copy-on-write file system (btrfs, ZFS) allocated space
+    does not guarantee an overwrite, so a completely full one may still fail
+    every commit. Without `fallocate`, a completely full disk and no free
+    pages in the file would do the same (not seen in the tests). Drops come
+    in chunks, up to half a reserve (512 KiB) of records more than one for
+    one. A quarantined file (`spool.db.corrupt-*`) stays on the volume: the
+    new spool keeps to what is left, as on any full disk, until it is
+    deleted.
+  - Not changed: round five's medium (after a backlog, bbolt rewrites a
+    large freelist on every commit). `NoFreelistSync` would end it, but then
+    `bolt.Open` rebuilds the freelist with a walk whose errors panic in a
+    goroutine of bbolt's own (fatal, never quarantined) unless `checkPages`
+    first checked everything that walk does (branch key order among it).
+    Left for the owner.
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,24 +180,148 @@ func TestConsumerChanges(t *testing.T) {
 	}
 }
 
-func TestSizeBoundDropsOldest(t *testing.T) {
-	s, err := Open(Options{Dir: t.TempDir(), MaxAge: time.Hour, MaxBytes: 1000, Consumers: []string{"c"}})
+// noisePool holds random bytes for noise.
+var noisePool = sync.OnceValue(func() []byte {
+	r := rand.New(rand.NewPCG(1, 11)) //nolint:gosec // test data
+	b := make([]byte, 1<<20)
+	for i := range b {
+		b[i] = byte(r.Uint32())
+	}
+	return b
+})
+
+// noise is record i's data, size bytes that do not compress: stored, a
+// record takes about size bytes, as a real one of that compressed size.
+func noise(i, size int) []byte {
+	pool := noisePool()
+	off := i * 4099 % (len(pool) - size)
+	return pool[off : off+size]
+}
+
+// appendNoise appends n records of noise of size bytes; every append must
+// succeed.
+func appendNoise(t testing.TB, s *Spool, n, size int) {
+	t.Helper()
+	for i := range n {
+		if _, err := s.Append(time.Now(), func(uint64) ([]byte, error) { return noise(i, size), nil }); err != nil {
+			t.Fatalf("append %d of %d: %v (stats %+v)", i+1, n, err, s.Stats())
+		}
+	}
+}
+
+// checkNewestKept checks that s holds its newest records, all unread by
+// consumer, and if first is not 0, that every record since seq first that
+// it does not hold counts as dropped.
+func checkNewestKept(t testing.TB, s *Spool, consumer string, first uint64) Stats {
+	t.Helper()
+	st := s.Stats()
+	if st.Records == 0 || first != 0 && st.Dropped != st.LastSeq-first-uint64(st.Records) {
+		t.Fatalf("stats %+v: want every record not kept counted as dropped (%d appended)", st, st.LastSeq-first)
+	}
+	es, err := s.Read(consumer, int(st.Records)+1, 1<<30)
+	if err != nil || len(es) != int(st.Records) || es[0].Seq != st.LastSeq-uint64(st.Records)+1 || es[len(es)-1].Seq != st.LastSeq {
+		var from, to uint64
+		if len(es) > 0 {
+			from, to = es[0].Seq, es[len(es)-1].Seq
+		}
+		t.Fatalf("kept %d records, seqs %d..%d (%v); want the newest %d, up to %d", len(es), from, to, err, st.Records, st.LastSeq)
+	}
+	return st
+}
+
+// usedBytes is what the bound counts: the file's pages in use.
+func usedBytes(t testing.TB, s *Spool) int64 {
+	t.Helper()
+	var used int64
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		st := s.db.Stats()
+		used = tx.Size() - int64(st.FreePageN+st.PendingPageN)*int64(s.db.Info().PageSize)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return used
+}
+
+// The size bound is on the database file (review, round six). With
+// MaxBytes 1 MiB and nothing acknowledged, 2 MB of records are appended:
+// every append succeeds, the file stays within 1 MiB, the newest records
+// are kept and every other one counts as dropped. Before, the bound counted
+// the stored record bytes only, and the file grew to about 1.5 times it
+// (a volume as large as the bound filled first): bbolt fills its leaves
+// to about two thirds with records of this size, and to half with records
+// of a quarter page (it splits no leaf of up to 4 elements).
+func TestSizeBoundIsTheFile(t *testing.T) {
+	dir := t.TempDir()
+	const maxBytes = MinMaxBytes
+	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: maxBytes, Consumers: []string{"c"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	base := s.Stats().LastSeq
-	appendN(t, s, 50)
+	first := s.Stats().LastSeq
+	appendNoise(t, s, 1500, 1300)
+	st := checkNewestKept(t, s, "c", first)
+	fi, err := os.Stat(filepath.Join(dir, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("file %d bytes, %d in use, %d records of %d bytes stored, %d dropped", fi.Size(), usedBytes(t, s), st.Records, st.Bytes, st.Dropped)
+	if fi.Size() > maxBytes {
+		t.Errorf("file %d bytes, over the bound of %d", fi.Size(), maxBytes)
+	}
+	if st.Bytes < maxBytes*2/5 {
+		t.Errorf("%d bytes of records stored: the bound is not used", st.Bytes)
+	}
+}
+
+// A file larger than MaxBytes (an earlier version's, or a lower
+// max_bytes) keeps its size, and the spool keeps no more than MaxBytes of
+// it in use: dropped at open, oldest first, counted.
+func TestLowerMaxBytes(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 4 << 20, Consumers: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := s.Stats().LastSeq
+	appendNoise(t, s, 1700, 1300)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(dir, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Stats().Dropped != 0 {
+		t.Fatalf("dropped under the larger bound: %+v", s.Stats())
+	}
+	const maxBytes = MinMaxBytes
+	s, err = Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: maxBytes, Consumers: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if used := usedBytes(t, s); used > maxBytes {
+		t.Errorf("%d bytes in use after opening with a bound of %d", used, maxBytes)
+	}
+	if s.Stats().Dropped == 0 {
+		t.Error("nothing counted as dropped")
+	}
+	appendNoise(t, s, 300, 1300)
+	if used := usedBytes(t, s); used > maxBytes {
+		t.Errorf("%d bytes in use, bound %d", used, maxBytes)
+	}
 	st := s.Stats()
-	if st.Bytes > 1000 || st.Records == 0 || st.Records >= 50 {
-		t.Fatalf("stats %+v", st)
+	if es, err := s.Read("c", 1, 1<<20); err != nil || es[0].Seq != st.LastSeq-uint64(st.Records)+1 || st.LastSeq != first+2000 {
+		t.Errorf("oldest kept %v (%v), stats %+v", seqsOf(es), err, st)
 	}
-	if st.Dropped != uint64(50-st.Records) {
-		t.Errorf("dropped %d, want %d", st.Dropped, 50-st.Records)
+	after, err := os.Stat(filepath.Join(dir, fileName))
+	if err != nil {
+		t.Fatal(err)
 	}
-	es, _ := s.Read("c", 100, 1<<20)
-	if es[len(es)-1].Seq != base+50 || es[0].Seq != base+uint64(51-st.Records) {
-		t.Errorf("kept %v; the newest must survive", seqsOf(es))
+	if after.Size() > before.Size() {
+		t.Errorf("the file grew from %d to %d bytes", before.Size(), after.Size())
 	}
 }
 
@@ -232,17 +357,31 @@ func TestAgeBoundDropsOldest(t *testing.T) {
 }
 
 func TestDeliveredRecordsAreNotCountedAsDropped(t *testing.T) {
-	s, err := Open(Options{Dir: t.TempDir(), MaxAge: time.Hour, MaxBytes: 1000, Consumers: []string{"a", "b"}})
+	s, err := Open(Options{Dir: t.TempDir(), MaxAge: time.Hour, MaxBytes: MinMaxBytes, Consumers: []string{"a", "b"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	appendN(t, s, 5)
-	_ = s.Ack("a", 5) // b lags; records stay but are delivered to a
-	appendN(t, s, 50)
+	first := s.Stats().LastSeq
+	appendNoise(t, s, 100, 1300)
+	if err := s.Ack("a", first+50); err != nil { // b lags; records stay but are delivered to a
+		t.Fatal(err)
+	}
+	appendNoise(t, s, 1000, 1300)
 	// Every dropped record was undelivered by b, so all count.
-	if st := s.Stats(); st.Dropped != uint64(55-st.Records) {
+	if st := s.Stats(); st.Dropped == 0 || st.Dropped != 1100-uint64(st.Records) {
 		t.Errorf("stats %+v", st)
+	}
+	// Records every consumer delivered are deleted, not dropped.
+	st := s.Stats()
+	for _, c := range []string{"a", "b"} {
+		if err := s.Ack(c, st.LastSeq-10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendNoise(t, s, 5, 1300)
+	if got := s.Stats(); got.Dropped != st.Dropped || got.Records != 15 {
+		t.Errorf("after delivery: stats %+v, before %+v", got, st)
 	}
 }
 

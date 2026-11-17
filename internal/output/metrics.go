@@ -125,13 +125,13 @@ func NewMetrics(o MetricsOptions) *Metrics {
 	if sp := o.Spool; sp != nil {
 		r.MustRegister(
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-				Name: "hopcorder_spool_bytes", Help: "Compressed record bytes held in the spool.",
+				Name: "hopcorder_spool_bytes", Help: "Compressed record bytes held in the spool (its file, bounded by spool.max_bytes, also holds their B+tree).",
 			}, func() float64 { return float64(sp.Stats().Bytes) }),
 			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 				Name: "hopcorder_spool_records", Help: "Records held in the spool.",
 			}, func() float64 { return float64(sp.Stats().Records) }),
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
-				Name: "hopcorder_spool_records_dropped_total", Help: "Undelivered records dropped by the spool's age or size bound.",
+				Name: "hopcorder_spool_records_dropped_total", Help: "Undelivered records dropped by the spool's age or size bound, or for room on a full file system.",
 			}, func() float64 { return float64(sp.Stats().Dropped) }),
 		)
 		for _, name := range o.Outputs {

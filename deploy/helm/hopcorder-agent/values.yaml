@@ -66,7 +66,13 @@ config:
     format: json
   spool:
     max_age: 168h
-    max_bytes: 1GiB
+    # max_bytes bounds the spool file on disk (all of it: the records take
+    # half to two thirds). With mode: statefulset it must fit the volume:
+    # unset, it is 75% of persistence.size, at most 1GiB (768MiB for the
+    # default 1Gi); set, at most 90% of persistence.size, or the chart
+    # refuses it (the file system needs the rest). With mode: daemonset,
+    # unset, the agent's default (1GiB) on the node's disk.
+    # max_bytes: 768MiB
   targets: []                 # required, e.g. [{host: example.net}, {host: 192.0.2.10, protocol: tcp, port: 443}]
 
 metrics:
@@ -103,7 +109,11 @@ networkPolicy:
   enabled: false
   from: []
 
-# mode: statefulset - the spool volume of each agent.
+# mode: statefulset - the spool volume of each agent. config.spool.max_bytes
+# follows it (see there). A StatefulSet's volumes cannot be resized through
+# it: a new size applies to new volumes (after deleting the StatefulSet
+# with --cascade=orphan, or a new release), so for more spool on existing
+# volumes expand the PVCs themselves and set max_bytes.
 persistence:
   size: 1Gi
   storageClass: ""

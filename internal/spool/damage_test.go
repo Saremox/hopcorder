@@ -121,7 +121,16 @@ func buildSpool(t *testing.T) pageView {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return view(b)
+	// The file as bbolt alone grew it (the least power of two from 32 KiB
+	// that holds the high water mark and one page more), without the space
+	// the spool allocates ahead since round six: the corpus damages the
+	// bytes it did before.
+	v := view(b)
+	n := 32 << 10
+	for n < int(v.meta().hwm+1)*v.ps {
+		n *= 2
+	}
+	return view(b[:n])
 }
 
 // view returns b's pages, with the page size its first meta page states.

@@ -205,8 +205,10 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   generated Secret. Whoever can query Grafana's data source can still crash
   ClickHouse (see [Dashboards](#dashboards)): give only trusted users access to it.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
-  after their pods, each with its own spool volume; `mode: daemonset` runs one
-  agent per node, named after the node, with its spool on the node.
+  after their pods, each with its own spool volume (`persistence.size`, 1Gi;
+  `config.spool.max_bytes` is 75% of it unless set, at most 1GiB, and the
+  chart refuses more than 90%); `mode: daemonset` runs one agent per node,
+  named after the node, with its spool on the node.
   `hostNetwork: true` traces from the node's network. The pods run as root
   with `NET_RAW`, which Pod Security `baseline` does not allow: give the
   agent a namespace of its own at the `privileged` level. Credentials for the
@@ -465,7 +467,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `log.format` | `text` | `--log-format` | `text` or `json` (to stderr) |
 | `spool.dir` | — | `--spool-dir` | Spool directory (required unless `--once`) |
 | `spool.max_age` | `168h` | | Oldest record kept |
-| `spool.max_bytes` | `1GiB` | | Stored (compressed) record bytes kept |
+| `spool.max_bytes` | `1GiB` | | Size of the spool file on disk, records and database overhead (at least `1MiB`) |
 
 **Targets** (`targets:` list): `host` (name or address, required), and
 overrides `protocol`, `port` (destination port: default 33434 for UDP, 443
@@ -518,8 +520,8 @@ hop addresses.
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
 | `hopcorder_output_abandoned_total` | output | Deliveries still blocked when a configuration stopped (reload or shutdown), left behind; their records stay spooled |
-| `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
-| `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
+| `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents (`hopcorder_spool_bytes`: the compressed records, half to two thirds of the file) |
+| `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds, or for room on a full disk |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
 | `hopcorder_probe_mismatched_replies_total` | | Replies matching an in-flight probe's id but not its IPv4 ID, nonce or TCP sequence number, dropped: answers to another process's packets, forgeries, or a middlebox rewrites IP IDs (hops beyond it then stay silent) |
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
@@ -602,8 +604,16 @@ groups:
 - **DNS**: names are re-resolved in the background every `dns_ttl`; if that
   fails the last address keeps being used. Address changes are logged and every
   record carries `target_ip`.
-- **Spool disk use** tracks the high-water mark of `max_bytes` plus database
-  overhead; the file reuses free space but does not shrink.
+- **Spool disk use** is bounded by `max_bytes`: the spool file, records and
+  database overhead together, grows to it and no further (the records take
+  half to two thirds, depending on their size), allocating a little ahead of
+  its pages (up to 2 MiB); it
+  reuses free space but does not shrink. At the bound the oldest records are
+  dropped and counted. On a disk that fills before that (shared with other
+  files, or `max_bytes` larger than the disk), the spool keeps to the file it
+  has, again dropping the oldest records first, and grows again once there is
+  room. A file larger than `max_bytes` (from an earlier version, or a lower
+  setting) keeps its size, with at most `max_bytes` of it in use.
 - **A corrupt spool file** (its page structure or consistency check fails at
   start, or bbolt faults or panics on it while the agent runs) is renamed to
   `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from
