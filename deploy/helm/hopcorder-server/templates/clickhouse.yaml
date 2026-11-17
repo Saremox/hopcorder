@@ -71,7 +71,9 @@ data:
   # one of them a query wrote temporary data to the data volume until it
   # was full), the limits with MIN 1 (0 means "unlimited"). No hyperscan:
   # its compiled patterns stay in a global cache outside every memory
-  # limit (ten queries OOM-killed ClickHouse).
+  # limit (ten queries OOM-killed ClickHouse). Its time-zone tables stay in
+  # one too, and nothing here can stop that: the user's queries can still
+  # OOM-kill ClickHouse, so only trusted users may have it.
   readonly.xml: |
     <clickhouse>
         <profiles>

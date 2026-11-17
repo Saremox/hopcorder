@@ -12,8 +12,12 @@
 # redirects other host names to it), so a web page cannot reach them through
 # DNS rebinding. ClickHouse is not published at all (`docker compose exec
 # clickhouse clickhouse-client` to query it), and Grafana reads it with a
-# read-only user whose queries are bounded in time and memory. The other
-# passwords below are fixed: this is not a production setup (see README.md).
+# read-only user whose queries are bounded in time and memory. That user does
+# not keep ClickHouse up: anyone who can open Grafana, anonymous viewers
+# included, can crash it with a query (compose/clickhouse-init.sql). Keep
+# Grafana on localhost, or turn anonymous access off before you publish it.
+# The other passwords below are fixed: this is not a production setup (see
+# README.md).
 name: hopcorder
 
 services:
@@ -71,6 +75,9 @@ services:
     image: grafana/grafana:13.3.1
     environment:
       GF_PLUGINS_PREINSTALL_SYNC: grafana-clickhouse-datasource@4.23.5
+      # Anonymous viewers can send ClickHouse any SQL the read-only user
+      # allows, enough to crash it (compose/clickhouse-init.sql): fine on
+      # localhost, not on a published port.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       # Requests for any other host name are redirected to localhost, so a

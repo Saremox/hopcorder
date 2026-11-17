@@ -63,6 +63,19 @@ The section for a version is the text of its GitHub release.
   the data volume ran out of inodes and ingest failed. Compose users: the
   setting takes effect when the ClickHouse container is recreated
   (`docker compose up -d`).
+- Docs: Grafana's read-only ClickHouse user protects the data, not
+  ClickHouse's availability. Every time zone a query names makes ClickHouse
+  keep a table of about 5 MiB for good, outside every memory limit, and no
+  setting or grant prevents it: a viewer's queries OOM-killed a ClickHouse
+  of 2 GiB within seconds. Give only trusted users access to Grafana's
+  ClickHouse data source; the compose try-out's anonymous viewers are for
+  localhost only.
+
+<!-- round six: distance -->
+
+<!-- round six: tcp flows -->
+
+<!-- round six: spool volume -->
 
 **Security: server ingest**
 
