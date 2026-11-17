@@ -29,6 +29,16 @@ The section for a version is the text of its GitHub release.
 
 **Security: CI, release and deployment**
 
+- Releases carry signed build provenance: every file and both images (by
+  digest) are attested by the release job, and the notes list the image
+  digests with the `gh attestation verify` commands. The `release`
+  environment only gates the repository's own release job; anyone with
+  write access can still replace a release's images and files with a
+  workflow of their own, and the attestations are how to tell. The
+  repository settings that limit it (a tag ruleset for `v*`, immutable
+  releases) are listed in `docs/HANDOFF.md`.
+- The release job checks, once the release exists, that its tag still
+  names the commit it built, and deletes the release again if not.
 - systemd: the server can take its socket from systemd
   (`deploy/hopcorder-server.socket` with `listen: systemd`), a unix socket
   that only the reverse proxy's group may open. On `127.0.0.1:8080` every

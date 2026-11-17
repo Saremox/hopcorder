@@ -9,7 +9,9 @@
 # - the ci workflow succeeded on that commit, on main or run by hand
 #   (--wait-for-ci waits up to 25 minutes for a run still in progress);
 # - no release (draft or published) of that tag exists: a version is
-#   released once;
+#   released once (GitHub lists drafts only to tokens with push access, so
+#   verify-tag's run, with contents: read, sees published releases only;
+#   publish's run, with contents: write, sees drafts too);
 # - the latest release is older: its commit is an ancestor of this one and
 #   its version lower, so neither an old commit nor a lower version can take
 #   :latest.

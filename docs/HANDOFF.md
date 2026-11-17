@@ -831,7 +831,9 @@ added in the commit that introduced it.
   as the notes (it fails without one), using
   `scripts/release-build.sh` with go.mod's toolchain. On pull requests and
   `main` that is a dry run; for a tag the files go to `publish`, which
-  creates the GitHub release from them. The binaries and images carry the
+  attests them and both image digests and creates the GitHub release from
+  them, the notes followed by the digests and how to verify them (round
+  three). The binaries and images carry the
   version (`hopcorder version` prints `v<version>`).
 - **Server chart**: always one replica with the `Recreate` strategy. The
   server keeps each stream's path tracker and open outage in memory
@@ -1017,7 +1019,9 @@ fixes. The decisions:
   environment variable.
 - **Releases**: a `v*` tag is checked by `scripts/release-verify.sh` (see
   round two) before anything is built, and published only by the `publish`
-  job in the `release` environment. The release build is
+  job in the `release` environment (as far as this workflow goes: round
+  three found that any workflow with write tokens can publish). The release
+  build is
   `scripts/release-build.sh`, shared with the dry run.
 - **When workflows run**: `ci` runs on pull requests, on main and by hand,
   not on every branch push (a pull request's branch ran everything twice,
@@ -1303,6 +1307,10 @@ decisions:
     tags, so two approved tags cannot both pass the checks.
   - A version is released once. To fix a release, release the next version
     (or delete the release, and its tag, by hand).
+  - (Round three: this holds for `images.yml` only. The environment gates
+    that one job, not the packages and releases, which take `GITHUB_TOKEN`
+    from any workflow of the repository; anyone with write access can
+    still publish with a workflow of their own. See round three.)
 - **One Go release for binaries and images.**
   - `go.mod` has `toolchain go1.27.4`. The release binaries and CI used to
     build with Go 1.27.0, because setup-go installs the version from the
@@ -1391,13 +1399,17 @@ decisions:
   image, not `:main`, which is built with the shared Actions cache. Chart
   version and appVersion in `Chart.yaml` are 0.1.1, so installs from a
   checkout run 0.1.1 images too.
-- **Still to do in the repository settings**:
+- **Still to do in the repository settings** (superseded by round three's
+  list, which makes immutable releases and the tag ruleset required: the
+  `release` environment alone gates nothing for a collaborator):
   - Add required reviewers to the `release` environment; until then
-    `publish` runs without approval, though after all the checks.
+    `publish` runs without approval, though after all the checks. (Wrong
+    as a gate, round three found: with reviewers too, a collaborator's own
+    workflow publishes without `publish`.)
   - Restrict it to `v*` tags (deployment tag policy).
   - Enforce the main ruleset with `ci` as a required check.
   - Add a tag ruleset for `v*`.
-  - Optionally turn on immutable releases.
+  - Optionally turn on immutable releases (required since round three).
 
 **Agent**
 - **Corrupt spool files are read in full before bbolt's check.** The
@@ -1540,6 +1552,79 @@ high-severity issue. Four fixes followed. The decisions:
 
 **CI, release and deployment**
 
+- **The `release` environment gates the `publish` job, not publishing.**
+  `publish` has no credential of its own: it uses `GITHUB_TOKEN`, and a
+  workflow file pushed to any branch (or in a same-repository pull request)
+  can ask for `packages: write` and `contents: write` and leave out
+  `environment:`. ghcr grants writes per repository, not per workflow or
+  environment, and release assets take any token with `contents: write`.
+  So a collaborator, or a stolen token of theirs with the `workflow` scope,
+  can overwrite `:<version>`, `:<major>.<minor>`, `:latest`, the charts and
+  the release files (`gh release upload --clobber`), with all of round
+  two's settings applied. Round two's "until then publish runs without
+  approval" read as if reviewers closed this; they do not. What the code
+  does now:
+  - **Build provenance attestations** (`actions/attest` v4.2.2, pinned by
+    commit; the action that `attest-build-provenance` v4 wraps, which its
+    README recommends for new workflows). `id-token: write` and
+    `attestations: write` are on `publish` only. It attests every file in
+    `dist/` (archives, chart packages, `SHA256SUMS`) and both image digests
+    (the multi-arch indexes, by `subject-digest`) before it publishes
+    anything. The attestations live in GitHub's attestation store; they are
+    not pushed to ghcr, since `gh attestation verify oci://…` fetches them
+    from GitHub by digest, and so no `artifact-metadata` permission or
+    storage records are needed.
+  - The Sigstore certificate names the workflow file, the ref
+    (`refs/tags/vX.Y.Z`) and the commit. A collaborator's own workflow can
+    attest too, but its certificate names its own file or a branch, and
+    with the tag ruleset (below) a run for a `v*` tag means a maintainer
+    pushed the tag. So `gh attestation verify … --signer-workflow
+    Saremox/hopcorder/.github/workflows/images.yml --source-ref
+    refs/tags/vX.Y.Z` tells a replaced file or image from a released one.
+    It detects replacement, it does not prevent it, and helps only users
+    who verify.
+  - **Digests in the release notes**: `scripts/release-notes.sh` appends
+    the commit, both image digests and the verify commands to the
+    CHANGELOG section. Every dry run runs it with made-up digests. `publish`
+    also checks that each tag it sets names the attested digest
+    (`imagetools create` with one source copies the index as it is). The
+    notes are a convenience; the attestations are the proof.
+  - Charts: `helm pull`, `gh attestation verify` on the `.tgz` (an OCI
+    chart's content layer is that file), then install from the file.
+    `--set image.tag=X.Y.Z@sha256:…` pins the image in both charts without
+    a template change.
+  - **No environment-only credential.** Considered: an environment secret
+    (a bot's classic PAT, as ghcr takes nothing finer) with a fallback to
+    `GITHUB_TOKEN`. It only helps once no other workflow can write the
+    packages, that is with this repository's Actions access on them set to
+    Read. But the `image` job pushes `:main` and `:sha-…` to the same
+    packages with `GITHUB_TOKEN`, so that would break main's images, and
+    keeping them would take a separate package for main. Release files are
+    protected by immutable releases, not by a credential. Left to the
+    owner; not implemented.
+  - Accepted: whoever can push a workflow file can publish something. The
+    defence is detection plus the repository settings.
+- **The tag is checked again once the release exists.** A release belongs
+  to a tag name, and GitHub ignores `--target` (`target_commitish`) for a
+  tag that exists, so `--target` would not pin the commit. checkout v7.0.1
+  fails if the tag moved before the job checked out, but `publish` creates
+  the release about a minute later. Now it resolves the tag through the API
+  after creating the release, peeling an annotated tag. Unless the tag
+  names `$GITHUB_SHA`, it deletes the release (the tag stays) and fails; an
+  API error counts as a mismatch. With immutable releases the tag cannot
+  move once the release exists, so the check is final. Without them it can
+  move later anyway, which only the tag ruleset prevents. The images,
+  charts and files stay: they were built and attested from this commit.
+- **verify-tag does not see drafts.** GitHub lists draft releases only to
+  tokens with push access, and verify-tag's has `contents: read`. `publish`
+  (`contents: write`) runs the same check and sees them, so "no release of
+  the tag, drafts included" still holds before anything is published.
+  Noted in `release-verify.sh`.
+- **The `image` job has `packages: write`.** README said a tag's images
+  were built "without write tokens"; corrected. The job pushes
+  `:sha-<full commit>` for a tag and `:main`/`:sha-<short>` for main, so it
+  keeps the permission. The Dockerfile's `RUN` steps cannot see the token,
+  only the job's actions can.
 - **The server can listen on a unix socket, its own or systemd's.** On a
   systemd host the docs put the server on 127.0.0.1 behind the reverse
   proxy, but every local user reached that port without the proxy's
@@ -1646,3 +1731,27 @@ high-severity issue. Four fixes followed. The decisions:
     (ci, `release-build.sh`) read only the `toolchain` line.
   - Only a tag ruleset (a repository setting) keeps stray `v*` tags out;
     nothing in the repository's files can.
+- **Still to do in the repository settings** (the owner; replaces round
+  two's list):
+  - A tag ruleset for `refs/tags/v*` restricting creation, update and
+    deletion, with only the maintainers (the admin role) as bypass, not
+    GitHub Actions or an app. It keeps stray tags out of the Go module proxy
+    and the release workflow, and makes `--source-ref refs/tags/v…` mean a
+    maintainer's tag.
+  - Immutable releases: a published release's files and tag can no longer
+    change (and `gh release verify` / `gh release verify-asset` check
+    GitHub's attestation of the release).
+  - Required reviewers on the `release` environment, and its deployment
+    tag policy limited to `v*`. That gates `images.yml`'s publishing
+    against mistakes and a stray tag run, not against collaborators.
+  - The ghcr packages (`hopcorder-agent`, `hopcorder-server`,
+    `charts/hopcorder-server`, `charts/hopcorder-agent`): under Manage
+    Actions access, only this repository, with no other repository granted
+    write. Read for this repository needs main's images moved first (see
+    the first bullet).
+  - Enforce the main ruleset with `ci` as a required check (from round
+    two).
+  - Give write access only to people you would let release.
+  - Artifact attestations need a public repository (or GitHub Enterprise
+    Cloud): if the repository is private, `publish` fails at the first
+    attest step, before it publishes anything.
