@@ -118,7 +118,6 @@ The section for a version is the text of its GitHub release.
   with an error in the log and `hopcorder_flow_in_use` at 1, and they
   resume by themselves once the identifier is free. Every other target is
   probed. `--once` prints the other targets' records and exits 1.
-
 - A metrics `path` the endpoint could not serve (`/metrics x`, `/{x`,
   `/a{b}` and the like) passed validation and then panicked the agent at
   start, or on the reload that brought it: exit 2, and again on every
