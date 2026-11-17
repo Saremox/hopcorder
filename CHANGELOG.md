@@ -2,6 +2,35 @@
 
 The section for a version is the text of its GitHub release.
 
+## Unreleased
+
+**Added**
+
+- The server chart can run a single ClickHouse pod next to the server
+  (`clickhouse.deploy.enabled`, opt-in): the official image, a persistent
+  volume, a generated password kept across upgrades, an optional read-only
+  user for Grafana, and a NetworkPolicy. No operator.
+
+**Fixed**
+
+- UI: a click on the timeline while it reloads no longer throws.
+
+**Security: server ingest**
+
+<!-- round three: ingest -->
+
+**Security: read side and Grafana**
+
+<!-- round three: read side -->
+
+**Security: agent**
+
+<!-- round three: agent -->
+
+**Security: CI, release and deployment**
+
+<!-- round three: deployment -->
+
 ## v0.1.1
 
 The first published release. v0.1.0 was withdrawn: its tag and release are

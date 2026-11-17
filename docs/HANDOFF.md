@@ -1517,3 +1517,25 @@ decisions:
   - It also runs the review's PoC, given the exact id of the silent TTL 2:
     the PoC can no longer plant a hop there or end the path there. It
     could with the check disabled.
+
+### Security review, round three
+
+A third review of the whole code base (the same four areas, every finding
+reproduced, ClickHouse-dependent ones against ClickHouse 25.8) found no
+high-severity issue. Four fixes followed. The decisions:
+
+**Ingest and storage**
+
+<!-- round three: ingest -->
+
+**Read side, enrichment and the browser**
+
+<!-- round three: read side -->
+
+**Agent**
+
+<!-- round three: agent -->
+
+**CI, release and deployment**
+
+<!-- round three: deployment -->
