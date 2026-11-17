@@ -36,6 +36,7 @@ type fakeStore struct {
 	rows    map[string][]map[string]any
 	fail    map[string]int // table -> inserts still to fail
 	queries []string
+	execs   []string                // statements run with Exec (it has no views to fill in)
 	answer  func(q string) []string // optional canned answers for read-API queries
 }
 
@@ -60,6 +61,13 @@ func (f *fakeStore) InsertJSON(_ context.Context, table string, rows [][]byte) e
 	return nil
 }
 
+func (f *fakeStore) Exec(_ context.Context, q string, _ clickhouse.Params) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.execs = append(f.execs, q)
+	return nil
+}
+
 func num(v any) uint64 { f, _ := v.(float64); return uint64(f) }
 
 func (f *fakeStore) stream(m map[string]any, p clickhouse.Params) bool {
@@ -75,12 +83,23 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 	switch {
 	case strings.Contains(q, "FROM agent_seq"):
 		var m uint64
-		for _, c := range f.rows["cycles"] {
+		for _, c := range f.rows["agent_seq"] {
 			if c["agent_id"] == p["agent"] {
-				m = max(m, num(c["seq"]))
+				m = max(m, num(c["max_seq"]))
 			}
 		}
 		out = []string{fmt.Sprintf(`{"m":%d}`, m)}
+	case strings.Contains(q, "SELECT DISTINCT seq FROM cycles"): // findStored
+		lo, _ := strconv.ParseUint(p["lo"], 10, 64)
+		hi, _ := strconv.ParseUint(p["hi"], 10, 64)
+		seen := map[uint64]bool{}
+		for _, c := range f.rows["cycles"] {
+			s, ts := num(c["seq"]), c["ts"].(string)
+			if c["agent_id"] == p["agent"] && s >= lo && s <= hi && ts >= p["from"] && ts <= p["to"] && !seen[s] {
+				seen[s] = true
+				out = append(out, fmt.Sprintf(`{"seq":%d}`, s))
+			}
+		}
 	case strings.Contains(q, "SELECT count() AS n FROM cycles"):
 		start, _ := strconv.ParseUint(p["start"], 10, 64)
 		n := 0
@@ -113,8 +132,10 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 			}
 		}
 		var best map[string]any
+		after, _ := strconv.ParseUint(p["after"], 10, 64)
 		for _, o := range latest {
-			if o["end_ts"] == nil && num(o["start_seq"]) < before && (best == nil || num(o["start_seq"]) > num(best["start_seq"])) {
+			if o["end_ts"] == nil && num(o["start_seq"]) < before && num(o["start_seq"]) > after &&
+				(best == nil || num(o["start_seq"]) > num(best["start_seq"])) {
 				best = o
 			}
 		}

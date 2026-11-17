@@ -190,3 +190,32 @@ func TestQuerySettings(t *testing.T) {
 		t.Errorf("statement settings %v", e)
 	}
 }
+
+// Inserts and statements carry the write settings of their context (the
+// ingester names its writes with a query_id to stop them by); queries do
+// not.
+func TestWriteSettings(t *testing.T) {
+	var got []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Query())
+	}))
+	defer srv.Close()
+	c, err := New(Config{URL: srv.URL, Database: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithWriteSettings(t.Context(), Settings{"query_id": "hopcorder/lab/1"})
+	if err := c.InsertJSON(ctx, "cycles", [][]byte{[]byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Exec(ctx, "INSERT INTO hops SELECT 1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Query(ctx, "SELECT 1", nil, func(json.RawMessage) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Get("query_id") != "hopcorder/lab/1" || got[1].Get("query_id") != "hopcorder/lab/1" ||
+		got[0].Get("query") != "INSERT INTO `cycles` FORMAT JSONEachRow" || got[2].Has("query_id") {
+		t.Errorf("requests %v", got)
+	}
+}

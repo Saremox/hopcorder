@@ -3,6 +3,8 @@ package server
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 // ClickHouse's.
 type Store interface {
 	InsertJSON(ctx context.Context, table string, rows [][]byte) error
+	Exec(ctx context.Context, query string, params clickhouse.Params) error
 	Query(ctx context.Context, query string, params clickhouse.Params, row func(json.RawMessage) error) error
 }
 
@@ -33,11 +36,26 @@ const replayDepth = 30
 // Ingester turns validated records into rows and events.
 //
 // Deduplication on (agent_id, seq): an agent ships its records in seq order
-// and only moves on once a batch was accepted, so everything at or below the
-// highest seq stored for that agent has been stored already. Each agent's
-// batches are processed one at a time under its own lock, the high-water
-// mark moves only after a cycles insert succeeded, and so a retried batch
-// (say, after a lost response) is stored exactly once.
+// and only moves on once a batch was accepted. Each agent's batches are
+// processed one at a time under its own lock, in parts (see nextPart) that
+// are inserted in seq order, each into one partition of cycles and so
+// stored there whole or not at all. The agent's mark (highWater, written to
+// agent_seq by the server) moves past a part only once the part is stored
+// with its hop and loop rows and its events were derived: records at or
+// below it are duplicates.
+//
+// A cycles insert is not all-or-nothing beyond cycles: ClickHouse commits
+// the cycles part before it runs the views, so a failing view (memory, disk,
+// a restart) leaves the part stored without some of its hop or loop rows,
+// and an insert can outlive the client's timeout and commit later. So after
+// any failed write, and when the agent's state is loaded (after a restart,
+// or after it was dropped), the agent is unsure: its next batch first stops
+// whatever of its statements still runs in ClickHouse (settle), then looks
+// up which of its records cycles already holds (findStored). Those are not
+// inserted again; their missing hop and loop rows are written from cycles
+// (fillViews) and their events are derived with the rest. Since parts are
+// stored whole and in seq order, a part whose last record is not stored has
+// nothing of the agent stored above it, and the agent is sure again.
 type Ingester struct {
 	store   Store
 	enrich  Enricher
@@ -63,8 +81,10 @@ type Ingester struct {
 	// restoreTimeout of its first restore.
 	maxRestores    int
 	restoreTimeout time.Duration
-	now            func() time.Time
-	nstreams       atomic.Int64
+	// partBytes bounds one insert (maxInsertBytes; tests lower it).
+	partBytes int
+	now       func() time.Time
+	nstreams  atomic.Int64
 
 	mu        sync.Mutex
 	agents    map[string]*agentState
@@ -72,12 +92,17 @@ type Ingester struct {
 }
 
 type agentState struct {
-	mu        sync.Mutex
-	evicted   bool // dropped from Ingester.agents; look the agent up again
-	loaded    bool
+	mu      sync.Mutex
+	evicted bool // dropped from Ingester.agents; look the agent up again
+	loaded  bool
+	// highWater is the agent's mark: its cycles up to this seq are stored
+	// with their hop and loop rows, and their events were derived.
 	highWater uint64
-	streams   map[streamKey]*stream
-	used      time.Time
+	// unsure: cycles of the agent above highWater may be stored (a write
+	// failed or timed out, or the state was just loaded); see Ingester.
+	unsure  bool
+	streams map[streamKey]*stream
+	used    time.Time
 	// nstreams is len(streams), for sweeps that find the agent locked.
 	nstreams atomic.Int64
 	// keep, unless negative, is how many streams a sweep left the agent
@@ -114,9 +139,10 @@ const (
 	// stored ones is not a retry but a reset spool or a second agent with
 	// the same agent_id.
 	staleWindow = 100000
-	// insertTimeout bounds the cycles inserts of one agent's batch, which
-	// are not cancelled when the agent disconnects: an insert that
-	// ClickHouse committed must be accounted for.
+	// insertTimeout bounds the writes of one agent's batch (cycles, hop
+	// and loop rows filled in, the mark), which are not cancelled when the
+	// agent disconnects: an insert that ClickHouse committed must be
+	// accounted for.
 	insertTimeout = 30 * time.Second
 	// maxInsertBytes bounds one cycles insert: its rows' JSON, and what
 	// hops_mv makes of them, hopRowBytes per hop row plus the hop's loop
@@ -124,6 +150,8 @@ const (
 	// seven times its record (AS and rDNS names on every hop), and a hop's
 	// loop TTLs can be 900 bytes on each of 255 hops, so a large batch is
 	// inserted in parts; an agent's normal batch (1 MiB) is one insert.
+	// The events of a part are inserted after it, in inserts of at most
+	// this many bytes of JSON too.
 	maxInsertBytes = 8 << 20
 	// hopRowBytes is about what a hop row costs ClickHouse besides its
 	// strings: the cycle's columns repeated on it and its own fixed-size
@@ -143,6 +171,11 @@ const (
 	restoreRecent = 24 * time.Hour
 	// eventsTimeout bounds storing the derived events of one batch.
 	eventsTimeout = 10 * time.Second
+	// queryIDPrefix starts the query_id of every write of an agent's
+	// cycles and of the hop and loop rows filled in for them, followed by
+	// the agent_id and "/" (not in agent_ids), so that settle can stop the
+	// agent's writes that are still running, a previous process's too.
+	queryIDPrefix = "hopcorder/"
 )
 
 // ErrStaleBatch is returned for a batch whose records all lie far below the
@@ -172,7 +205,8 @@ func NewIngester(store Store, en Enricher, log *slog.Logger, m *serverMetrics) *
 	}
 	return &Ingester{store: store, enrich: en, log: log, metrics: m, agents: map[string]*agentState{},
 		maxStreams: DefaultMaxStreams, maxAgents: DefaultMaxAgents, idleTTL: DefaultStreamIdleTTL,
-		maxRecordAge: DefaultMaxRecordAge, maxRestores: maxRestores, restoreTimeout: restoreTimeout, now: time.Now}
+		maxRecordAge: DefaultMaxRecordAge, maxRestores: maxRestores, restoreTimeout: restoreTimeout,
+		partBytes: maxInsertBytes, now: time.Now}
 }
 
 // lockAgent returns the agent's state, locked.
@@ -388,8 +422,9 @@ func (b *restoreBudget) take() (time.Time, bool) {
 }
 
 // Ingest stores recs (already validated). It returns an error only when
-// storage failed, in which case the failing agent's records from the first
-// failed insert on are not stored and the batch should be retried.
+// storage failed; the failing agent's records from the part that failed on
+// may then be stored or not, and the batch should be retried, which is safe
+// (see Ingester).
 func (in *Ingester) Ingest(ctx context.Context, recs []*record.Record) (IngestResult, error) {
 	in.sweep()
 	var res IngestResult
@@ -424,7 +459,9 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 		if err != nil {
 			return 0, 0, fmt.Errorf("load high-water mark for %s: %w", id, err)
 		}
-		a.highWater, a.loaded = hw, true
+		// A previous process (or this one, before it dropped the agent's
+		// state) may have left writes above the mark.
+		a.highWater, a.loaded, a.unsure = hw, true, true
 	}
 
 	slices.SortStableFunc(recs, func(x, y *record.Record) int { return cmp.Compare(x.Seq, y.Seq) })
@@ -448,66 +485,308 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 		return 0, dups, nil
 	}
 
-	stored, err := in.insertCycles(ctx, a, fresh)
+	stored, err := in.storeRecords(ctx, a, id, fresh, now, rb)
 	in.metrics.records(stored, dups)
-	// Derived events of what was stored, even if a later part failed: the
-	// retry sees those records as duplicates.
-	in.derive(ctx, a, fresh[:stored], now, rb)
 	return stored, dups, err
 }
 
-// insertCycles inserts recs (in seq order) in parts of at most
-// maxInsertBytes (the rows and the hop rows the view makes of them, see
-// buildCycleRow) and moves a's high-water mark after each. It returns how
-// many records were stored. Not cancelled with the request: if the agent
-// disconnects after ClickHouse committed, the high-water mark must still
-// move.
-func (in *Ingester) insertCycles(ctx context.Context, a *agentState, recs []*record.Record) (int, error) {
-	ictx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
+// storeRecords stores recs (agent id's, in seq order, above its mark) part
+// by part: once a part is stored, its events are derived and stored and the
+// mark moves past it, so the memory a batch takes beyond its records is one
+// part's. It returns how many of recs are stored. The writes are not
+// cancelled with the request: if the agent disconnects after ClickHouse
+// committed, the mark must still move.
+func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, recs []*record.Record, now time.Time,
+	rb *restoreBudget) (int, error) {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
 	defer cancel()
+	// Events have their own budget, from the first part's on.
+	ectx := &lazyTimeout{parent: context.WithoutCancel(ctx), d: eventsTimeout}
+	defer ectx.stop()
+	var st deriveStats
+	defer in.reportDerive(a, id, &st)
+
+	if a.unsure {
+		if err := in.settle(wctx, id); err != nil {
+			return 0, err
+		}
+	}
 	stored := 0
 	for stored < len(recs) {
-		var rows [][]byte
-		size, end := 0, stored
-		for end < len(recs) && size < maxInsertBytes {
-			b, cost, err := buildCycleRow(recs[end], in.enrich)
+		end, rows, err := in.nextPart(recs, stored)
+		if err != nil {
+			return stored, err
+		}
+		part := recs[stored:end]
+		last := part[len(part)-1].Seq
+		sure := !a.unsure
+		if a.unsure {
+			found, err := in.findStored(wctx, id, part)
 			if err != nil {
-				return stored, fmt.Errorf("encode record %s/%d: %w", recs[end].AgentID, recs[end].Seq, err)
+				return stored, err
 			}
-			rows = append(rows, b)
-			size += cost
-			end++
+			if len(found) > 0 {
+				if err := in.fillViews(wctx, id, part, found); err != nil {
+					return stored, err
+				}
+				in.metrics.recovered(len(found))
+				in.log.Info("cycles of a failed or interrupted insert were stored after all; not inserting them again",
+					"agent_id", id, "cycles", len(found))
+				keep := rows[:0]
+				for i, r := range part {
+					if !found[r.Seq] {
+						keep = append(keep, rows[i])
+					}
+				}
+				rows = keep
+			}
+			// Parts are stored whole and in seq order: if this one's last
+			// record is not stored, nothing of the agent above it is.
+			sure = !found[last]
 		}
-		start := time.Now()
-		if err := in.store.InsertJSON(ictx, "cycles", rows); err != nil {
-			in.metrics.insertError("cycles")
-			// The insert may have been committed all the same: re-read the
-			// high-water mark before the next batch rather than trusting ours.
-			a.loaded = false
-			return stored, fmt.Errorf("insert cycles: %w", err)
+		if err := in.insertPart(wctx, id, rows); err != nil {
+			a.unsure = true
+			return stored, err
 		}
-		in.metrics.insertDuration(time.Since(start))
-		a.highWater = recs[end-1].Seq
+		in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st))
+		in.writeMark(wctx, id, last)
+		a.highWater, a.unsure = last, !sure
 		stored = end
 	}
 	return stored, nil
 }
 
-// derive feeds stored records to their streams and stores the events they
-// produce. The cycles are committed at this point; events are derived data,
-// so a failure here is logged rather than failing (and re-sending) a batch
-// that is already stored. A stream whose state cannot be restored now
-// (budget used up, or storage failing) skips this batch's cycles and is
-// restored with its next batch, from storage, which then holds these
-// cycles: it never starts from scratch while ClickHouse has its history.
-func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Record, now time.Time, rb *restoreBudget) {
+// lazyTimeout is a context with a timeout that starts at its first use.
+type lazyTimeout struct {
+	parent context.Context
+	d      time.Duration
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (l *lazyTimeout) get() context.Context {
+	if l.ctx == nil {
+		l.ctx, l.cancel = context.WithTimeout(l.parent, l.d)
+	}
+	return l.ctx
+}
+
+func (l *lazyTimeout) stop() {
+	if l.cancel != nil {
+		l.cancel()
+	}
+}
+
+// nextPart returns where the part of recs that starts at start ends, and
+// its cycles rows: at most partBytes (the rows and the hop rows the view
+// makes of them, see buildCycleRow), within one month. A month is a
+// partition of cycles, so ClickHouse stores the part in cycles as one part
+// of the table: whole or not at all.
+func (in *Ingester) nextPart(recs []*record.Record, start int) (int, [][]byte, error) {
+	var rows [][]byte
+	size, end := 0, start
+	month := monthOf(recs[start].TS)
+	for end < len(recs) && size < in.partBytes && monthOf(recs[end].TS) == month {
+		b, cost, err := buildCycleRow(recs[end], in.enrich)
+		if err != nil {
+			return end, nil, fmt.Errorf("encode record %s/%d: %w", recs[end].AgentID, recs[end].Seq, err)
+		}
+		rows = append(rows, b)
+		size += cost
+		end++
+	}
+	return end, rows, nil
+}
+
+// monthOf is toYYYYMM(ts), the partition of a cycle and its hop and loop
+// rows, as a number.
+func monthOf(t time.Time) int {
+	t = t.UTC()
+	return t.Year()*12 + int(t.Month())
+}
+
+func (in *Ingester) insertPart(ctx context.Context, id string, rows [][]byte) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	start := time.Now()
+	if err := in.store.InsertJSON(writeCtx(ctx, id), "cycles", rows); err != nil {
+		in.metrics.insertError("cycles")
+		return fmt.Errorf("insert cycles: %w", err)
+	}
+	in.metrics.insertDuration(time.Since(start))
+	return nil
+}
+
+// writeCtx gives a write of agent id's cycles (or of their hop and loop
+// rows) a query_id that settle finds it by, and the settings the ingester
+// relies on whatever the user's profile says: the insert is the client's
+// own (not buffered with others'), and it fails if a view fails.
+func writeCtx(ctx context.Context, id string) context.Context {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return clickhouse.WithWriteSettings(ctx, clickhouse.Settings{
+		"query_id":                         queryIDPrefix + id + "/" + hex.EncodeToString(b[:]),
+		"async_insert":                     "0",
+		"materialized_views_ignore_errors": "0",
+	})
+}
+
+// settle stops the writes of agent id that still run in ClickHouse (an
+// insert of this process that outlived its timeout, or one of a process
+// before a restart) and waits until they have ended, so that what
+// findStored sees no longer changes. (KILL QUERY needs the server's
+// ClickHouse user to read query_id, user and query of system.processes;
+// Migrate checks that.)
+func (in *Ingester) settle(ctx context.Context, id string) error {
+	if err := in.store.Exec(ctx, "KILL QUERY WHERE startsWith(query_id, {prefix:String}) SYNC",
+		clickhouse.Params{"prefix": queryIDPrefix + id + "/"}); err != nil {
+		return fmt.Errorf("stop earlier writes of %s: %w", id, err)
+	}
+	return nil
+}
+
+// partWindow selects an agent's rows in cycles, hops or loop_events by seq
+// and ts, both within a part's: ts is in the sort keys, seq is not. A cycle
+// is stored with the ts clickhouse.Time gives (in UTC, to the
+// millisecond), as here, so the window holds it whatever ClickHouse's
+// time zone.
+const partWindow = `agent_id = {agent:String} AND seq >= {lo:UInt64} AND seq <= {hi:UInt64}
+	AND ts >= {from:DateTime64(3, 'UTC')} AND ts <= {to:DateTime64(3, 'UTC')}`
+
+func windowParams(id string, recs []*record.Record) clickhouse.Params {
+	from, to := recs[0].TS, recs[0].TS
+	for _, r := range recs {
+		if r.TS.Before(from) {
+			from = r.TS
+		}
+		if r.TS.After(to) {
+			to = r.TS
+		}
+	}
+	return clickhouse.Params{"agent": id, "lo": strconv.FormatUint(recs[0].Seq, 10),
+		"hi": strconv.FormatUint(recs[len(recs)-1].Seq, 10), "from": clickhouse.Time(from), "to": clickhouse.Time(to)}
+}
+
+// findStored returns the seqs of part's records that cycles holds already.
+func (in *Ingester) findStored(ctx context.Context, id string, part []*record.Record) (map[uint64]bool, error) {
+	type row struct {
+		Seq uint64 `json:"seq"`
+	}
+	rows, err := clickhouseQuery[row](ctx, in.store, "SELECT DISTINCT seq FROM cycles WHERE "+partWindow,
+		windowParams(id, part))
+	if err != nil {
+		return nil, fmt.Errorf("look up stored cycles of %s: %w", id, err)
+	}
+	found := map[uint64]bool{}
+	for _, r := range rows {
+		if _, ok := slices.BinarySearchFunc(part, r.Seq, func(x *record.Record, s uint64) int { return cmp.Compare(x.Seq, s) }); ok {
+			found[r.Seq] = true
+		}
+	}
+	return found, nil
+}
+
+// The hop and loop rows of stored cycles that hops_mv and loop_events_mv
+// did not write (one failed, or its insert was stopped), made from cycles
+// as those views make them, and only where they are missing, so that a
+// fill can run any number of times. They must change with the views
+// (TestFillMatchesViews checks that they agree).
+const (
+	fillHops = `INSERT INTO hops (ts, agent_id, seq, target, target_ip, af, protocol, flow_id, reached, path_len,
+		path_hash, ttl, status, hop_ip, rtt_us, code, hop_asn, hop_as_name, hop_name, mpls, is_loop, loop_ttls)
+	SELECT ts, agent_id, seq, target, target_ip, af, protocol, flow_id, reached, path_len, path_hash,
+		hops.ttl AS ttl, hops.status AS status, hops.ip AS hop_ip, hops.rtt_us AS rtt_us, hops.code AS code,
+		hops.asn AS hop_asn, hops.as_name AS hop_as_name, hops.name AS hop_name, hops.mpls AS mpls,
+		notEmpty(hops.loop_ttls) AS is_loop,
+		arrayStringConcat(arrayMap(x -> toString(x), hops.loop_ttls), ',') AS loop_ttls
+	FROM cycles ARRAY JOIN hops
+	WHERE ` + partWindow + ` AND (seq, ttl) NOT IN (SELECT seq, ttl FROM hops WHERE ` + partWindow + `)`
+	fillLoops = `INSERT INTO loop_events (ts, agent_id, seq, target, protocol, flow_id, loop_ip, ttls)
+	SELECT ts, agent_id, seq, target, protocol, flow_id, loops.ip AS loop_ip, loops.ttls AS ttls
+	FROM cycles ARRAY JOIN loops
+	WHERE ` + partWindow + ` AND (seq, loop_ip) NOT IN (SELECT seq, loop_ip FROM loop_events WHERE ` + partWindow + `)`
+)
+
+// fillViews writes the missing hop and loop rows of part's records that
+// cycles holds (found).
+func (in *Ingester) fillViews(ctx context.Context, id string, part []*record.Record, found map[uint64]bool) error {
+	var stored []*record.Record
+	var hops, loops bool
+	for _, r := range part {
+		if found[r.Seq] {
+			stored = append(stored, r)
+			hops, loops = hops || len(r.Hops) > 0, loops || len(r.Loops) > 0
+		}
+	}
+	p := windowParams(id, stored)
+	for _, f := range []struct {
+		need         bool
+		table, query string
+	}{{hops, "hops", fillHops}, {loops, "loop_events", fillLoops}} {
+		if !f.need {
+			continue
+		}
+		if err := in.store.Exec(writeCtx(ctx, id), f.query, p); err != nil {
+			in.metrics.insertError(f.table)
+			return fmt.Errorf("fill in %s of stored cycles of %s: %w", f.table, id, err)
+		}
+	}
+	return nil
+}
+
+// writeMark stores agent id's mark. If that fails, the mark kept in memory
+// moves all the same: the stored one only lags, which costs the next
+// process (or this one, once it dropped the agent's state) a findStored of
+// records it has.
+func (in *Ingester) writeMark(ctx context.Context, id string, seq uint64) {
+	b, err := json.Marshal(struct {
+		AgentID string `json:"agent_id"`
+		MaxSeq  uint64 `json:"max_seq"`
+	}{id, seq})
+	if err == nil {
+		err = in.store.InsertJSON(ctx, "agent_seq", [][]byte{b})
+	}
+	if err != nil {
+		in.metrics.insertError("agent_seq")
+		in.log.Warn("cannot store the agent's high-water mark; it is kept in memory", "agent_id", id, "seq", seq, "err", err)
+	}
+}
+
+// deriveStats counts the cycles of a batch that derived no events.
+type deriveStats struct{ skipped, failed, noRoom int }
+
+func (in *Ingester) reportDerive(a *agentState, id string, st *deriveStats) {
+	if st.skipped > 0 {
+		in.metrics.unrestoredCycles(st.skipped)
+		in.log.Warn("stream state not restored in time; these cycles derive no path changes or outages "+
+			"(the streams are restored with their next batch)", "agent_id", id, "cycles", st.skipped,
+			"failed_restores", st.failed)
+	}
+	if st.noRoom > 0 {
+		in.metrics.unrestoredCycles(st.noRoom)
+		in.log.Warn("no room to track more streams; these cycles derive no path changes or outages "+
+			"(raise ingest.max_streams or max_streams_per_agent if this agent's streams are real)",
+			"agent_id", id, "cycles", st.noRoom, "agent_streams", len(a.streams),
+			"max_streams_per_agent", in.streamsPerAgent(), "max_streams", in.maxStreams)
+	}
+}
+
+// derive feeds stored records to their streams and returns the events they
+// produce. A stream whose state cannot be restored now (budget used up, or
+// storage failing) skips these cycles and is restored with its next batch,
+// from storage, which then holds them: it never starts from scratch while
+// ClickHouse has its history. Every record comes here once: in seq order,
+// right after its part is stored (or found stored), when the mark moves
+// past it.
+func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Record, now time.Time, rb *restoreBudget,
+	st *deriveStats) events {
 	var ev events
 	tried := map[*stream]bool{}
-	var skipped, failed, noRoom int
 	for _, r := range recs {
 		s := in.stream(a, keyOf(r))
 		if s == nil {
-			noRoom++
+			st.noRoom++
 			continue
 		}
 		s.used = now
@@ -515,33 +794,18 @@ func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Re
 			tried[s] = true
 			if deadline, ok := rb.take(); ok {
 				if err := in.restore(ctx, deadline, s, r, &ev); err != nil {
-					failed++
+					st.failed++
 					in.log.Debug("cannot restore stream state", "stream", s.key, "err", err)
 				}
 			}
 		}
 		if !s.loaded {
-			skipped++
+			st.skipped++
 			continue
 		}
 		s.observe(r, &ev)
 	}
-	if skipped > 0 {
-		in.metrics.unrestoredCycles(skipped)
-		in.log.Warn("stream state not restored in time; these cycles derive no path changes or outages "+
-			"(the streams are restored with their next batch)", "agent_id", recs[0].AgentID, "cycles", skipped,
-			"failed_restores", failed)
-	}
-	if noRoom > 0 {
-		in.metrics.unrestoredCycles(noRoom)
-		in.log.Warn("no room to track more streams; these cycles derive no path changes or outages "+
-			"(raise ingest.max_streams or max_streams_per_agent if this agent's streams are real)",
-			"agent_id", recs[0].AgentID, "cycles", noRoom, "agent_streams", len(a.streams),
-			"max_streams_per_agent", in.streamsPerAgent(), "max_streams", in.maxStreams)
-	}
-	ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventsTimeout)
-	defer cancel()
-	in.insertEvents(ectx, ev)
+	return ev
 }
 
 // stream returns a's stream k, creating it if there is room: nil if a has
@@ -730,6 +994,8 @@ func clickhouseQuery[T any](ctx context.Context, st Store, q string, p clickhous
 	return out, err
 }
 
+// insertEvents stores events in inserts of at most partBytes of JSON each,
+// encoding an insert's rows only when it is due.
 func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 	insert := func(table string, rows [][]byte) {
 		if len(rows) == 0 {
@@ -749,14 +1015,20 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 		in.log.Error("cannot store derived events; they are lost (the cycles are stored)", "table", table,
 			"events", len(rows), "err", err)
 	}
-	var changes, outages [][]byte
-	for _, c := range ev.changes {
-		b, _ := json.Marshal(c)
-		changes = append(changes, b)
+	write := func(table string, n int, row func(int) []byte) {
+		var rows [][]byte
+		size := 0
+		for i := range n {
+			b := row(i)
+			rows, size = append(rows, b), size+len(b)+1
+			if size >= in.partBytes {
+				insert(table, rows)
+				rows, size = nil, 0
+			}
+		}
+		insert(table, rows)
 	}
 	for _, o := range ev.outages {
-		b, _ := json.Marshal(o)
-		outages = append(outages, b)
 		if o.EndTS == nil {
 			in.metrics.outage("open")
 		} else {
@@ -764,6 +1036,6 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 		}
 	}
 	in.metrics.pathChanges(len(ev.changes))
-	insert("path_changes", changes)
-	insert("outages", outages)
+	write("path_changes", len(ev.changes), func(i int) []byte { b, _ := json.Marshal(ev.changes[i]); return b })
+	write("outages", len(ev.outages), func(i int) []byte { b, _ := json.Marshal(ev.outages[i]); return b })
 }

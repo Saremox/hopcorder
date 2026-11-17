@@ -590,7 +590,10 @@ added in the commit that introduced it.
   into `cycles` (one row per cycle, hops and loops as `Nested` columns, plus
   per-hop enrichment). `hops`, `loop_events` and `agent_seq` are materialized
   views of it. So a cycle is stored atomically, and "flatten to one row per hop
-  at insert time" happens at insert time inside ClickHouse.
+  at insert time" happens at insert time inside ClickHouse. (Not so, round
+  four found: the views run after the `cycles` part is committed, and one
+  that fails leaves the cycle without its rows. The server now repairs that
+  on the retry, and writes `agent_seq` itself; see round four.)
 - **No ClickHouse client library.** The server uses ClickHouse's HTTP
   interface through `internal/clickhouse` (standard library, typed
   `{name:Type}` parameters). This avoids a new dependency; the HTTP interface
@@ -602,7 +605,10 @@ added in the commit that introduced it.
   only after the insert succeeded. A `ReplacingMergeTree` would not do: the
   per-hop view would still see every duplicate insert. The mark is restored
   from `agent_seq` after a restart. Consequence: an agent whose spool was
-  wiped (seq restarting at 1) must get a new `agent_id`.
+  wiped (seq restarting at 1) must get a new `agent_id`. (Round four: "the
+  insert succeeded" is not enough, since an insert that fails or times out
+  may have stored cycles all the same; the mark now moves only past cycles
+  stored with their hop and loop rows, and a retry looks up what is stored.)
 - **Path changes and outages are derived in Go, not by materialized views**
   (deviation from the M2 line above). A path change uses the stateful
   wildcard rule decided after M1 (`record.PathTracker`), and an outage window
@@ -962,7 +968,10 @@ fixes. The decisions:
   the proxy's job (§2).
 - **Inserts are not cancelled with the request**: if the agent disconnects
   after ClickHouse committed, the high-water mark still moves; after a failed
-  insert it is re-read from storage before the next batch.
+  insert it is re-read from storage before the next batch. (Round four: the
+  re-read mark came from a view and could claim cycles whose hop rows were
+  missing, or miss cycles stored after all; the retry now stops the insert
+  and looks up which of its cycles are stored.)
 - **Read API**: at most `query.max_concurrent` (8) requests at once; every
   SELECT carries `max_execution_time` (the client timeout minus 5 s) and
   `cancel_http_readonly_queries_on_client_close=1`.
@@ -1246,6 +1255,8 @@ decisions:
   still one insert. The zstd decoder (and its window) is closed before the
   records are stored. A request being processed holds up to about three
   times `max_decoded_bytes` (corrected in round three; this said twice).
+  (Round four: the parts bounded the cycles only; a batch's events went in
+  one insert per table, and are now stored part by part too.)
 - **The Go memory limit follows the cgroup's**: at start, unless GOMEMLIMIT
   is set, the server sets it to 90% of the memory limit of its cgroup (v2:
   the lowest `memory.max` from its own cgroup up; v1:
@@ -1707,6 +1718,10 @@ high-severity issue. Four fixes followed. The decisions:
   peaked at 114 MiB (3.6 times). So ingest needs about `max_concurrent x
   (3 x max_decoded_bytes + 24 MiB)`, plus the stream state and the read
   buffer: with the defaults 480 + 170 + 32 MiB, within the chart's 1 GiB.
+  (Round four: not for a request of events, all held and inserted at once,
+  213 MiB beyond the body. Events now go part by part, and the figure is
+  about `max_concurrent x (3 x max_decoded_bytes + 32 MiB)`, 512 + 170 +
+  32 MiB with the defaults.)
   Test: `TestDecodedRecordsMemory` (at most 3.2 times for records of 9 and
   of 255 silent hops; 3.6 before).
 
@@ -2469,6 +2484,27 @@ decisions:
 
 **Ingest and storage**
 
+- **A batch's events are stored part by part.** `derive` collected the
+  events of a whole batch and `insertEvents` sent them in one insert per
+  table. Records without hops whose `reached` and `target_ip` flip every
+  cycle make a route change (reason target) and an outage row each: one
+  32 MiB request held 213 MiB beyond its body (inserts of 48 and 43 MiB),
+  and four clients OOM-killed the server under the chart's 1 GiB in 3 of 3
+  runs (GOMEMLIMIT is a soft limit). Now the events of each cycles part
+  are derived once the part is stored, inserted in inserts of at most
+  `maxInsertBytes` (8 MiB) of JSON, encoded one insert at a time, and
+  dropped before the next part. Measured with `measureStore` (live heap
+  after a collection at each insert, beyond the request body): the review's
+  request 213 MiB before, 66 MiB now past validation (which refuses it,
+  next item); its cheapest valid form, a reply hop every other record,
+  146 → 61 MiB; two IPv6 paths of 255 hops in turn (a route change at
+  every TTL) 114 → 52 MiB. Sizing: about `max_concurrent x (3 x
+  max_decoded_bytes + 32 MiB)` plus the stream state and the read buffer,
+  512 + 170 + 32 MiB with the defaults (corrected in round three's text,
+  `server.example.yaml` and the chart's `values.yaml`).
+  - Test: `TestRequestMemoryEventFlood` (both shapes at 32 MiB: every
+    insert within 8 MiB, events in several, peak within 3 x 32 + 32 MiB;
+    before, one 36 MiB `path_changes` insert and 146 MiB).
 - **Records must be what `Finalize` makes of their hops** (`record.Validate`):
   the path ends at its first `reply` or `unreachable`, `reached` says
   whether a reply came, and `path_hash` and `loops` are those of the hops.
@@ -2478,6 +2514,115 @@ decisions:
   produces are refused; the checks are one SHA-1 and one loop scan per
   record. Tests: `TestValidateRejects` (eight new cases, all accepted
   before), `TestFlipRecordsValid`.
+- **A retried batch is stored once, with its hop and loop rows, and derives
+  its events once** (this replaces the M2 and round one reasoning). An
+  insert into `cycles` is not all-or-nothing: ClickHouse 25.8 commits the
+  `cycles` part, then runs its views one after another, in an order that
+  differs between databases; an exception in one leaves the part and the
+  views before it written, skips the rest, and fails the insert. An insert
+  can also outlive the client's timeout and commit later. The mark came
+  from `agent_seq_mv`, one of those views, and was re-read after a failure,
+  so the review saw: the retry answered "duplicates" while 51,000 hop rows
+  and the batch's outage were gone; or every cycle stored twice (2.1% of an
+  agent's cycles, 150 s against a ClickHouse short of memory); or a late
+  commit's events never derived. Now:
+  - A part lies within one month (a partition of `cycles` and its views),
+    so ClickHouse stores it as one part of `cycles` (checked: 21,000 rows,
+    8 MiB, one part): whole or not at all. Parts are inserted in seq order
+    and a batch stops at the first that fails.
+  - The server writes the mark into `agent_seq` (migration 0004 drops
+    `agent_seq_mv`) once a part is stored with its hop and loop rows (the
+    insert succeeded, so every view ran: the ingester's writes set
+    `materialized_views_ignore_errors = 0` and `async_insert = 0`, whatever
+    the user's profile says) and its events were derived. The
+    mark in memory moves with it; a failed mark insert is logged and only
+    makes the stored mark lag.
+  - After any failed write, and when an agent's state is loaded (a restart,
+    or the state was dropped), the agent is unsure. Its next batch first
+    stops the agent's writes that still run: every write of its cycles has
+    the query_id `hopcorder/<agent_id>/<random>`, and `KILL QUERY WHERE
+    startsWith(query_id, …) SYNC` ends them, a previous process's too, so
+    what is stored no longer changes. Then, per part, it looks up which of
+    the part's seqs `cycles` holds (by agent, the part's seq range and its
+    ts range: ts is in the sort key, seq is not), writes their missing hop
+    and loop rows from `cycles` with the views' own queries, only where
+    missing (`INSERT … SELECT … WHERE (seq, ttl) NOT IN (…)`, so it can run
+    any number of times), inserts only the other records, derives the
+    events of all of them in seq order and moves the mark. A part whose last
+    record is not stored has nothing of the agent stored above it (parts
+    are whole and in order), and the agent is sure again. Without failures
+    this costs one KILL and one lookup for each agent whose state is
+    loaded: after a restart, and for an agent_id new to the server or
+    dropped by it.
+  - The guarantee: while one server at a time writes an agent's cycles,
+    after any mix of view failures, client timeouts with late commits,
+    ClickHouse or server restarts and agent retries, with any batch
+    boundaries, each cycle the agent sends is stored once in `cycles` and
+    its hop and loop rows once in `hops` and `loop_events`, the mark (stored
+    and in memory) never covers a cycle whose rows are missing, and each
+    stored cycle's events are derived once, in seq order, by the batch that
+    stores or finds it (none if its stream has no state then: restore
+    budget or no room, as in rounds two and three). Only a crash between
+    storing a part's events and its mark (milliseconds) derives them a
+    second time, from the stream as a restore leaves it; `path_changes` and
+    `outages` are `ReplacingMergeTree`s read with `FINAL`, keyed by stream
+    and seq, so the second rows replace the first (a restored tracker can
+    know fewer of the earlier addresses, so a route change may list fewer
+    TTLs).
+  - Why not ClickHouse's insert deduplication (`insert_deduplication_token`
+    with `non_replicated_deduplication_window` and
+    `deduplicate_blocks_in_dependent_materialized_views`): a token
+    deduplicates only a retry of the same block, and after a restart the
+    server no longer has the failed part, while the agent's retry may be
+    shorter or longer (its spool grows; enrichment changes row sizes and so
+    the parts). The window would also have to outlast every retry's backoff
+    under all agents' inserts. Looking at what is stored works across both
+    and needs no table settings. Making `cycles`, `hops` and `loop_events`
+    `ReplacingMergeTree`s would not do either: the dashboards, the read API
+    and the prototype's queries read them without `FINAL`.
+  - The server's ClickHouse user must see and stop its own queries:
+    `GRANT SELECT(query_id, user, query) ON system.processes` (the default
+    user and the images' `CLICKHOUSE_USER` have it; without it KILL QUERY
+    fails with ACCESS_DENIED, checked on 25.8). Migrate checks it with a
+    KILL that matches nothing and keeps the server unready otherwise.
+  - `hopcorder_server_records_total{result="recovered"}` counts cycles
+    found stored; each such batch logs one line.
+  - Accepted: a write ClickHouse has received but not started when the
+    KILL runs (it would have to hold a received request for longer than
+    the 30 s client timeout) can still commit after the lookup, and its
+    cycles are then stored twice. Two servers writing the same agent's
+    cycles at once (the mark is kept in memory, as before) can store a
+    batch twice; the chart runs one replica with `Recreate`. Cycles a
+    failed insert stored that the agent never sends again (its spool
+    dropped them past `max_age`) keep their missing rows and derive no
+    events. Events whose own insert fails (three attempts within the
+    batch's 10 s) are still lost, logged and counted; the mark moves on.
+    Damage done before the upgrade (marks past missing rows, duplicates)
+    is not repaired. A lookup reads the agent's cycles within the part's
+    ts range once per unsure part: a part spanning the 30 days of
+    `max_record_age` reads that much.
+  - Rolling back below migration 0004: recreate `agent_seq_mv` first (the
+    statement is in the migration), or that version, which does not write
+    the mark, stores retried batches twice after its next restart. Rolling
+    forward again: drop it (the server refuses to start while it exists).
+  - Tests (`clickhouse` tag unless noted): `TestViewFailureRetriedExactlyOnce`
+    (a constraint on `hops`, or on `loop_events`, fails `hops_mv` or
+    `loop_events_mv` for the part of seqs 41–60; retried as 41–50, 41–90
+    and 91–120, in the same process and after a restart; every table
+    compared with an agent that ingested the same records cleanly, rows
+    counted with their multiplicity, events as `FINAL` reads them. Before:
+    20 cycles stored twice, or 570 of 909 hop rows, 4 of 24 loop rows, 6 of
+    29 route changes and 2 of 13 outages missing),
+    `TestLateCommitRetriedExactlyOnce` (`hops_mv` slowed by a constraint
+    that sleeps, a client timeout of 700 ms; retried while the insert runs
+    and after it committed, with and without a restart. Before: 23 of 29
+    route changes and 10 of 13 outages never derived; without the KILL,
+    810 hop rows twice),
+    `TestPartFailureMidBatchClickHouse` (the third of several parts fails;
+    a restarted server's retries in other boundaries), `TestFillMatchesViews`,
+    `TestRetryAfterCommittedFailure` (default run: an insert that stores
+    and fails; before, the batch's route change and outage were lost),
+    `TestWriteSettings`.
 
 <!-- round four: ingest -->
 

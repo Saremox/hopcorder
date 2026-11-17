@@ -35,9 +35,11 @@ config:
     retention_days: 90        # 0 keeps data forever
   # ingest: the server's defaults (deploy/server.example.yaml) fit
   # resources.limits.memory below. A request holds up to about three times
-  # its decompressed size in memory while it is processed, plus about 24MiB
-  # while it is stored, so raise the memory limit with
-  # (3 x max_decoded_bytes + 24MiB) x max_concurrent, e.g.
+  # its decompressed size in memory while it is processed, plus about 32MiB
+  # while it is stored (one part of it and its events at a time), so raise
+  # the memory limit with (3 x max_decoded_bytes + 32MiB) x max_concurrent,
+  # plus the stream state (170MiB at max_streams 20000) and the 32MiB read
+  # buffer: 512 + 170 + 32MiB with the defaults,
   #   max_decoded_bytes: 32MiB
   #   max_concurrent: 4
   enrich:

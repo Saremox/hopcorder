@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path"
@@ -79,7 +80,8 @@ func splitStatements(sql string) []string {
 
 // Migrate creates the database if needed and applies every migration that
 // is not recorded in schema_migrations yet, in order. Statements use IF NOT
-// EXISTS, so a migration interrupted half-way is safe to re-run.
+// EXISTS, so a migration interrupted half-way is safe to re-run. It then
+// checks what ingest relies on and no migration can restore (checkSchema).
 func Migrate(ctx context.Context, c *clickhouse.Client, log *slog.Logger) error {
 	migs, err := loadMigrations()
 	if err != nil {
@@ -118,6 +120,36 @@ func Migrate(ctx context.Context, c *clickhouse.Client, log *slog.Logger) error 
 			clickhouse.Params{"v": strconv.Itoa(m.version), "n": m.name}); err != nil {
 			return fmt.Errorf("record migration %04d: %w", m.version, err)
 		}
+	}
+	return checkSchema(ctx, c)
+}
+
+// checkSchema refuses (the server then stays unready, and says why) what
+// would make ingest lose rows without an error: agent_seq_mv back (it moved
+// the mark past cycles whose hop rows a later view failed to write; the
+// server writes agent_seq since 0004), or a ClickHouse user that cannot
+// stop its own queries (the ingester stops a timed-out insert before it
+// looks at what the insert stored).
+func checkSchema(ctx context.Context, c *clickhouse.Client) error {
+	type row struct {
+		Views []string `json:"dependencies_table"`
+	}
+	rows, err := clickhouse.QueryInto[row](ctx, c, `SELECT dependencies_table FROM system.tables
+		WHERE database = currentDatabase() AND name = 'cycles'`, nil)
+	if err != nil {
+		return fmt.Errorf("check the views of cycles: %w", err)
+	}
+	var views []string
+	if len(rows) == 1 {
+		views = rows[0].Views
+	}
+	if slices.Contains(views, "agent_seq_mv") {
+		return errors.New("materialized view agent_seq_mv exists again (recreated for a rollback?): " +
+			"drop it (DROP VIEW agent_seq_mv), the server writes agent_seq itself since migration 0004")
+	}
+	if err := c.Exec(ctx, "KILL QUERY WHERE query_id = {id:String} SYNC", clickhouse.Params{"id": queryIDPrefix + " check"}); err != nil {
+		return fmt.Errorf("the ClickHouse user cannot stop its own queries, which ingest needs after a failed insert "+
+			"(GRANT SELECT(query_id, user, query) ON system.processes TO the server's user): %w", err)
 	}
 	return nil
 }

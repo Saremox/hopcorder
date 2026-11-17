@@ -1,7 +1,9 @@
 -- One row per (agent, cycle): the wire record, with hops and loops as Nested
 -- columns, plus the server's enrichment (ASN, AS name, rDNS) for each hop.
 -- This is the only table the server inserts records into, so a cycle lands
--- atomically; per-hop rows are derived by hops_mv.
+-- here atomically; per-hop rows are derived by hops_mv, in the same insert
+-- but not atomically with it (round four: a failing view leaves the cycle
+-- without them, and the server fills them in; see Ingester).
 CREATE TABLE IF NOT EXISTS cycles
 (
     agent_id    LowCardinality(String),
@@ -96,7 +98,9 @@ SELECT ts, agent_id, seq, target, protocol, flow_id, loops.ip AS loop_ip, loops.
 FROM cycles
 ARRAY JOIN loops;
 
--- Highest seq stored per agent, for deduplication on (agent_id, seq).
+-- Highest seq stored per agent, for deduplication on (agent_id, seq). Since
+-- migration 0004 the server writes it, once a cycle's hop and loop rows are
+-- stored too, and agent_seq_mv is gone.
 CREATE TABLE IF NOT EXISTS agent_seq
 (
     agent_id LowCardinality(String),

@@ -63,7 +63,9 @@ func newServerMetrics(reg prometheus.Registerer) *serverMetrics {
 			Help: "Agent and stream states dropped at ingest.max_agents and ingest.max_streams (not idle ones).",
 		}, []string{"kind"}),
 	}
-	for _, r := range []string{"accepted", "duplicate", "rejected"} {
+	// recovered: accepted records whose cycles a failed or interrupted
+	// insert had stored after all (found when the batch came again).
+	for _, r := range []string{"accepted", "duplicate", "rejected", "recovered"} {
 		m.recordsVec.WithLabelValues(r)
 	}
 	for _, k := range []string{"agent", "stream"} {
@@ -81,7 +83,8 @@ func (m *serverMetrics) records(accepted, dups int) {
 	m.recordsVec.WithLabelValues("accepted").Add(float64(accepted))
 	m.recordsVec.WithLabelValues("duplicate").Add(float64(dups))
 }
-func (m *serverMetrics) rejected(n int) { m.recordsVec.WithLabelValues("rejected").Add(float64(n)) }
+func (m *serverMetrics) rejected(n int)  { m.recordsVec.WithLabelValues("rejected").Add(float64(n)) }
+func (m *serverMetrics) recovered(n int) { m.recordsVec.WithLabelValues("recovered").Add(float64(n)) }
 func (m *serverMetrics) insertError(table string) {
 	m.insertErrs.WithLabelValues(table).Inc()
 }

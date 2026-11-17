@@ -40,14 +40,41 @@ The section for a version is the text of its GitHub release.
   them, each waiting for more, until their read timeout. A body now reserves
   what it needs at once, in turn, and gives it back once it is decoded.
 - Memory sizing, corrected: a request being processed holds up to about
-  three times `max_decoded_bytes` (not twice), plus about 24 MiB while it is
-  stored; plan for `max_concurrent` of them. Decoded records no longer keep
-  spare capacity, which made it up to 3.6 times.
+  three times `max_decoded_bytes` (not twice), plus about 32 MiB while it is
+  stored (one part of it and its events at a time); plan for
+  `max_concurrent` of them. Decoded records no longer keep spare capacity,
+  which made it up to 3.6 times.
 
+- A batch's path changes and outages no longer go to ClickHouse in one
+  unbounded insert: records whose target address and reached flag flipped
+  every cycle made an event each, one 32 MiB request held 213 MiB on top of
+  its body, and four such requests OOM-killed the server under the chart's
+  1 GiB. Events are now derived and stored with each part of the batch, in
+  inserts of at most 8 MiB, and such a request holds about 60 MiB.
 - Records whose `reached`, `path_hash` or `loops` contradict their hops, or
   that go on past the destination's reply, are rejected; agents never send
   such records (`reached: true` without a reply was the flood's cheapest
   form).
+- A failed or interrupted insert no longer loses hop rows, loop rows or
+  events, or stores cycles twice. ClickHouse stores the cycles before it
+  runs the views that write their hop and loop rows, so a view failing (out
+  of memory, a full disk, a restart) left cycles without those rows, and
+  depending on the order the views ran in, the agent's retry was answered
+  "duplicates" and the batch's outages and route changes were never
+  recorded, or every cycle was stored twice; an insert that outlived its
+  timeout and committed later lost its events the same way. Now the
+  server writes the deduplication mark itself once a part is complete
+  (migration 0004 drops `agent_seq_mv`, applied on start), and after any
+  failed write, or a restart, it stops the agent's writes still running,
+  looks up what they stored, fills in the missing rows and derives the
+  events: each cycle is stored once with its rows, whatever the retry's
+  batch boundaries. `hopcorder_server_records_total{result="recovered"}`
+  counts such cycles. Upgrading: the server's ClickHouse user must be able
+  to see and stop its own queries (`GRANT SELECT(query_id, user, query) ON
+  system.processes`; the default user and the images' `CLICKHOUSE_USER`
+  can), or the server stays unready and says so. Rolling back below this
+  release: recreate `agent_seq_mv` first (the statement is in migration
+  0004).
 
 <!-- round four: ingest -->
 
