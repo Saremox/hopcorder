@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,10 +236,16 @@ func TestOutageAndRecovery(t *testing.T) {
 		return u > 0
 	}, "a delivery while the endpoint was up")
 
+	// The outage lasts a number of the agent's cycles, not a fixed time, so
+	// a slow runner cannot leave it with too few records to check.
+	before, _, _ := ingest.snapshot()
+	c0 := cycles(getMetrics(t, metricsAddr))
 	ingest.mode.Store("reset") // the network dies
-	time.Sleep(600 * time.Millisecond)
+	waitFor(t, 10*time.Second, func() bool { return cycles(getMetrics(t, metricsAddr)) >= c0+5 },
+		"cycles while the network is down")
 	ingest.mode.Store("503") // reachable again, but the server is unhealthy
-	time.Sleep(300 * time.Millisecond)
+	waitFor(t, 10*time.Second, func() bool { return cycles(getMetrics(t, metricsAddr)) >= c0+8 },
+		"cycles while the server answers 503")
 	m := getMetrics(t, metricsAddr)
 	if !strings.Contains(m, `hopcorder_output_errors_total{agent_id="e2e",output="http"}`) ||
 		strings.Contains(m, `hopcorder_output_errors_total{agent_id="e2e",output="http"} 0`) {
@@ -266,8 +273,10 @@ func TestOutageAndRecovery(t *testing.T) {
 	unique, dupes, maxSeq := ingest.snapshot()
 	produced := st.LastSeq - base
 	t.Logf("spool produced %d records, delivered %d unique (%d duplicates) in %d posts", produced, unique, dupes, ingest.posts)
-	if produced < 30 {
-		t.Fatalf("only %d records produced", produced)
+	// At least the 8 outage cycles beyond what was delivered before it
+	// (allowing for the last cycles being counted before they are spooled).
+	if produced < uint64(before)+6 {
+		t.Fatalf("only %d records produced, %d delivered before the outage", produced, before)
 	}
 	if p := sp.Pending("http"); p != 0 {
 		t.Errorf("%d records still pending after recovery", p)
@@ -289,6 +298,17 @@ func TestOutageAndRecovery(t *testing.T) {
 	if st.Dropped != 0 {
 		t.Errorf("spool dropped %d records", st.Dropped)
 	}
+}
+
+// cycles sums hopcorder_cycles_total over its series in a metrics page.
+func cycles(page string) (n float64) {
+	for _, l := range strings.Split(page, "\n") {
+		if f := strings.Fields(l); len(f) == 2 && strings.HasPrefix(f[0], "hopcorder_cycles_total{") {
+			v, _ := strconv.ParseFloat(f[1], 64)
+			n += v
+		}
+	}
+	return n
 }
 
 func grep(s, sub string) string {
