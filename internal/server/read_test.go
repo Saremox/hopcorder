@@ -212,11 +212,12 @@ func TestTopologyByteBudget(t *testing.T) {
 }
 
 // With allowed hosts, other Host headers get 421 (DNS rebinding), except on
-// the health and metrics endpoints; without, every host is served.
+// the health and metrics endpoints; without, every host is served. A
+// "*.domain" entry allows one label below the domain, like an Ingress host.
 func TestHostCheck(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	s := New(Options{Store: newFakeStore(), Logger: quietLogger(), Registry: reg, UI: http.NotFoundHandler(),
-		AllowedHosts: []string{"localhost", "127.0.0.1", "::1", "Hopcorder.Example."}})
+		AllowedHosts: []string{"localhost", "127.0.0.1", "::1", "Hopcorder.Example.", "*.Lab.Example"}})
 	s.SetReady()
 	h := s.Handler()
 	for _, tc := range []struct {
@@ -233,6 +234,12 @@ func TestHostCheck(t *testing.T) {
 		{"rebind.attacker.example", "/ui/", 421},
 		{"127.0.0.2:8080", "/", 421},
 		{"", "/api/v1/query/targets", 421},
+		{"hc.lab.example", "/api/v1/query/targets", 200},
+		{"HC.Lab.Example.:443", "/ui/", 404}, // served (by the test's UI handler)
+		{"lab.example", "/api/v1/query/targets", 421},
+		{".lab.example", "/api/v1/query/targets", 421},
+		{"a.hc.lab.example", "/api/v1/query/targets", 421},
+		{"hc.lab.example.attacker.example", "/api/v1/query/targets", 421},
 		{"10.1.2.3:8080", "/healthz", 200},
 		{"10.1.2.3:8080", "/readyz", 200},
 		{"10.1.2.3:8080", "/metrics", 200},
@@ -259,8 +266,8 @@ func TestHostCheck(t *testing.T) {
 			refused = mf.GetMetric()[0].GetCounter().GetValue()
 		}
 	}
-	if refused != 5 {
-		t.Errorf("hopcorder_server_host_refused_total = %v, want 5", refused)
+	if refused != 9 {
+		t.Errorf("hopcorder_server_host_refused_total = %v, want 9", refused)
 	}
 
 	open := New(Options{Store: newFakeStore(), Logger: quietLogger()}).Handler()

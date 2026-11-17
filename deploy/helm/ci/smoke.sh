@@ -25,6 +25,22 @@ for i in $(seq 90); do
     if [ "$agents" -ge "$want" ] && [ "$reached" -ge 1 ]; then
       jq -c '.rows[] | {agent_id, target, protocol, cycles, last_reached, last_path_len}' <<<"$streams"
       curl -sf http://127.0.0.1:18080/ui/ | grep -q '<div id="app">'
+      # DNS rebinding: through the port-forward, a page whose own name
+      # resolves to 127.0.0.1 gets 421; probes and scrapers, which use the
+      # pod's address, are served.
+      code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rebind.attacker.example:18080' \
+        http://127.0.0.1:18080/api/v1/query/targets)
+      if [ "$code" != 421 ]; then
+        echo "a request for a foreign Host got $code, want 421"
+        exit 1
+      fi
+      curl -sf -H 'Host: 10.244.0.9:8080' http://127.0.0.1:18080/readyz >/dev/null
+      metrics=$(curl -sf -H 'Host: 10.244.0.9:8080' http://127.0.0.1:18080/metrics)
+      if ! grep -qx 'hopcorder_server_host_refused_total 1' <<<"$metrics"; then
+        echo "other requests were refused too (an agent or a probe?):"
+        grep '^hopcorder_server_host_refused_total' <<<"$metrics" || true
+        exit 1
+      fi
       ro=$(kubectl get secret hopcorder-server-clickhouse-readonly -o jsonpath='{.data.password}' | base64 -d)
       chq() { kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user grafana --password "$ro" --query "$1"; }
       if [ "$(chq 'SELECT count() > 0 FROM hopcorder.cycles')" != 1 ]; then
@@ -36,6 +52,15 @@ for i in $(seq 90); do
         echo "ClickHouse's read-only user can write (or the check failed otherwise): $out"
         exit 1
       fi
+      # Nor can it make ClickHouse spill temporary data to its volume.
+      for s in "max_bytes_before_external_sort = 1000000" "max_bytes_ratio_before_external_group_by = 0.1" \
+        "join_algorithm = 'grace_hash'" "join_algorithm = 'partial_merge'"; do
+        if out=$(chq "SELECT count() FROM numbers(10) SETTINGS $s" 2>&1) ||
+          ! grep -q 'SETTING_CONSTRAINT_VIOLATION' <<<"$out"; then
+          echo "ClickHouse's read-only user may set $s (or the check failed otherwise): $out"
+          exit 1
+        fi
+      done
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then

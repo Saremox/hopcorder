@@ -168,8 +168,9 @@ func serve(ctx context.Context, cfg *config.ServerConfig, logger *slog.Logger, r
 
 	// Every phase of a connection is bounded, so stalled clients cannot pin
 	// connections (and the decode buffers of their requests) indefinitely.
+	// Read-API responses also have a deadline for each part (internal/server).
 	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 2 * time.Minute,
-		WriteTimeout: 2 * time.Minute, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
+		WriteTimeout: server.WriteTimeout, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
 	hosts := "any"

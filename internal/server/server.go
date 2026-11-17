@@ -119,6 +119,9 @@ type Server struct {
 	readSem     chan struct{}
 	readBuf     chan struct{}
 	bodyTimeout time.Duration
+	// writeProgress, if set (tests), replaces the constant: how long a
+	// read-API client has for each part of its response.
+	writeProgress time.Duration
 }
 
 // New returns a server. Call SetReady once migrations have been applied.
@@ -192,19 +195,29 @@ func acquire(ctx context.Context, sem chan struct{}) bool {
 // each of their queries there. max_result_bytes is a backstop at twice the
 // response budget (it counts ClickHouse's in-memory columns, not JSON, and
 // stops only between blocks); the response budget is what truncates.
+//
+// A request keeps its slot until its response is sent, and each part of
+// the response must reach the client within writeProgress, so a client
+// that stops reading gives its slot up then (see writeProgress).
 func (s *Server) limitQueries(h http.HandlerFunc) http.HandlerFunc {
 	settings := clickhouse.Settings{
 		"max_memory_usage":     strconv.FormatInt(s.opts.MaxQueryMemory, 10),
 		"max_result_bytes":     strconv.FormatInt(2*s.opts.MaxResponseBytes, 10),
 		"result_overflow_mode": "break",
 	}
+	progress := s.writeProgress
+	if progress <= 0 {
+		progress = writeProgress
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		pw := newProgressWriter(w, progress, WriteTimeout)
+		defer pw.done()
 		if !acquire(r.Context(), s.querySem) {
-			writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
+			writeJSON(pw, http.StatusServiceUnavailable, errorBody{Error: "too many queries; retry later"})
 			return
 		}
 		defer func() { <-s.querySem }()
-		h(w, r.WithContext(clickhouse.WithSettings(r.Context(), settings)))
+		h(pw, r.WithContext(clickhouse.WithSettings(r.Context(), settings)))
 	}
 }
 

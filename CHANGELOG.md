@@ -21,7 +21,38 @@ The section for a version is the text of its GitHub release.
 
 **Security: read side and Grafana**
 
-<!-- round three: read side -->
+- Grafana's read-only ClickHouse user (the compose stack's, and the server
+  chart's `clickhouse.deploy.readOnlyUser`) can no longer make ClickHouse
+  spill temporary data to disk: one viewer's query with an external sort or
+  GROUP BY, or a grace_hash or partial_merge join, filled ClickHouse's volume
+  until the server's inserts failed. The spill settings are constant now; such
+  a query fails at the memory limit instead. Compose: re-run
+  `deploy/compose/clickhouse-init.sql` on an existing volume (it now replaces
+  the profile).
+- Helm: the server is protected against DNS rebinding. While `kubectl
+  port-forward` ran, as the chart's notes suggest, a web page whose name
+  resolved to 127.0.0.1 could read the read API and post records (a seq of
+  2^64-1 locked its agent out with 409). The chart now sets `allowed_hosts`
+  to `localhost`, `127.0.0.1`, `::1`, the Service's names and the ingress
+  hosts; other Host names get 421, `/healthz`, `/readyz` and `/metrics`
+  still answer any. Upgrading: list the other names clients use (another
+  ingress or gateway, a NodePort or LoadBalancer address) in the new
+  `allowedHosts` value; the chart refuses NodePort and LoadBalancer Services
+  and ingress rules without host until you do (`["*"]` turns the check off).
+  A `config.allowed_hosts` of your own replaces the chart's list.
+- `allowed_hosts` takes `*.example.net` (one label below `example.net`, as
+  an Ingress host of that form), so wildcard ingress hosts work.
+- The read API gives up on a client that stops reading its response after
+  10 s (each 64 KiB of it must be taken within 10 s), which frees its
+  `query.max_concurrent` slot: eight such connections kept the read API and
+  the UI at 503 for as long as they stayed open, up to two minutes each.
+- The ASN database is bounded by its memory: at most 2 million ranges,
+  500,000 distinct ASes and 16 MiB of AS names (the real file has about
+  600,000 ranges), stored compactly (31 instead of 73 bytes per range). A
+  45 MiB download within the old bounds took the server's heap to 1.35 GB
+  and got it OOM-killed in the chart's 1 GiB container on every try; the
+  worst file the new bounds allow peaks at about 380 MiB while the old
+  database is still in use.
 
 **Security: agent**
 

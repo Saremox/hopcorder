@@ -843,8 +843,9 @@ added in the commit that introduced it.
   stream-sticky routing first. The chart owns `listen`, the ASN cache path
   (an emptyDir, or a PVC with `persistence.enabled`), `password_file` (with
   `clickhouse.passwordSecret` or `clickhouse.deploy`) and, with
-  `clickhouse.deploy`, `clickhouse.url` and `clickhouse.user`; everything else
-  in `values.config` is the server's config file as-is.
+  `clickhouse.deploy`, `clickhouse.url` and `clickhouse.user`, and, unless
+  `config.allowed_hosts` is set, `allowed_hosts` (round three); everything
+  else in `values.config` is the server's config file as-is.
 - **Bundled ClickHouse (opt-in, `clickhouse.deploy.enabled`)**, added after
   v0.1.1 for deployments where hopcorder is a monitoring aid: a one-replica
   StatefulSet of the official `clickhouse/clickhouse-server` image (25.8, the
@@ -874,9 +875,10 @@ added in the commit that introduced it.
     password read from the environment (`from_env`): `GRANT SELECT` on the
     hopcorder database only and the compose stack's bounded profile
     (`readonly = 2`, time, memory and concurrency limits with `MIN 1`, the
-    cancel setting const). Checked on 25.8: it reads the tables, and writes,
-    `system.users`, `url()`, `max_execution_time = 0` and changing the cancel
-    setting are refused.
+    cancel setting and, since round three, the spill settings const).
+    Checked on 25.8: it reads the tables, and writes, `system.users`,
+    `url()`, `max_execution_time = 0`, changing the cancel setting and
+    spilling to disk are refused.
   - Runs as the image's `clickhouse` user (uid 101, `fsGroup` 101) without
     capabilities or privilege escalation; the root file system stays
     writable because the entrypoint writes its user file into
@@ -952,7 +954,8 @@ fixes. The decisions:
   into a tab); credentials in `clickhouse.url` are refused (use `user` and
   `password`); `/readyz` no longer returns ClickHouse's error text.
 - **ASN database**: at most 64 MiB downloaded and 256 MiB uncompressed (it
-  is about 7 and 30 MB), 5 million ranges, AS names cut to 128 bytes without
+  is about 7 and 30 MB), 5 million ranges (2 million, 500,000 ASes and
+  16 MiB of names since round three), AS names cut to 128 bytes without
   control characters; redirects from https to http are refused; a plain-http
   URL is warned about at startup.
 
@@ -1110,8 +1113,8 @@ decisions:
   most once a minute). Default without the option: on a loopback listen
   address, `localhost`, `127.0.0.1`, `::1` and the listen host; on any other
   address no check, because the server is reached under service names, pod
-  IPs and ingress hosts it cannot know (Helm, containers). `"*"` turns it
-  off. `/healthz`, `/readyz` and `/metrics` answer every host (probes and
+  IPs and ingress hosts it cannot know (Helm, containers; the server chart
+  sets the list since round three). `"*"` turns it off. `/healthz`, `/readyz` and `/metrics` answer every host (probes and
   scrapers use addresses). A proxy on the same host that passes the client's
   Host on (Caddy, Traefik; nginx sends the upstream's by default) needs its
   public names listed. The compose stack's server listens on 0.0.0.0 in its
@@ -1137,11 +1140,14 @@ decisions:
   may lower these, not raise them, and cannot switch profiles. The
   plugin's own query timeout must stay at or below 300 s. The script runs on
   the first start of an empty volume and can be re-run on an older one
-  (every statement is `IF NOT EXISTS`).
+  (every statement is `IF NOT EXISTS`; since round three the profile is
+  `OR REPLACE`, so a re-run also updates it).
 - **ASN names are copied out of their line** (`strings.Clone`): a name was
   a substring of the line it came from, so a small, compressible download
   with 60 KB lines kept up to the whole 256 MiB it inflated to (measured:
-  500 such lines kept 32 MB; with the copy, under 1 MB).
+  500 such lines kept 32 MB; with the copy, under 1 MB). Since round three
+  the copy goes into the database's one string of names, and
+  `TestParseDoesNotPinLines` still holds.
 - **Checked and unchanged**: the UI escapes everything it puts into
   tooltips (rendered in Chromium with HTML in AS names and in IPv6 zones,
   `{b}` and `$'` template tokens included; nothing was injected, no CSP
@@ -1543,8 +1549,157 @@ high-severity issue. Four fixes followed. The decisions:
 <!-- round three: ingest -->
 
 **Read side, enrichment and the browser**
-
-<!-- round three: read side -->
+- **Grafana's ClickHouse user cannot spill to disk** (`grafana_limits` in
+  `deploy/compose/clickhouse-init.sql`, `hopcorder_readonly` in the chart's
+  `readonly.xml`). `readonly = 2` let a query set the spill settings, and
+  ClickHouse wrote the temporary data to its data volume: one
+  `ORDER BY rand()` over `numbers(1e10)` with
+  `max_bytes_before_external_sort` wrote about 100 MB/s, filled a 2 GB
+  volume in 20 s, and the server's inserts failed with NOT_ENOUGH_SPACE
+  (25.8). External GROUP BY and the grace_hash, partial_merge, auto and
+  prefer_partial_merge joins spill the same way.
+  `max_temporary_data_on_disk_size_for_user`/`_for_query` did not hold
+  (temporary data grew past 1.5 GB against a 500 MB cap). Now
+  `max_bytes_before_external_{sort,group_by}` and
+  `max_bytes_ratio_before_external_{sort,group_by}` are `0 CONST`, and
+  `join_algorithm` is `'direct,parallel_hash,hash' CONST` (25.8's default:
+  in-memory joins only). A query that does not fit `max_memory_usage` fails
+  instead, also without settings (the ratios default to 0.5, spilling at
+  half the memory limit). Setting a constant to its own value still works.
+  - Checked on 25.8, for the compose user and for the chart's rendered
+    `readonly.xml`: every variant (sort and GROUP BY by bytes and by ratio,
+    each spilling join algorithm, in the query and as URL parameters) fails
+    with SETTING_CONSTRAINT_VIOLATION and writes no temporary data; switching
+    to the `default` profile does not lift the constraints.
+  - The plugin sends none of these settings: 4.23.5 sends the data source's
+    custom settings (ours has none) and `limit` with a row limit, and
+    clickhouse-go 2.50.0 adds `max_execution_time` from the query's deadline
+    (read in their source). The CI `grafana` job runs every dashboard query
+    through the plugin.
+  - The server's own read queries use the server's user, which has no such
+    profile: unchanged.
+  - The compose profile is created with `OR REPLACE`, so re-running the
+    script on an existing volume applies it (`IF NOT EXISTS` kept the old
+    profile).
+  - Accepted: `system.query_log` keeps each query's text (at most what the
+    client sent; in the chart for `systemLogRetentionDays`), so a viewer can
+    still write to disk at the rate they upload SQL, without amplification.
+  - Tests: `TestGrafanaUserClickHouse` (`clickhouse` tag) creates the
+    compose user from the script, runs every dashboard query with it and
+    every spill variant, which it refused only with the fix;
+    `deploy/helm/ci/smoke.sh` runs spill settings as the chart's user in
+    kind, and the CI `helm` job checks that the rendered `readonly.xml`
+    makes them constant.
+- **The server chart sets `allowed_hosts`.** The chart listens on 0.0.0.0,
+  where the server's default is no Host check, and its NOTES send the
+  operator to `kubectl port-forward` and `http://127.0.0.1:8080/ui/`; port
+  forwarding passes the Host header through, so a page whose name was
+  rebound to 127.0.0.1 read the read API and posted records (reproduced:
+  `{"accepted":1}` for seq 2^64-1 under a real agent_id, which 409s that
+  agent for good). Round two's fix did not cover the documented Helm path.
+  The chart now renders `allowed_hosts`: `localhost`, `127.0.0.1`, `::1`
+  (the port-forward), `<fullname>`, `<fullname>.<ns>`, `<fullname>.<ns>.svc`
+  and `<fullname>.<ns>.svc.<clusterDomain>` (the agents; `clusterDomain`,
+  default `cluster.local`, is a new value), the ingress hosts, and the new
+  `allowedHosts` value for other names; `"*"` in it renders `["*"]`, no
+  check. A `config.allowed_hosts` of the operator's own is used as it is.
+  The list matches names without port, so every Service port works.
+  - Nothing that worked stops: kubelet probes (Host = pod IP) and Prometheus
+    (pod IP) only use `/healthz`, `/readyz` and `/metrics`, which round two
+    already exempted; agents use the Service's names; the smoke test uses
+    the port-forward. In kind the smoke test checks that a foreign Host gets
+    421 while `/readyz` and `/metrics` answer under a pod-IP Host, and that
+    exactly that one request was refused
+    (`hopcorder_server_host_refused_total`).
+  - Names the chart cannot know: a NodePort or LoadBalancer Service (node
+    and load-balancer addresses, external DNS names) and an ingress rule
+    without host (any name). For those the chart fails at template time
+    until `allowedHosts` lists something: an upgrade stops with the
+    instructions instead of agents getting 421 at run time. Other ways in
+    that the chart does not render (a second Ingress, a Gateway, a proxy
+    that passes the client's Host on, pod IPs) are refused with 421 and
+    logged with the Host, once a minute; they go into `allowedHosts`.
+  - Wildcard ingress hosts (`*.example.net`) would have made the server
+    refuse its config, so `allowed_hosts` now accepts `*.domain`: names one
+    label below the domain, as Kubernetes routes them (not `example.net`
+    itself, not `a.b.example.net`). Safe for the same reason as a listed
+    name: a rebinding page sends its own name, which an attacker cannot put
+    under the operator's domain.
+  - NOTES print the list (or warn when it is `*`). Entries are checked at
+    template time (host name, `*.domain` or address, no port), so a bad one
+    fails the install instead of crash-looping the server.
+  - Tests: `TestHostCheck` and `TestHostAllowlist` cover `*.domain`; the CI
+    `helm` job renders the list (service names, ingress host, extra names,
+    `*`, `config.allowed_hosts`) and the refusals; smoke.sh as above.
+- **A read-API client that stops reading loses its slot after 10 s.** A
+  request held its `query.max_concurrent` slot for the whole response, and
+  the only bound on writing it was the server's 2-minute `WriteTimeout`: 8
+  connections that sent `cycles?limit=1000` and never read kept every other
+  read request and the UI at 503 (the review: 503 at 2, 52 and 102 s, 200
+  at 137 s), and could start over. Now every write of a read-API response,
+  in parts of at most 64 KiB (topology writes its response at once), and
+  every flush get a deadline 10 s from then, never past the request's
+  `WriteTimeout` (`server.WriteTimeout`, which the http.Server uses; a
+  write deadline replaces the server's). 64 KiB in 10 s is 6.4 KB/s, far
+  below any real link; 10 s is also how long a request waits for a slot.
+  - The slot is still held while the response is sent rather than given
+    back once ClickHouse has finished (`wait_end_of_query`): ClickHouse
+    keeps a finished result in a temporary file, and the query in
+    `system.processes`, until the server has read it (measured on 25.8: a
+    2M-row result read at 20 KB/s sat in a 261 MB file in
+    `/var/lib/clickhouse/tmp`). Without the slot, unread results would pile
+    up there without bound.
+  - Accepted: a client that keeps reading at least 64 KiB every 10 s holds
+    its slot until its response is done or `WriteTimeout`, as a slow
+    download does; and clients can still take every slot by opening new
+    connections every 10 s, as they can with ordinary requests. Both are
+    for a rate limit at the proxy (a buffering proxy, nginx's default,
+    absorbs slow readers entirely).
+  - Tests: `TestNonReadingClientLosesQuerySlot` (one slot, small socket
+    buffers, a client that never reads): another reader gets 200 within a
+    second; without the deadlines it got 503 after the 10 s queue wait.
+    `TestSlowReaderGetsWholeResponse`: a client reading 1.6 MB/s gets a
+    2.4 MB topology response whole with a 0.5 s deadline per part; with one
+    deadline for the whole write it was cut off after 0.6 s.
+- **The ASN database's bounds bound its memory.** Round one's limits (64
+  MiB download, 256 MiB uncompressed, 5 million ranges) let a 45 MiB gzip
+  of 5M ranges with unique AS names through; parsing it peaked at 1.35 GB
+  of live heap (a 56-byte range, a 40-byte `ASNInfo` with two strings and
+  an index-map entry per line), and the server in the chart's 1 GiB
+  container was OOM-killed. The old database stays loaded during a parse
+  and the cache is written only after a successful one, so it crash-looped
+  for as long as the file was served. Now:
+  - New bounds: 2 million ranges, 500,000 distinct (AS, country, name) and
+    16 MiB of countries and names together. The real file has about
+    600,000 ranges, 7 MB gzipped and 30 MB uncompressed (not re-measured:
+    iptoasn.com is not reachable from the development container); the
+    figure of about 80,000 ASes is roughly the number of ASes in BGP.
+  - Compact storage: IPv4 ranges as two `uint32` and an index (12 bytes),
+    IPv6 ranges as two pairs of `uint64` (40 bytes), each AS as 12 bytes
+    pointing into one string that holds every country and name. The index
+    used while parsing maps a seeded `maphash` of AS, country and name to
+    the AS (a collision moves on to the next hash value), so it holds no
+    copy of the names. `ASNInfo` strings returned by `Lookup` share that
+    string, so an old database's text (at most 16 MiB) lives as long as a
+    caller holds one of its names (rows being inserted).
+  - Measured (`TestASNWorstCaseMemory`, opt-in with
+    `HOPCORDER_ASN_MEMTEST=1`): the worst file the bounds allow (2M IPv6
+    ranges, 500,000 ASes, 16 MiB of names; 14 MiB gzipped) is about 105 MB
+    in memory; parsing it while another is in use, with a 64 MiB download
+    held, peaks at 383 MiB of live heap (GOGC 5; 534 MiB at GOGC 100) and
+    keeps 273 MiB. With the old storage the same test peaked at 563 MiB
+    (788 MiB), and the new range and AS bounds alone, without the one on
+    the names' total, allowed 604 MiB (824 MiB) even without a download
+    held: they were not enough by themselves. The server in a 1 GiB
+    container (Go memory limit 966 MB from the cgroup) downloaded it three
+    times at a 1-minute refresh, each parse next to the previous database,
+    without exceeding 600 MiB. The review's 45 MiB file now fails after
+    0.4 s (more than 500,000 ASes) at a peak of 135 MiB.
+  - Lookups are unchanged (`TestParseAndLookup`; IPv4 and IPv6 at the top
+    of the address space and every generated range in the new tests).
+  - Tests: `TestParseMemoryBounds` (each bound, lowered) and
+    `TestASNDatabaseIsCompact` (200,000 ranges keep 31 bytes each; with the
+    old storage 73, over the test's limit of about 54) both failed before.
 
 **Agent**
 

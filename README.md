@@ -142,7 +142,12 @@ helm install hopcorder-agent oci://ghcr.io/saremox/charts/hopcorder-agent --vers
 
 - **Server**: one replica (it derives route changes and outages from each
   stream's history in memory), `Recreate` on upgrade, probes on `/healthz`
-  and `/readyz`, optional Ingress and ServiceMonitor.
+  and `/readyz`, optional Ingress and ServiceMonitor. Against DNS rebinding
+  (a web page reaching the UI while `kubectl port-forward` runs), it answers
+  only `localhost`, `127.0.0.1`, `::1`, the Service's names and the ingress
+  hosts; list other names clients use in `allowedHosts` (the chart insists
+  for NodePort and LoadBalancer Services and ingress rules without host;
+  `["*"]` turns the check off).
 - **ClickHouse**: bring your own (an operator or a managed service, for high
   availability), or set `clickhouse.deploy.enabled=true` for a single pod
   next to the server, enough for a monitoring aid: the official
@@ -512,7 +517,9 @@ server's address), the server answers only requests whose `Host` header is in
 `allowed_hosts` (any port), others get 421. Without the option, a server on a
 loopback address answers `localhost`, `127.0.0.1`, `::1` and its listen host;
 on any other address it checks nothing, since it is reached under service
-names, pod IPs and ingress hosts it cannot know: list them to get the check.
+names, pod IPs and ingress hosts it cannot know: list them to get the check
+(the Helm chart lists its own). `*.example.net` allows the names one label
+below `example.net`, as an Ingress host of that form routes them.
 A reverse proxy on the same host that passes the client's `Host` on (Caddy,
 Traefik; nginx sends the upstream's by default) needs its public names in
 the list. `"*"` turns the check off; `/healthz`, `/readyz` and `/metrics`
@@ -643,7 +650,8 @@ ClickHouse data source. Give Grafana a read-only ClickHouse user with bounded
 queries, as [`deploy/compose/clickhouse-init.sql`](deploy/compose/clickhouse-init.sql)
 does: anyone who can open a dashboard can send Grafana SQL, with any
 settings it allows (`max_execution_time = 0` included, unless a settings
-profile constrains it). Set Grafana's `server.domain` and `enforce_domain`
+profile constrains it, and the spill settings, with which one query can fill
+ClickHouse's disk with temporary data). Set Grafana's `server.domain` and `enforce_domain`
 when it runs on localhost, as the compose stack does, against DNS rebinding.
 
 ## Development

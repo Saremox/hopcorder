@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // Read-API response bounds.
@@ -19,6 +20,72 @@ const (
 	// is written to the client.
 	streamFlushBytes = 64 << 10
 )
+
+// Writing to read-API clients.
+const (
+	// WriteTimeout bounds writing one response (the http.Server's
+	// WriteTimeout); the read API's per-write deadlines never reach past it.
+	WriteTimeout = 2 * time.Minute
+	// writeProgress is how long a read-API client has to take each
+	// writeChunk of its response. A client that stops reading loses its
+	// query slot then, rather than at WriteTimeout: the slot stays taken
+	// while a response is sent, because ClickHouse keeps the finished
+	// result of a wait_end_of_query query (in a temporary file) and its
+	// connection until the server has read it. 64 KiB in 10 s is far below
+	// any real link, and 10 s is also how long a request waits for a slot.
+	writeProgress = 10 * time.Second
+	writeChunk    = 64 << 10
+)
+
+// progressWriter gives every write of at most writeChunk bytes, and every
+// flush, its own deadline: progress from now, but never past until.
+type progressWriter struct {
+	http.ResponseWriter
+	rc       *http.ResponseController
+	progress time.Duration
+	until    time.Time
+}
+
+func newProgressWriter(w http.ResponseWriter, progress, total time.Duration) *progressWriter {
+	return &progressWriter{ResponseWriter: w, rc: http.NewResponseController(w), progress: progress,
+		until: time.Now().Add(total)}
+}
+
+func (p *progressWriter) deadline() {
+	d := time.Now().Add(p.progress)
+	if d.After(p.until) {
+		d = p.until
+	}
+	// Not every ResponseWriter supports deadlines (tests).
+	_ = p.rc.SetWriteDeadline(d)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n := 0
+	for len(b) > 0 {
+		p.deadline()
+		m, err := p.ResponseWriter.Write(b[:min(len(b), writeChunk)])
+		n += m
+		if err != nil {
+			return n, err
+		}
+		b = b[m:]
+	}
+	return n, nil
+}
+
+// FlushError is what http.ResponseController.Flush calls.
+func (p *progressWriter) FlushError() error {
+	p.deadline()
+	return p.rc.Flush()
+}
+
+// done leaves the overall deadline for what net/http still sends after
+// the handler (the end of a chunked body).
+func (p *progressWriter) done() { _ = p.rc.SetWriteDeadline(p.until) }
+
+// Unwrap lets http.ResponseController reach the connection.
+func (p *progressWriter) Unwrap() http.ResponseWriter { return p.ResponseWriter }
 
 // errResponseFull ends a query whose next row does not fit the response.
 var errResponseFull = errors.New("response byte budget reached")
