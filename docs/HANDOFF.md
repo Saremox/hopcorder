@@ -1140,11 +1140,14 @@ decisions:
   may lower these, not raise them, and cannot switch profiles. The
   plugin's own query timeout must stay at or below 300 s. The script runs on
   the first start of an empty volume and can be re-run on an older one
-  (every statement is `IF NOT EXISTS`).
+  (every statement is `IF NOT EXISTS`; since round three the profile is
+  `OR REPLACE`, so a re-run also updates it).
 - **ASN names are copied out of their line** (`strings.Clone`): a name was
   a substring of the line it came from, so a small, compressible download
   with 60 KB lines kept up to the whole 256 MiB it inflated to (measured:
-  500 such lines kept 32 MB; with the copy, under 1 MB).
+  500 such lines kept 32 MB; with the copy, under 1 MB). Since round three
+  the copy goes into the database's one string of names, and
+  `TestParseDoesNotPinLines` still holds.
 - **Checked and unchanged**: the UI escapes everything it puts into
   tooltips (rendered in Chromium with HTML in AS names and in IPv6 zones,
   `{b}` and `$'` template tokens included; nothing was injected, no CSP
