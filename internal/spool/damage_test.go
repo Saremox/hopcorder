@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // These tests damage spool files and open them in a child process
@@ -45,16 +48,17 @@ func (v pageView) leafValue(id uint64, i int) int {
 	return int(id)*v.ps + pageHeaderSize + i*elementSize + int(ne.Uint32(e[4:])) + int(ne.Uint32(e[8:]))
 }
 
+// meta returns the meta page with the higher txid.
 func (v pageView) meta() boltMeta {
-	m := [2]boltMeta{}
-	for i := range m {
-		p := v.page(uint64(i))[pageHeaderSize:]
-		m[i] = boltMeta{root: ne.Uint64(p[16:]), freelist: ne.Uint64(p[32:]), hwm: ne.Uint64(p[40:]), txid: ne.Uint64(p[48:])}
+	if m0, m1 := v.metaAt(0), v.metaAt(1); m1.txid > m0.txid {
+		return m1
 	}
-	if m[1].txid > m[0].txid {
-		return m[1]
-	}
-	return m[0]
+	return v.metaAt(0)
+}
+
+func (v pageView) metaAt(id uint64) boltMeta {
+	p := v.page(id)[pageHeaderSize:]
+	return boltMeta{root: ne.Uint64(p[16:]), freelist: ne.Uint64(p[32:]), hwm: ne.Uint64(p[40:]), txid: ne.Uint64(p[48:])}
 }
 
 // bucketRoot returns the root page of the named top-level bucket.
@@ -343,6 +347,193 @@ func TestDirectedDamageIsQuarantined(t *testing.T) {
 				t.Errorf("damaged file kept\n%s", out)
 			}
 		})
+	}
+}
+
+// craftedMeta returns the review's crafted spool (round four): meta page 1
+// rewritten into one with the higher txid, a valid checksum, twice the page
+// size, and as root a free page made into the given branch. bbolt checks
+// only a meta's magic, version and checksum, so it uses that meta and its
+// tree. checkPages refused the meta for its page size and checked the
+// other's tree instead, then bbolt's own check ran on the crafted one.
+func craftedMeta(t *testing.T, branch func(v pageView, root, child uint64)) []byte {
+	t.Helper()
+	base := buildSpool(t)
+	if base.meta() != base.metaAt(0) {
+		// Make meta page 0 the newer one, so that bbolt takes its page
+		// size from page 0, the meta this leaves alone.
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, fileName), base.b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Update(func(*bolt.Tx) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(filepath.Join(dir, fileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if base = view(b); base.meta() != base.metaAt(0) {
+			t.Fatal("meta page 0 is still the older one")
+		}
+	}
+	v := pageView{b: append([]byte(nil), base.b...), ps: base.ps}
+	m := v.metaAt(0)
+	var f uint64 // the lowest free page
+	for p := range v.freePages() {
+		if f == 0 || p < f {
+			f = p
+		}
+	}
+	if f == 0 {
+		t.Fatal("no free page")
+	}
+	pg := v.page(f)
+	clear(pg[:v.ps])
+	binary.NativeEndian.PutUint64(pg[0:], f)
+	binary.NativeEndian.PutUint16(pg[8:], flagBranch)
+	branch(v, f, m.root)
+	meta := v.page(1)[pageHeaderSize:]
+	copy(meta, v.page(0)[pageHeaderSize:pageHeaderSize+64])
+	binary.NativeEndian.PutUint32(meta[8:], uint32(2*v.ps)) //nolint:gosec // a page size
+	binary.NativeEndian.PutUint64(meta[16:], f)
+	binary.NativeEndian.PutUint64(meta[48:], m.txid+1)
+	h := fnv.New64a()
+	_, _ = h.Write(meta[:56])
+	binary.NativeEndian.PutUint64(meta[56:], h.Sum64())
+	return v.b
+}
+
+// The review's crafted spools got past checkPages, which chose another
+// meta page than bbolt does, and then crashed or hung every start: a fault
+// in tx.Check's goroutine, or a cursor walk descending for ever. They are
+// quarantined now.
+func TestCraftedMetaIsQuarantined(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	// key adds a branch element pointing at child whose key is at offset
+	// pos from the element (and, unless pos is far off, is "k").
+	key := func(v pageView, id uint64, i int, pos uint32, k string, child uint64) {
+		e := v.elem(id, i)
+		binary.NativeEndian.PutUint32(e[0:], pos)
+		binary.NativeEndian.PutUint32(e[4:], uint32(len(k))) //nolint:gosec // short
+		binary.NativeEndian.PutUint64(e[8:], child)
+		if int(pos) < v.ps {
+			copy(e[pos:], k)
+		}
+	}
+	cases := []struct {
+		name   string
+		branch func(v pageView, root, child uint64)
+	}{
+		{"branch key outside the mapping", func(v pageView, root, child uint64) {
+			binary.NativeEndian.PutUint16(v.page(root)[10:], 1)
+			key(v, root, 0, 0x7ff00000, "meta", child)
+		}},
+		{"branch pointing at itself", func(v pageView, root, _ uint64) {
+			binary.NativeEndian.PutUint16(v.page(root)[10:], 1)
+			key(v, root, 0, elementSize, "meta", root)
+		}},
+		// A seek reads keys 1 and 2, the cursor walk none, tx.Check (in a
+		// goroutine of its own) all three.
+		{"key only tx.Check reads outside the mapping", func(v pageView, root, child uint64) {
+			binary.NativeEndian.PutUint16(v.page(root)[10:], 3)
+			key(v, root, 0, 0x7ff00000, "0000", child)
+			key(v, root, 1, 2*elementSize+8, "a", child)
+			key(v, root, 2, elementSize+16, "z", child)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := craftedMeta(t, c.branch)
+			path := filepath.Join(t.TempDir(), fileName)
+			if err := os.WriteFile(path, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := checkPages(path, int(ne.Uint32(b[pageHeaderSize+8:]))); err == nil {
+				t.Error("checkPages accepts the crafted file")
+			}
+			for start := 1; start <= 2; start++ {
+				out, moved, err := runChild(t.Context(), t, b, "use")
+				if err != nil {
+					t.Fatalf("start %d: %v\n%s", start, err, out)
+				}
+				if !moved {
+					t.Errorf("start %d: crafted file kept\n%s", start, out)
+				}
+			}
+		})
+	}
+}
+
+// rleBomb is a zstd frame of n RLE blocks of 128 KiB of '{' each: 4 bytes
+// of input per 128 KiB of output, and no content size in its header.
+func rleBomb(n int) []byte {
+	b := []byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38} // magic; no checksum or size; window 128 KiB
+	for i := range n {
+		h := uint32(128<<10)<<3 | 1<<1 // block size, type RLE
+		if i == n-1 {
+			h |= 1 // last block
+		}
+		b = append(b, byte(h), byte(h>>8), byte(h>>16), '{')
+	}
+	return b
+}
+
+// replaceRecord stores val as the record seq of the closed spool in dir.
+func replaceRecord(t *testing.T, dir string, seq uint64, val []byte) {
+	t.Helper()
+	db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketRecords).Put(seqKey(seq), append(binary.BigEndian.AppendUint64(nil, uint64(time.Now().UnixNano())), val...)) //nolint:gosec // now
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The review's decompression bomb (round four): a 48 KiB stored value that
+// decodes to 1.5 GiB. With the decoder's default bound (64 GiB) every start
+// took the heap past 512 MiB here, and the agent was OOM-killed in the
+// chart's 256 MiB on every start; it is not damage bbolt or the page check
+// can see, so it was never quarantined. Now it decodes to at most
+// maxRecordSize, fails, and is skipped like any undecodable record.
+func TestDecompressionBombIsSkipped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns processes")
+	}
+	dir := t.TempDir()
+	s := open(t, dir, "a", "b")
+	seqs := appendN(t, s, 3)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	replaceRecord(t, dir, seqs[1], rleBomb(12<<10)) // 12,288 blocks: 1.5 GiB
+	b, err := os.ReadFile(filepath.Join(dir, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for start := 1; start <= 2; start++ {
+		out, _, err := runChild(t.Context(), t, b, "use")
+		if err != nil {
+			t.Fatalf("start %d: %v\n%.600s", start, err, out)
+		}
+		if !strings.Contains(out, "skipping undecodable record") {
+			t.Errorf("start %d: the bomb was not skipped\n%.600s", start, out)
+		}
 	}
 }
 

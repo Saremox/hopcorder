@@ -44,6 +44,8 @@ The section for a version is the text of its GitHub release.
   stored; plan for `max_concurrent` of them. Decoded records no longer keep
   spare capacity, which made it up to 3.6 times.
 
+<!-- round four: ingest -->
+
 **Security: read side and Grafana**
 
 - Grafana's read-only ClickHouse user (the compose stack's, and the server
@@ -83,6 +85,10 @@ The section for a version is the text of its GitHub release.
   took 3.1 GiB and 29 s, more than a read query may use (1 GiB), so long
   paths, real or sent to that end, broke the view; now 49 MiB and 0.4 s.
 
+<!-- round four: grafana user -->
+
+<!-- round four: read API -->
+
 **Security: agent**
 
 - Spoofed packets from anywhere can no longer forge hops, loops or a
@@ -112,6 +118,52 @@ The section for a version is the text of its GitHub release.
   with an error in the log and `hopcorder_flow_in_use` at 1, and they
   resume by themselves once the identifier is free. Every other target is
   probed. `--once` prints the other targets' records and exits 1.
+- A metrics `path` the endpoint could not serve (`/metrics x`, `/{x`,
+  `/a{b}` and the like) passed validation and then panicked the agent at
+  start, or on the reload that brought it: exit 2, and again on every
+  restart until the file was fixed. `metrics.path` now takes `/` and then
+  only `[A-Za-z0-9/._~-]` (at most 256 characters), so a reload to another
+  one keeps the running configuration, and the endpoint serves exactly that
+  path (a path ending in `/` no longer serves the paths below it).
+- A reload that fails and is reverted no longer frees the ICMP echo
+  identifier to a local user. The new configuration released the running
+  one's identifiers before it had started, so when it then failed (a JSONL
+  directory missing, a TLS file unreadable, the spool locked), a process
+  polling `bind()` took the old identifier, and the reverted
+  configuration's ICMP targets were not probed until it let go. Both
+  configurations' identifiers are now held while the new one starts, and
+  the old ones released once it runs.
+- A JSONL write that blocks (a FIFO for a log shipper that is not reading,
+  stdout under a blocking log driver, a hung NFS mount) no longer hangs a
+  reload or the shutdown. The agent waited for it for good: after SIGHUP
+  nothing was probed, the metrics endpoint answered 200 with frozen
+  numbers, and SIGTERM was ignored until systemd killed the agent. Writes
+  to FIFOs and pipes now give up when the outputs stop; a delivery still
+  blocked 3 s later is left behind, logged and counted in the new
+  `hopcorder_output_abandoned_total{output}` (its records stay spooled).
+  The metrics endpoint answers 503 from the moment probing stops. JSONL to
+  a FIFO or pipe also works now: every batch failed at its fsync after it
+  was written, and was written again on every retry.
+- A spool file crafted to get past the page check (a meta page with a
+  higher txid and another page size, which the check passed over for the
+  other one, while bbolt used it) crashed or hung the agent on every start.
+  The check now picks the meta page as bbolt does and quarantines such a
+  file. It takes write access to the spool file; random damage cannot do
+  this.
+- A spooled record decodes to at most 8 MiB (the largest the agent writes
+  is about 220 KB). A 48 KiB stored value that decoded to 1.5 GiB got the
+  agent OOM-killed on every start, and was never quarantined; such a record
+  is now skipped like any undecodable one.
+- `hopcorder_flow_in_use` counts the targets of its series that are not
+  probed. Two targets with the same host and protocol (another `port` or
+  `af`) share every per-target series, and the gauge flapped between 0 and
+  1 when only one of them was refused; the agent now also warns at start
+  about targets that share series.
+- Documented: the 32 random bits a forged reply must guess are a rate at
+  line rate (a fake hop about every 2 to 3 minutes at 1 GbE while probes
+  are in flight, about every 12 minutes with the defaults). README has an
+  alert rule on `hopcorder_probe_mismatched_replies_total`, which counts
+  the many near misses that come before.
 
 **Security: CI, release and deployment**
 
@@ -147,6 +199,8 @@ The section for a version is the text of its GitHub release.
 - Go: install a released version (`go install …@v0.1.1`), not `@latest`:
   the Go module proxy takes any `v*` tag as a version, released or not, and
   keeps it. `go.mod` retracts the withdrawn v0.1.0.
+
+<!-- round four: deployment -->
 
 ## v0.1.1
 

@@ -49,6 +49,58 @@ func (m *memOutput) all() []string {
 	return out
 }
 
+// stuckOutput's deliveries block, whatever their context, until release is
+// closed: a write to a pipe nobody reads on a blocking descriptor.
+type stuckOutput struct {
+	name    string
+	release chan struct{}
+	entered chan struct{}
+}
+
+func (s *stuckOutput) Name() string { return s.name }
+func (s *stuckOutput) Close() error { return nil }
+func (s *stuckOutput) Deliver(context.Context, [][]byte) error {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	<-s.release
+	return nil
+}
+
+// Stop waits a bounded time for every drain, leaves a stuck one behind
+// and counts it. (A reload used to wait for it for good.)
+func TestDrainsStopLeavesStuckDeliveryBehind(t *testing.T) {
+	s := openSpool(t, "ok", "stuck")
+	ok := &memOutput{name: "ok"}
+	stuck := &stuckOutput{name: "stuck", release: make(chan struct{}), entered: make(chan struct{}, 1)}
+	defer close(stuck.release)
+	quiet := slog.New(slog.DiscardHandler)
+	d := StartDrains(t.Context(), s, []Output{ok, stuck}, []DrainOptions{{Logger: quiet}, {Logger: quiet}})
+	push(t, s, 3)
+	<-stuck.entered
+	eventually(t, 5*time.Second, func() bool { return len(ok.all()) == 3 }, "the other output's records")
+	before := abandonedCount("stuck").Load()
+	start := time.Now()
+	left := d.Stop(200*time.Millisecond, quiet)
+	if took := time.Since(start); took < 200*time.Millisecond || took > 2*time.Second {
+		t.Errorf("Stop took %v, want about the grace of 200ms", took)
+	}
+	if len(left) != 1 || left[0] != "stuck" {
+		t.Errorf("left behind %v, want [stuck]", left)
+	}
+	if n := abandonedCount("stuck").Load() - before; n != 1 {
+		t.Errorf("counted %d, want 1", n)
+	}
+	if n := abandonedCount("ok").Load(); n != 0 {
+		t.Errorf("the drain that stopped counted %d", n)
+	}
+	out := scrape(t, NewMetrics(MetricsOptions{AgentID: "a", Outputs: []string{"stuck"}}).Handler())
+	if want := fmt.Sprintf(`hopcorder_output_abandoned_total{agent_id="a",output="stuck"} %d`, before+1); !strings.Contains(out, want) {
+		t.Errorf("metrics lack %s", want)
+	}
+}
+
 func openSpool(t *testing.T, consumers ...string) *spool.Spool {
 	t.Helper()
 	s, err := spool.Open(spool.Options{Dir: t.TempDir(), MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: consumers})

@@ -215,17 +215,30 @@ replies must echo a random nonce in its data, ICMP errors that quote the
 probe's payload must quote that nonce (on IPv6 they must quote it), and TCP
 replies must acknowledge the SYN's exact sequence number (32 random bits).
 Mismatches are dropped and counted in
-`hopcorder_probe_mismatched_replies_total`. The agent also holds its ICMP
-echo identifier (`flow_id`) with an unprivileged "ping" socket, so no other
-local process can claim it. That last part needs ping sockets
-for the agent's group (`net.ipv4.ping_group_range`, which systemd opens to
-every group); where other groups have them but the agent's does not, it
-logs so at startup. If another process (a second hopcorder, a `ping`, any
-local user) holds the echo identifier first, the agent's ICMP targets of
-that flow are not probed: it logs an error, `hopcorder_flow_in_use` is 1 and
-their cycles count as errors. Every other target is probed, and the ICMP
-targets resume by themselves once the identifier is free (tried every
-cycle). Give every hopcorder process its own `flow_id` (`--flow-id`).
+`hopcorder_probe_mismatched_replies_total`. A forgery is then a guess of at
+least 32 random bits: an ICMPv4 error that quotes 8 bytes needs the IP ID
+and the probe id, a TCP SYN-ACK or RST the sequence number (echo replies
+need 48). That is a rate, not a wall. Against a target that does not answer
+(its probes stay in flight until the timeout), a spoofer sending at 1 GbE
+line rate, about 1.4 million packets a second, plants a fake hop or a fake
+TCP `reached` about every 2 to 3 minutes if probes are always in flight,
+and about every 12 minutes at the default `timeout` (1s) and `interval`
+(5s); at 10 GbE about every 1 to 2 minutes. Each forgery that lands costs
+about 65,000 near misses first, all counted: alert on
+`hopcorder_probe_mismatched_replies_total` (see [Metrics](#metrics) for a
+rule).
+
+The agent also holds its ICMP echo identifier (`flow_id`) with an
+unprivileged "ping" socket, so no other local process can claim it. That
+needs ping sockets for the agent's group (`net.ipv4.ping_group_range`,
+which systemd opens to every group); where other groups have them but the
+agent's does not, it logs so at startup. If another process (a second
+hopcorder, a `ping`, any local user) holds the echo identifier first, the
+agent's ICMP targets of that flow are not probed: it logs an error,
+`hopcorder_flow_in_use` is 1 and their cycles count as errors. Every other
+target is probed, and the ICMP targets resume by themselves once the
+identifier is free (tried every cycle). Give every hopcorder process its
+own `flow_id` (`--flow-id`).
 
 ## Quick start
 
@@ -400,10 +413,11 @@ arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
 
 **Outputs** (at least one):
 
-- `jsonl.path` (`--jsonl`): append records to a file, `-` for stdout. Synced to
-  disk per batch. After a crash records may repeat (dedup on
-  `(agent_id, seq)`); a torn write never runs into the next record. Rotate
-  by renaming and sending SIGHUP (see Operations) or with `copytruncate`.
+- `jsonl.path` (`--jsonl`): append records to a file (or a FIFO), `-` for
+  stdout. A regular file is synced to disk per batch. After a crash records
+  may repeat (dedup on `(agent_id, seq)`); a torn write never runs into the
+  next record. Rotate by renaming and sending SIGHUP (see Operations) or
+  with `copytruncate`.
 - `http`: POST zstd-compressed NDJSON to `<url>/api/v1/ingest`. Options: `url`,
   `headers`, `bearer_token` or `bearer_token_file`, `basic_auth`
   (`username`, `password` or `password_file`), `tls` (`ca_file`, `cert_file`,
@@ -414,7 +428,8 @@ arguments), `flow_id`, `paris`, `adaptive_max_ttl`,
   accepted. hopcorder does no user authentication itself: secure the server
   behind your reverse proxy (basic auth, OIDC, mTLS).
 - `metrics.listen` (`--metrics-listen`), `metrics.path` (`/metrics`):
-  Prometheus endpoint.
+  Prometheus endpoint, served at exactly that path (`/` and then
+  `[A-Za-z0-9/._~-]`, at most 256 characters; any other path answers 404).
 
 ### Metrics
 
@@ -431,10 +446,11 @@ hop addresses.
 | `hopcorder_loops_detected_total` | target, protocol | Cycles with at least one loop |
 | `hopcorder_cycle_overruns_total` | target, protocol | Cycles longer than the interval |
 | `hopcorder_cycle_errors_total` | target, protocol | Cycles that could not run |
-| `hopcorder_flow_in_use` | target, protocol | 1 while the target is not probed because another process holds its ICMP echo identifier (`flow_id`) |
+| `hopcorder_flow_in_use` | target, protocol | Targets not probed because another process holds their ICMP echo identifier (`flow_id`): 1 while a single target is |
 | `hopcorder_resolve_errors_total` | target, protocol | Failed DNS lookups |
 | `hopcorder_output_errors_total` | output | Failed deliveries |
 | `hopcorder_output_pending_records` | output | Spooled, not yet delivered |
+| `hopcorder_output_abandoned_total` | output | Deliveries still blocked when a configuration stopped (reload or shutdown), left behind; their records stay spooled |
 | `hopcorder_spool_bytes`, `hopcorder_spool_records` | | Spool contents |
 | `hopcorder_spool_records_dropped_total` | | Undelivered records dropped by the bounds |
 | `hopcorder_probe_late_replies_total` | | Replies after the timeout |
@@ -442,19 +458,57 @@ hop addresses.
 | `hopcorder_probes_sent_total`, `hopcorder_probe_send_errors_total` | | Probe packets |
 | `hopcorder_build_info` | version, goversion | |
 
+Two targets with the same `host` and `protocol` (another `port` or `af`)
+share their per-target series, as the labels are only configured values:
+counters count both, the RTT histogram mixes them, `hopcorder_path_length`
+is the last cycle's, and `hopcorder_flow_in_use` counts those not probed.
+The agent warns at start. To tell them apart, give one an address or
+another name of the host.
+
+Forged replies (see [Privileges](#privileges-cap_net_raw-not-root)) show
+as mismatched replies long before one gets through: each takes about
+65,000 tries that match a probe's id but not the rest. This rule fires once
+600 have come within 10 minutes. A slow spoofer then has about a 1% chance
+of having planted one hop; one at line rate is caught within a scrape or
+two, about when its first one lands. Without an attack the counter grows
+only for the other reasons above (a middlebox that rewrites IP IDs, an IPv6
+router that quotes too little, another prober on the same `flow_id`), each
+of which silences hops and is worth knowing; where one is known and steady,
+set the threshold above its rate.
+
+```yaml
+groups:
+  - name: hopcorder
+    rules:
+      - alert: HopcorderMismatchedReplies
+        expr: increase(hopcorder_probe_mismatched_replies_total[10m]) > 600
+        annotations:
+          summary: >-
+            {{ $labels.agent_id }} drops replies that match a probe's id but
+            not the rest of it: forged replies, a second prober on the same
+            flow_id, or a middlebox that rewrites IP IDs (hops beyond it
+            then stay silent)
+```
+
 ## Operations
 
 - **Shutdown** (SIGINT/SIGTERM): probing stops at once (in-flight cycles are
-  abandoned), outputs get up to 3 seconds to ship what is spooled, and the rest
-  stays in the spool for the next start.
+  abandoned) and the metrics endpoint answers 503, outputs get up to 3
+  seconds to ship what is spooled, and the rest stays in the spool for the
+  next start. A delivery that blocks (a JSONL file on a hung mount, a
+  blocking stdout nobody reads) is given 3 more seconds and then left
+  behind, counted in `hopcorder_output_abandoned_total`; writes to a FIFO or
+  pipe give up at once. A reload stops the running configuration the same
+  way.
 - **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent
   restarts in-process with it (raw sockets stay open, seq continues, and so
   does the metrics listener while its address is unchanged; a new address is
-  bound before the old one is released). If the new configuration cannot
-  start, for example because its new metrics address is taken, the previous
-  one is started again; if that fails too, it is retried (from 1 s, doubling
+  bound before the old one is released, and the ICMP echo identifiers of
+  both configurations are held until the new one runs). If the new
+  configuration cannot start, for example because its new metrics address
+  is taken, the previous one is started again; if that fails too, it is retried (from 1 s, doubling
   to a minute) until it starts or another reload brings one that does, with
   errors in the log and the metrics endpoint answering 503 meanwhile. A
   reload never stops the agent. Moving the endpoint to another address with

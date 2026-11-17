@@ -1482,7 +1482,9 @@ decisions:
   development container has no IPv6), and the netns test checks that an
   IPv6 ping socket cannot take an identifier held over IPv4.
   - The daemon does this first, at every start and reload, and `--once`
-    does too (`probe.FlowHolder`, `Raw.HoldFlows`).
+    does too (`probe.FlowHolder`, `Raw.HoldFlows`). (Round four: during a
+    reload the supervisor holds both configurations' flows, and releases
+    the old ones once the new configuration runs.)
   - An identifier held by another process fails the start with
     `ErrFlowInUse` and a hint to use `--flow-id`. A failed reload reverts
     as before. This replaces the "two hopcorder processes" caveat for
@@ -1962,6 +1964,10 @@ high-severity issue. Four fixes followed. The decisions:
     retrying rather than probing without outputs, because every record
     must go through the spool. `runDaemon` returning on its own (it does
     not today) restarts the configuration the same way.
+  - (Round four found two ways a reload still stopped the agent: a
+    `metrics.path` that panicked `http.ServeMux`, and a JSONL write that
+    blocked for good, which the stopping configuration waited for. Both
+    are fixed; see there.)
   - Accepted: a local user who binds the port before the agent's first
     start still fails that start (exit 1, systemd retries), as for any
     service on an unprivileged port; the first start failing loudly is
@@ -1994,6 +2000,10 @@ high-severity issue. Four fixes followed. The decisions:
     identifier, its ping socket sees our echo replies and errors (with
     their nonces) and can send echoes with our identifier, and a second
     hopcorder on the flow is a misconfiguration to show, not to hide.
+  - (Round four: a reload that failed and was reverted had freed the
+    running configuration's identifier while the new one started, so a
+    local process could take it then too; both configurations' flows are
+    now held until the new one runs.)
   - Tests: TestDaemonFlowInUseStopsOnlyItsTargets (fake prober,
     `Fake.SetHoldErr` per flow: the TCP and UDP targets are recorded, the
     ICMP one not, the gauge is 1, and after the identifier frees the ICMP
@@ -2016,7 +2026,10 @@ high-severity issue. Four fixes followed. The decisions:
   - `checkPages` reads the file (`ReadAt`, not the mapping) under a shared
     lock (a read-only bbolt open, which reads only the meta pages and still
     gives `ErrLocked` while an agent has the file) and checks: the meta page
-    bbolt will use (the valid one with the higher txid, as bbolt picks it)
+    bbolt will use (the valid one with the higher txid, as bbolt picks it;
+    corrected in round four: "valid" meant more here than to bbolt, which
+    checks only magic, version and checksum, so a crafted meta took bbolt
+    to a tree nothing had checked)
     with the high water mark within the file; every page reachable from the
     root and the freelist page for id, type, overflow within the high water
     mark, and no page reached twice (so no cycles) or reachable and free;
@@ -2285,3 +2298,207 @@ high-severity issue. Four fixes followed. The decisions:
   - Artifact attestations need a public repository (or GitHub Enterprise
     Cloud): if the repository were private, `publish` would fail at the
     first attest step, before it publishes anything.
+
+### Security review, round four
+
+A fourth review of the whole code base (the same four areas, with the
+code added in round three first; every finding reproduced or, where only
+GitHub could confirm it, marked as reasoned) found that Grafana's
+read-only ClickHouse user was not a boundary, and that a batch's events
+and its retries escaped the ingest bounds. Five fixes followed. The
+decisions:
+
+**Grafana's ClickHouse user**
+
+<!-- round four: grafana user -->
+
+**Read API**
+
+<!-- round four: read API -->
+
+**Ingest and storage**
+
+<!-- round four: ingest -->
+
+**Agent**
+
+- **The metrics path is compared, not parsed.** `outputs.metrics.path` was
+  only checked for its leading `/` and then registered with
+  `http.ServeMux`, which panics on a pattern it cannot parse (`/metrics x`
+  reads as a method, `/{x`, `/a{b}`, `/ `, `/x/{a}/{a}`, `/{x...}/y`). The
+  panic hit `runDaemon`'s goroutine, so a reload to such a path ended the
+  agent with status 2, and systemd's restarts failed the same way until the
+  file was fixed. Now `Finalize` accepts only `/` and then unreserved URL
+  characters and slashes (`[A-Za-z0-9/._~-]`, 256 characters in all), so
+  such a path is an ordinary configuration error (a reload keeps the
+  running configuration, a start fails with the message), and
+  `MetricsServer` compares the request's path with it instead of using a
+  ServeMux, so no value can panic it whatever reaches `Serve`.
+  - Cost: a path ending in `/` serves only itself, not the subtree ServeMux
+    gave it; `//metrics` and other unclean forms get 404, not a redirect.
+  - Tests: TestMetricsPath (the review's six paths and others refused),
+    TestMetricsServer (a path ServeMux panicked on is served exactly),
+    TestReloadRefusesBadMetricsPath (six reloads to the review's paths keep
+    the agent running; before, the first panicked the test binary).
+- **A reload holds both configurations' flows until the new one runs.**
+  `runDaemon` called `HoldFlows` with the new configuration's flows first,
+  which released the running one's echo identifiers before anything else
+  of the new configuration had started. When the start then failed (the
+  JSONL file, TLS or secret files, the spool lock with its 1 s timeout,
+  `agent.New`), the supervisor reverted, but the old identifier had been
+  free meanwhile: the review's three uid 65534 squatters won it at the
+  first try, and the reverted configuration's ICMP targets were refused
+  (`hopcorder_flow_in_use` 1) until they let go. That is the denial round
+  three accepted only before the first start. Now the supervisor owns the
+  holds, as it owns the metrics listener: `supervisor.start` holds the
+  flows of the configuration that started last together with the new
+  one's, and releases the old ones (`HoldFlows` with the new flows alone)
+  only once the new configuration runs. A failed start leaves both held;
+  the revert's start holds the old flows alone again, which releases the
+  failed configuration's. `runDaemon` holds flows itself only without a
+  supervisor (`daemonEnv.flowsHeld`), and `--once` as before.
+  - Tests: TestFailedReloadKeepsTheFlowsHeld (fake prober recording every
+    `HoldFlows`: a reload to another ICMP `flow_id` with a missing JSONL
+    directory never leaves the running flow out, the revert ends with it
+    alone, and a reload that starts holds both until it runs, then the new
+    one alone; before, the failing start held only its own flow).
+    TestInnerHoldFlows (rawsock) checks what this rests on: a uid 65534
+    process can bind neither identifier while both are held, and gets the
+    old one once only the new one is.
+- **A configuration that stops waits a bounded time for its outputs.**
+  After `a.Run` returned, `runDaemon` gave the outputs up to
+  `shutdownGrace` to catch up, cancelled the drains, and then waited for
+  them without a bound, while `JSONL.Deliver` ignored its context. A write
+  that blocks (a FIFO for a log shipper that is not reading, stdout under a
+  blocking log driver, a hung NFS mount) held up the reload or the
+  shutdown for as long as it blocked: in the review, after SIGHUP with the
+  JSONL output on a FIFO nobody read, nothing was probed again, scrapes got
+  200 with frozen numbers, and SIGTERM was ignored (systemd kills after
+  `TimeoutStopSec=15s`). Now:
+  - `output.StartDrains` and `Drains.Stop` replace the WaitGroup. Stop
+    cancels the drains and waits up to `shutdownGrace` again; a drain still
+    delivering then is left behind, with an error in the log and
+    `hopcorder_output_abandoned_total{output}` (kept for the process: the
+    stuck delivery outlives its configuration). Its batch is not
+    acknowledged, so the next configuration delivers it again. A stop takes
+    at most twice `shutdownGrace` (6 s), plus closing the spool.
+  - JSONL writes take deadlines where the file does: a FIFO or pipe opened
+    by path (Go makes it non-blocking and polls it, on Linux) or a
+    non-blocking stdout. When the drain's context ends, `context.AfterFunc`
+    sets a deadline in the past, so such a write returns at once and
+    nothing is left behind. Regular files and a blocking stdout take no
+    deadlines; the bound is for them.
+  - The metrics endpoint answers 503 as soon as `a.Run` returns, not only
+    once `runDaemon` does.
+  - Found on the way: JSONL to a FIFO or pipe never worked. `fsync` fails
+    with EINVAL there, so every delivery failed after its write and was
+    written again on every retry. Only regular files are synced now.
+  - Accepted: a delivery left behind keeps its goroutine and its batch (up
+    to 1 MiB) until its write returns, one per stop that meets it. On a
+    blocking stdout the next configuration's JSONL writes queue behind it
+    (Go serializes writes to a file), so the next stop leaves that drain
+    behind too. A spool on a hung file system still hangs the agent, whose
+    appends block as well.
+  - Tests, without root (a FIFO in a temporary directory, and a full
+    blocking pipe as `os.Stdout`): TestReloadWithJSONLOnAFullFIFO and
+    TestReloadWithJSONLOnABlockedStdout (the reload completes, metrics
+    answer 503 in between; the FIFO's write stops at its deadline, the
+    stdout drain is left behind and counted once),
+    TestShutdownWithJSONLOnAFullFIFO and
+    TestShutdownWithJSONLOnABlockedStdout (cancelled as SIGTERM does, the
+    supervisor returns within twice the grace plus 2 s),
+    TestJSONLWriteHeedsItsContext, TestJSONLToAFIFO and
+    TestDrainsStopLeavesStuckDeliveryBehind. Against the previous code the
+    four daemon tests hang (the reload never completes, the supervisor
+    does not stop), and the two JSONL tests fail (the write ignores its
+    context; "sync: invalid argument").
+- **`checkPages` picks the meta page exactly as bbolt does.** It refused a
+  meta page whose page size differed from the file's and fell back to the
+  other one, while bbolt (`DB.meta`, v1.5.0) validates only magic, version
+  and checksum and uses the one with the higher txid. A crafted file (the
+  older meta rewritten with txid + 1, twice the page size and a valid
+  checksum, rooted at a free page) passed: `checkPages` checked the honest
+  tree, bbolt used the crafted one, and `tx.Check` ran on it unguarded in
+  its own goroutine. The review's three files faulted ("fatal error:
+  fault") or descended for ever (the heap past 512 MiB, the real binary at
+  1.66 GB in 6 s) on every start, and were never quarantined. Random damage
+  cannot do this (the checksum covers the page size); it takes write access
+  to the spool file (the agent's user, root, a pod sharing the hostPath).
+  Now `meta` orders the pages by txid and validates them as bbolt does,
+  then requires the page size of the one it chose to be the file's: a file
+  whose meta bbolt would use fails the check, and is quarantined, instead
+  of being checked by the other meta. The page size the check is given is
+  bbolt's (`Info().PageSize` of the read-only open, which takes it from
+  page 0 when that meta is valid), so the two now read the same pages.
+  - Tests: TestCraftedMetaIsQuarantined (the review's three files, built
+    from `buildSpool` with meta page 0 the newer: `checkPages` refuses
+    each, and two starts in the child process quarantine it; before,
+    `checkPages` accepted all three, and two of them crashed the child, by
+    a fault and by the heap bound).
+- **A stored record decodes to at most 8 MiB.** The spool's zstd decoder
+  had the library's default bound, 64 GiB, and `Read` decoded every record
+  whole (`DecodeAll`). A 48 KiB stored value (RLE blocks, no content size)
+  decodes to 1.5 GiB: every start went past the child's 512 MiB heap bound,
+  and the real binary was OOM-killed in a 256 MiB cgroup (the chart's
+  limit) on 3 of 3 starts. Neither bbolt nor `checkPages` can see this, so
+  the file was never quarantined, and the records after it never shipped.
+  Now `WithDecoderMaxMemory(maxRecordSize)`, 8 MiB: the largest record the
+  agent can write is about 220 KB of JSON (255 hops, each with an IPv6
+  address with zone and 16 MPLS labels, plus loops; measured), so the
+  format has room to grow more than 35 times over, and 8 MiB is also the
+  largest window any zstd encoder level declares (the spool writes
+  SpeedFastest, at most 4 MiB), which the decoder caps at the same bound,
+  so no record a spool wrote is refused. A bomb costs at most 8 MiB per
+  read of it. `ErrDecoderSizeExceeded` takes the path of every
+  undecodable record: `Read` skips it, logs its seq at error level, and
+  moves the cursor past it (it is not counted in a metric, as before).
+  - Accepted: the zstd library prints one line to stderr ("runDecoder:
+    maxDecodedSize exceeded") for each such record it refuses.
+  - Tests: TestDecompressionBombIsSkipped (the review's bomb, opened in
+    the child process twice: skipped, the other records delivered; before,
+    the heap bound on both starts) and TestRecordSizeIsBounded (a value
+    just over the bound is skipped, a 2 MiB record still decodes; before,
+    the value was delivered).
+- **The spoofing floor is stated, and alerting on it recommended.** Round
+  three's 32 random bits hold (the review re-ran TestRawNetns/spoof: no
+  fake hop), but at line rate they are a rate, not a wall. An ICMPv4 error
+  for an IPv4 probe that quotes 8 bytes needs the probe id and the IP ID,
+  a TCP SYN-ACK or RST the 32-bit sequence number. Measured in the review,
+  3.4·10^-4 of forgeries hit a key in flight (2.7·10^-4 for TCP), so about
+  5·10^-9 per packet get through. Against a target whose probes stay in
+  flight (one that does not answer), a spoofer at 1 GbE line rate (about
+  1.4 Mpps) plants a fake hop or a fake TCP `reached` about every 2 to 3
+  minutes with probes always in flight, about every 12 minutes at the
+  default 1 s timeout and 5 s interval, and about every 1 to 2 minutes at
+  10 GbE (the review's estimates). Echo replies need 48 bits, ICMPv4
+  errors that quote the payload 64.
+  - Not changed: the TCP timestamp option would give SYN-ACKs 32 more bits,
+    but only for TCP, and only where the destination and every middlebox
+    keep the option.
+  - Every accepted forgery is preceded by about 65,536 near misses, which
+    `hopcorder_probe_mismatched_replies_total` counts. README gives a rule
+    (`increase(...[10m]) > 600`): a slow spoofer has about a 1% chance of
+    one forged hop when it fires, one at line rate is caught within a
+    scrape or two, about when its first hop lands.
+- **Targets with the same host and protocol share their series, and the
+  flow-in-use gauge counts them.** Configs may list one host twice with
+  another `port` or `af` (dual-stack, or two TCP ports), and the dedup key
+  allows it, but per-target metrics are labelled with the configured host
+  and protocol only. So both targets write the same series: counters add
+  up, the RTT histogram mixes them, `hopcorder_path_length` is the last
+  cycle's, and `hopcorder_flow_in_use`, set to 0 or 1 by each cycle,
+  flapped when only one of them was refused (with two `flow_id`s), so an
+  alert on it with a `for:` never fired. Not refused in the config:
+  dual-stack and several ports to one name are what operators want to
+  record, and giving them apart labels (port, af) would change every
+  per-target series for everyone. Instead the gauge is the number of the
+  series' targets refused (1 for one target, as before), the agent warns
+  at start about targets that share series, and README says so; the labels
+  stay as bounded as they were.
+  - Tests: TestFlowInUseCountsTheSeriesTargets (two targets on one series:
+    one refused, the other's cycle leaves the gauge at 1; before, 0) and
+    TestWarnSharedSeries.
+
+**CI, release and deployment**
+
+<!-- round four: deployment -->

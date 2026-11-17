@@ -309,11 +309,31 @@ func (c *Config) Finalize(o FinalizeOptions) error {
 		if _, _, err := net.SplitHostPort(m.Listen); err != nil {
 			fail("outputs.metrics.listen %q: want host:port: %v", m.Listen, err)
 		}
-		if !strings.HasPrefix(m.Path, "/") {
-			fail("outputs.metrics.path %q: must start with /", m.Path)
+		if !validMetricsPath(m.Path) {
+			fail("outputs.metrics.path %q: want / and then at most %d characters from [A-Za-z0-9/._~-]",
+				m.Path, maxMetricsPathLen-1)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// maxMetricsPathLen bounds outputs.metrics.path.
+const maxMetricsPathLen = 256
+
+// validMetricsPath reports whether p may be the metrics endpoint's path: a
+// "/" followed by unreserved URL characters (RFC 3986) and slashes, at most
+// maxMetricsPathLen in all. The endpoint serves exactly that path, which
+// requests then need no escaping to reach. (Paths used to go to
+// http.ServeMux as a pattern, which panics on one it cannot parse, such as
+// "/{x" or "/a b": the agent died at start, or on the reload that brought
+// it.)
+func validMetricsPath(p string) bool {
+	if !strings.HasPrefix(p, "/") || len(p) > maxMetricsPathLen {
+		return false
+	}
+	return !strings.ContainsFunc(p, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && !strings.ContainsRune("/._~-", r)
+	})
 }
 
 func (c *Config) defaultTarget(t *Target) {

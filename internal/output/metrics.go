@@ -33,7 +33,10 @@ type SpoolStats interface {
 //
 // Labels are bounded by configuration: agent_id (constant), target (the
 // configured host), protocol, result and output. No hop address or other
-// per-probe value is ever a label; that detail lives in the records.
+// per-probe value is ever a label; that detail lives in the records. So two
+// targets with the same host and protocol (another port or address family)
+// share every per-target series: counters count both, and gauges are kept
+// meaningful for both where that matters (hopcorder_flow_in_use).
 type Metrics struct {
 	reg *prometheus.Registry
 
@@ -50,7 +53,11 @@ type Metrics struct {
 
 	mu    sync.Mutex
 	paths map[*agent.Target]*record.PathTracker
+	inUse map[series]map[*agent.Target]bool // targets refused for their flow, by series
 }
+
+// series names the per-target series a target's metrics go to.
+type series struct{ target, protocol string }
 
 // MetricsOptions wires the metrics output to the rest of the agent.
 type MetricsOptions struct {
@@ -94,7 +101,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 		}, tp),
 		flowInUse: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "hopcorder_flow_in_use",
-			Help: "1 while the target is not probed because another process holds its flow's identifier (ICMP echo identifier = flow_id).",
+			Help: "Targets of this host and protocol not probed because another process holds their flow's identifier (ICMP echo identifier = flow_id): 1 for a single target.",
 		}, tp),
 		resolveErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "hopcorder_resolve_errors_total", Help: "Failed DNS resolutions of a target.",
@@ -103,6 +110,7 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			Name: "hopcorder_output_errors_total", Help: "Failed deliveries by output.",
 		}, []string{"output"}),
 		paths: map[*agent.Target]*record.PathTracker{},
+		inUse: map[series]map[*agent.Target]bool{},
 	}
 	r.MustRegister(m.cycles, m.rtt, m.pathLen, m.pathChanges, m.loops, m.overruns,
 		m.cycleErrors, m.flowInUse, m.resolveErrors, m.outputErrors)
@@ -133,6 +141,14 @@ func NewMetrics(o MetricsOptions) *Metrics {
 			}, func() float64 { return float64(sp.Pending(name)) }))
 			m.outputErrors.WithLabelValues(name)
 		}
+	}
+	for _, name := range o.Outputs {
+		c := abandonedCount(name)
+		r.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name:        "hopcorder_output_abandoned_total",
+			Help:        "Deliveries still blocked (a write that never returned) when a configuration stopped for a reload or shutdown, left behind after the grace period; their records stay spooled.",
+			ConstLabels: prometheus.Labels{"output": name},
+		}, func() float64 { return float64(c.Load()) }))
 	}
 	if pr := o.Prober; pr != nil {
 		r.MustRegister(
@@ -180,10 +196,16 @@ const maxMetricsConns = 64
 // (which would make the new configuration, and going back to the old one,
 // fail to bind it, and could serve made-up metrics).
 type MetricsServer struct {
-	addr string
-	srv  *http.Server
-	done chan struct{}
-	mux  atomic.Pointer[http.ServeMux] // nil: no configuration is running
+	addr   string
+	srv    *http.Server
+	done   chan struct{}
+	served atomic.Pointer[served] // nil: no configuration is running
+}
+
+// served is what a MetricsServer serves: h at exactly path.
+type served struct {
+	path string
+	h    http.Handler
 }
 
 // ListenMetrics binds addr and serves on it. Until Serve installs metrics
@@ -214,26 +236,31 @@ func ListenMetrics(ctx context.Context, addr string, log *slog.Logger) (*Metrics
 // Addr returns the address the server was asked to listen on.
 func (s *MetricsServer) Addr() string { return s.addr }
 
-// Serve makes the server serve m's metrics at path. With m nil it answers
-// 503 instead, while no configuration is running.
+// Serve makes the server serve m's metrics at path, and 404 at any other.
+// With m nil it answers 503 instead, while no configuration is running.
+//
+// The path is compared with the request's (decoded) path as it is, never
+// parsed: as an http.ServeMux pattern, a path ServeMux could not parse
+// panicked here and killed the agent at start or on a reload.
 func (s *MetricsServer) Serve(path string, m *Metrics) {
 	if m == nil {
-		s.mux.Store(nil)
+		s.served.Store(nil)
 		return
 	}
-	mux := http.NewServeMux()
-	mux.Handle(path, m.Handler())
-	s.mux.Store(mux)
+	s.served.Store(&served{path: path, h: m.Handler()})
 }
 
 // ServeHTTP implements http.Handler.
 func (s *MetricsServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	mux := s.mux.Load()
-	if mux == nil {
+	cur := s.served.Load()
+	switch {
+	case cur == nil:
 		http.Error(w, "the agent is (re)starting", http.StatusServiceUnavailable)
-		return
+	case r.URL.Path != cur.path:
+		http.NotFound(w, r)
+	default:
+		cur.h.ServeHTTP(w, r)
 	}
-	mux.ServeHTTP(w, r)
 }
 
 // Close shuts the server down and returns once the listener is closed.
@@ -261,7 +288,7 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 		}
 	}
 	m.cycles.WithLabelValues(host, proto, result).Inc()
-	m.flowInUse.WithLabelValues(host, proto).Set(0)
+	m.setInUse(t, false)
 	m.pathLen.WithLabelValues(host, proto).Set(float64(rec.PathLen))
 	if len(rec.Loops) > 0 {
 		m.loops.WithLabelValues(host, proto).Inc()
@@ -283,8 +310,29 @@ func (m *Metrics) CycleDone(t *agent.Target, rec *record.Record) {
 func (m *Metrics) CycleFailed(t *agent.Target, err error) {
 	m.cycleErrors.WithLabelValues(t.Host, string(t.Protocol)).Inc()
 	if errors.Is(err, probe.ErrFlowInUse) {
-		m.flowInUse.WithLabelValues(t.Host, string(t.Protocol)).Set(1)
+		m.setInUse(t, true)
 	}
+}
+
+// setInUse records whether t is refused for its flow, and sets its series'
+// gauge to how many of the series' targets are. (Set to 0 or 1 by each
+// target's cycles, a series shared by two targets flapped while only one
+// was refused.)
+func (m *Metrics) setInUse(t *agent.Target, in bool) {
+	k := series{t.Host, string(t.Protocol)}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	refused := m.inUse[k]
+	if in {
+		if refused == nil {
+			refused = map[*agent.Target]bool{}
+			m.inUse[k] = refused
+		}
+		refused[t] = true
+	} else {
+		delete(refused, t)
+	}
+	m.flowInUse.WithLabelValues(k.target, k.protocol).Set(float64(len(refused)))
 }
 
 // CycleOverrun implements agent.Observer.

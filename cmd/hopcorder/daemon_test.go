@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -477,6 +478,84 @@ outputs: {jsonl: {path: %q}}
 	}
 }
 
+// A metrics path the endpoint cannot serve is a configuration error, so a
+// reload to one keeps the running configuration. Each of these passed
+// validation and made the reload panic in http.ServeMux.Handle (round
+// four): the agent exited with status 2, and again on every restart.
+func TestReloadRefusesBadMetricsPath(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath, out, addr := dir+"/agent.yaml", dir+"/out.jsonl", freeAddr(t)
+	write := func(path string) {
+		writeTestFile(t, cfgPath, fmt.Sprintf("agent_id: r\ninterval: 100ms\ntimeout: 50ms\nspool: {dir: %q}\n"+
+			"targets: [{host: 192.0.2.1}]\noutputs:\n  jsonl: {path: %q}\n  metrics: {listen: %q, path: %q}\n",
+			dir+"/spool", out, addr, path))
+	}
+	loaded := make(chan error, 1)
+	load := func() (*config.Config, error) {
+		c, err := config.Load(cfgPath)
+		if err == nil {
+			err = c.Finalize(config.FinalizeOptions{})
+		}
+		select {
+		case loaded <- err:
+		default:
+		}
+		return c, err
+	}
+	write("/metrics")
+	cfg, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loaded; err != nil {
+		t.Fatal(err)
+	}
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() { done <- superviseDaemon(ctx, cfg, fakeNetwork(), reload, load, quiet) }()
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) >= 2 }, "records")
+
+	for _, p := range []string{"/metrics x", "/{bad", "/a{b}", "/ ", "/x/{a}/{a}", "/{x...}/y"} {
+		write(p)
+		reload <- syscall.SIGHUP
+		select {
+		case err := <-loaded:
+			if err == nil || !strings.Contains(err.Error(), "outputs.metrics.path") {
+				t.Errorf("reload to %q: %v", p, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("reload to %q: not loaded", p)
+		}
+		n := len(readRecords(t, out))
+		waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, out)) > n }, "records after the reload to "+p)
+		running(t, done)
+	}
+	write("/m2") // a valid one is taken
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool {
+		resp, err := http.Get("http://" + addr + "/m2")
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, "metrics at the valid path")
+	running(t, done)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("supervisor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+}
+
 func TestReloadRevertsWhenNewConfigCannotStart(t *testing.T) {
 	dir := t.TempDir()
 	good := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
@@ -716,6 +795,98 @@ func TestDaemonHoldsFlows(t *testing.T) {
 	}
 }
 
+// holdLog is a fake prober that records the flows of every HoldFlows call.
+type holdLog struct {
+	*probe.Fake
+	mu    sync.Mutex
+	calls [][]probe.Flow
+}
+
+func (h *holdLog) HoldFlows(flows []probe.Flow) error {
+	h.mu.Lock()
+	h.calls = append(h.calls, slices.Clone(flows))
+	h.mu.Unlock()
+	return h.Fake.HoldFlows(flows)
+}
+
+func (h *holdLog) log() [][]probe.Flow {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.calls)
+}
+
+// A reload holds the new configuration's flows besides the running one's,
+// and releases those only once the new configuration runs, so a reload that
+// fails and is reverted never lets go of the identifiers the agent goes
+// back to (as with the metrics listener). Before, the new configuration's
+// start released them first; when it then failed (here: its JSONL
+// directory is missing), a local process polling bind() on the old echo
+// identifier got it, and the reverted configuration's ICMP targets stopped
+// until it let go (round four).
+func TestFailedReloadKeepsTheFlowsHeld(t *testing.T) {
+	dir := t.TempDir()
+	good := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
+	bad := daemonConfigJSONL(t, dir+"/spool", dir+"/missing/out.jsonl", "")
+	bad.Targets[0].FlowID = 40000
+	next := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
+	next.Targets[0].FlowID = 40001
+	old := probe.Flow{Protocol: probe.ICMP, ID: 33434}
+	tried, moved := probe.Flow{Protocol: probe.ICMP, ID: 40000}, probe.Flow{Protocol: probe.ICMP, ID: 40001}
+
+	f := &holdLog{Fake: fakeNetwork()}
+	shutdownGrace = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	reload := make(chan os.Signal, 1)
+	done := make(chan error, 1)
+	var reloads atomic.Int32
+	load := func() (*config.Config, error) {
+		if reloads.Add(1) == 1 {
+			return bad, nil
+		}
+		return next, nil
+	}
+	quiet := func(*config.Config) *slog.Logger { return slog.New(slog.DiscardHandler) }
+	go func() { done <- superviseDaemon(ctx, good, f, reload, load, quiet) }()
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/out.jsonl")) >= 2 }, "records")
+
+	// The failing reload, and the revert.
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool {
+		calls := f.log()
+		return slices.ContainsFunc(calls, func(c []probe.Flow) bool { return slices.Contains(c, tried) }) &&
+			fmt.Sprint(calls[len(calls)-1]) == fmt.Sprint([]probe.Flow{old})
+	}, "the reverted configuration's flows")
+	for i, c := range f.log() {
+		if !slices.Contains(c, old) {
+			t.Fatalf("HoldFlows call %d released the running configuration's flow: %v (all: %v)", i, c, f.log())
+		}
+	}
+	n := len(readRecords(t, dir+"/out.jsonl"))
+	waitFor(t, 3*time.Second, func() bool { return len(readRecords(t, dir+"/out.jsonl")) >= n+2 }, "records after the revert")
+
+	// A reload that starts releases the old flow, once it runs.
+	reload <- syscall.SIGHUP
+	waitFor(t, 5*time.Second, func() bool {
+		calls := f.log()
+		return fmt.Sprint(calls[len(calls)-1]) == fmt.Sprint([]probe.Flow{moved})
+	}, "the new configuration's flows alone")
+	calls := f.log()
+	if c := calls[len(calls)-2]; !slices.Contains(c, old) || !slices.Contains(c, moved) {
+		t.Errorf("while the new configuration started, HoldFlows had %v; want both flows", c)
+	}
+	running(t, done)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("supervisor: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+}
+
 // One process on the ICMP flow's identifier (any local user may open a ping
 // socket where ping_group_range allows it) stops only the ICMP targets of
 // that flow, visibly, and they come back once it is free, without a
@@ -770,4 +941,19 @@ func TestDaemonFlowInUseStopsOnlyItsTargets(t *testing.T) {
 		t.Errorf("flow still shown in use:\n%s", grep(m, "flow_in_use"))
 	}
 	stop()
+}
+
+// Targets whose metrics share series are named at start.
+func TestWarnSharedSeries(t *testing.T) {
+	var buf bytes.Buffer
+	warnSharedSeries([]config.Target{
+		{Host: "a.example", Protocol: "icmp", AF: 4},
+		{Host: "a.example", Protocol: "udp"},
+		{Host: "b.example", Protocol: "icmp"},
+		{Host: "a.example", Protocol: "icmp", AF: 6},
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+	if n := strings.Count(buf.String(), "share their metrics series"); n != 1 ||
+		!strings.Contains(buf.String(), `target=a.example protocol=icmp targets="[0 3]"`) {
+		t.Errorf("%d warnings:\n%s", n, buf.String())
+	}
 }
