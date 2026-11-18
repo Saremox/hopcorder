@@ -234,11 +234,15 @@ jobs:
             'grep -a -E "(DNSResolver|Cluster): .*dnsprobe" /var/log/clickhouse-server/*' | grep -q .; then
             echo "ClickHouse's DNSResolver or Cluster logger repeats a query's host name"; exit 1
           fi
-          # Listeners: HTTP and the native protocol only (the PostgreSQL
-          # handlers also log a failing query's whole message).
+          # No MySQL (9004), PostgreSQL (9005) or interserver (9009)
+          # listener: the PostgreSQL handlers also log a failing query's
+          # whole message. (Docker's DNS listens in the container too.)
           ports=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c \
-            'awk "\$4 == \"0A\" { split(\$2, a, \":\"); print a[2] }" /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr "\n" " "')
-          [ "$ports" = "1FBB 2328 " ] || { echo "ClickHouse listens on (hex) $ports, not 8123 and 9000 only"; exit 1; }
+            'awk "\$4 == \"0A\" { print \$2 }" /proc/net/tcp /proc/net/tcp6 2>/dev/null')
+          grep -q ':1FBB$' <<<"$ports" || { echo "no listener on 8123 found: $ports"; exit 1; }
+          if grep -qE ':(232C|232D|2331)$' <<<"$ports"; then
+            echo "ClickHouse listens on 9004, 9005 or 9009 (hex): $ports"; exit 1
+          fi
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;

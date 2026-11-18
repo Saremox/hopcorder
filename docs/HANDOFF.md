@@ -4153,7 +4153,7 @@ decisions:
     name, about 1 MB a query, within the files' 10M × 2 cap.
   - Checks: CI's `grafana` job requires that compose's log files hold no
     `DNSResolver` or `Cluster` line with a 100 KB host name passed to
-    `hasColumnInTable()`, and that ClickHouse listens on 8123 and 9000
-    only (both failed before); the helm job checks the rendered levels and
+    `hasColumnInTable()`, and that nothing listens on 9004, 9005 or 9009
+    (both failed before); the helm job checks the rendered levels and
     the removed ports; `deploy/helm/ci/smoke.sh` requires the console to
     grow by less than 100 KB for a 1 MB name (not run here: no kind).
