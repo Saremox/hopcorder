@@ -4516,3 +4516,18 @@ decisions:
     and the e2e "a cut list says so" (the server's loops and targets
     answers marked cut: "Loops6+", the note, the tab and the end of the
     list, the stream list's note), which failed before on "Loops6".
+- **ICMPv6 unreachable codes have ICMPv6 names.** A hop's `code` is the
+  raw ICMPv4 or ICMPv6 destination unreachable code, to be read by the
+  record's `af` (§3.1), but the cycle panel named every code from
+  ICMPv4's table: an ICMPv6 address unreachable (code 3, the destination
+  host down) read "port unreachable", administratively prohibited (1)
+  "host unreachable" (review, round five; reproduced in the browser).
+  `unreachableName` (`ui/src/format.ts`) now takes the cycle's `af` and
+  has ICMPv6's table too (RFC 4443's codes 0 to 6, RFC 6550's 7, RFC
+  8883's 8); unknown codes read "code n" as before. Nothing else maps
+  codes: the Grafana dashboards and the other UI views do not show them.
+  - Tests: `format.test.ts` ("are named by the address family") and the
+    e2e "unreachable codes are named by address family" (one IPv4 and one
+    IPv6 cycle seeded with code 3 at their third hop: "port unreachable"
+    and "address unreachable"), which failed before with "unreachable
+    (port unreachable)" for the IPv6 one.

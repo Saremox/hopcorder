@@ -260,6 +260,10 @@ The section for a version is the text of its GitHub release.
   count ("Loops 10000" for 24,000 loops). A cut list's count now reads
   "10000+", and the stream view and the stream list say that only the
   newest (or, for streams, the first) are listed.
+- UI: ICMPv6 destination unreachable codes were named as ICMPv4's: an
+  IPv6 address unreachable (the destination host down) read "port
+  unreachable", and administratively prohibited read "host unreachable".
+  Codes are now named by the cycle's address family.
 
 **Security: server ingest**
 

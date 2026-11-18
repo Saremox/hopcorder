@@ -10,13 +10,16 @@ export const DEST = '203.0.113.10'
 export const STEP_MS = 5000
 export const CYCLES = 1440
 
-type Spec = (string | null)[] // address per TTL; null = no reply; '=' prefix = destination
+// Address per TTL; null = no reply; '=' prefix = destination; '!<code> '
+// prefix = destination unreachable with that ICMP code.
+type Spec = (string | null)[]
 
 interface Hop {
   ttl: number
-  status: 'reply' | 'ttl-expired' | 'no-reply'
+  status: 'reply' | 'ttl-expired' | 'unreachable' | 'no-reply'
   ip?: string
   rtt_us?: number
+  code?: number
 }
 
 const before = ['192.168.1.1', '100.64.0.1', '198.51.100.1', '198.51.100.9', '198.51.100.130', `=${DEST}`]
@@ -53,7 +56,10 @@ export function record(agent: string, seq: number, ts: number, spec: Spec, dest:
     const ttl = k + 1
     if (s === null) return { ttl, status: 'no-reply' }
     if (s.startsWith('=')) return { ttl, status: 'reply', ip: s.slice(1), rtt_us: 18000 + ((seq * 37) % 4000) }
-    return { ttl, status: 'ttl-expired', ip: s, rtt_us: 800 + ttl * 2500 + ((seq * 13) % 900) }
+    const rtt_us = 800 + ttl * 2500 + ((seq * 13) % 900)
+    const u = /^!(\d+) (.+)$/.exec(s)
+    if (u) return { ttl, status: 'unreachable', ip: u[2], rtt_us, code: Number(u[1]) }
+    return { ttl, status: 'ttl-expired', ip: s, rtt_us }
   })
   const seen = new Map<string, number[]>()
   for (const h of hops) if (h.status === 'ttl-expired' && h.ip) seen.set(h.ip, [...(seen.get(h.ip) ?? []), h.ttl])
@@ -111,6 +117,21 @@ export async function seedDualStack(baseURL: string, agent: string, end: number)
     lines.push(JSON.stringify(record(agent, i + 1, ts, spec, v6 ? dualV6 : dualV4)))
   }
   await ingest(baseURL, lines)
+}
+
+// One cycle each of an IPv4 and an IPv6 target whose third hop answers
+// destination unreachable with code 3: port unreachable in ICMPv4, address
+// unreachable in ICMPv6.
+export const UNREACH = 'unreach.example'
+const unreach4: Dest = { target: UNREACH, target_ip: '203.0.113.30', af: 4, flow_id: 33434 }
+const unreach6: Dest = { target: UNREACH, target_ip: '2001:db8::30', af: 6, flow_id: 33435 }
+
+/** Ingests the two cycles; the last is at `end`. */
+export async function seedUnreachable(baseURL: string, agent: string, end: number): Promise<void> {
+  await ingest(baseURL, [
+    JSON.stringify(record(agent, 1, end - STEP_MS, ['192.168.1.1', '198.51.100.1', '!3 198.51.100.2'], unreach4)),
+    JSON.stringify(record(agent, 2, end, ['2001:db8:1::1', '2001:db8:2::1', '!3 2001:db8:3::1'], unreach6)),
+  ])
 }
 
 async function ingest(baseURL: string, lines: string[]): Promise<void> {

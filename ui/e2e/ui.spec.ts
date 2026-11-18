@@ -1,16 +1,18 @@
 import { expect, test, type Page } from '@playwright/test'
-import { CYCLES, DEST, DUAL, DUAL_CYCLES, TARGET, seed, seedDualStack } from './seed'
+import { CYCLES, DEST, DUAL, DUAL_CYCLES, TARGET, UNREACH, seed, seedDualStack, seedUnreachable } from './seed'
 
 // Runs against a server with the embedded UI, ClickHouse behind it and
 // e2e/asn.tsv as its ASN database (see the ui job in .github/workflows/ci.yml).
 
 const agent = `e2e-${Date.now().toString(36)}`
 const dualAgent = `e2d-${Date.now().toString(36)}` // not a match for the filter by agent
+const unreachAgent = `e2u-${Date.now().toString(36)}`
 const streamHash = `#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&flow_id=33434&range=6h`
 
 test.beforeAll(async ({ baseURL }) => {
   await seed(baseURL ?? 'http://127.0.0.1:8080/', agent, Date.now() - 60_000)
   await seedDualStack(baseURL ?? 'http://127.0.0.1:8080/', dualAgent, Date.now() - 60_000)
+  await seedUnreachable(baseURL ?? 'http://127.0.0.1:8080/', unreachAgent, Date.now() - 60_000)
 })
 
 /** Fails the test on any console error, e.g. a Content-Security-Policy violation. */
@@ -214,6 +216,21 @@ test('a cut list says so', async ({ page }) => {
   await page.goto('./')
   await expect(page.locator('.streams .panel-head')).toContainText(/\d+ of \d+\+/)
   await expect(page.locator('.streams .list-note')).toContainText('more streams than the list holds')
+})
+
+// A destination unreachable code is named by the cycle's address family:
+// code 3 is port unreachable in ICMPv4 and address unreachable (the
+// destination's host is down) in ICMPv6. Before, ICMPv6 codes were named as
+// ICMPv4's (review round five).
+test('unreachable codes are named by address family', async ({ page }) => {
+  for (const [flow, af, want] of [
+    [33434, 4, 'unreachable (port unreachable)'],
+    [33435, 6, 'unreachable (address unreachable)'],
+  ] as const) {
+    await page.goto(`./ui/#/stream?agent=${unreachAgent}&target=${UNREACH}&protocol=icmp&flow_id=${flow}&range=6h`)
+    await expect(page.locator('.stream-head h1')).toContainText(`IPv${af} · flow ${flow}`)
+    await expect(page.locator('section.cycle tbody tr').nth(2)).toContainText(want)
+  }
 })
 
 // Links from before flows were part of a stream have no flow_id.
