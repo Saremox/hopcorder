@@ -243,6 +243,11 @@ The section for a version is the text of its GitHub release.
   it holds, so the output delivers those records, some again (the server
   ignores duplicates; a jsonl file repeats them), and gives such a record
   the next seq. Both are logged as errors; no record is lost.
+- An ongoing outage showed 1 cycle in the read API, the UI's event list and
+  Grafana's Outages panel until it ended: its row was written once, when it
+  began. The server now writes it again after each batch in which the
+  outage went on, with its cycles so far; the row written when it ends
+  still replaces every earlier one.
 
 **Security: server ingest**
 

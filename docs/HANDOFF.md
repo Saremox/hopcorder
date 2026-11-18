@@ -636,7 +636,9 @@ added in the commit that introduced it.
 - **Outage window** = from the first cycle that did not reach the destination
   to the first that did again (that cycle's time is `end_ts`). A routing loop
   is therefore an outage too. The row is written at open (`end_ts` NULL) and
-  at close (higher version). `last_hop_ip`/`last_hop_ttl` are the last
+  at close (higher version). (Round seven: the open row is written again
+  after each part of a batch it went on in, with its cycles so far; see
+  there.) `last_hop_ip`/`last_hop_ttl` are the last
   responding hop of the first failing cycle, which is where it broke.
 - **ASN from iptoasn** rather than GeoLite2: free, no licence key, and a TSV
   that the standard library parses (GeoLite2 needs a reader library and a
@@ -4407,3 +4409,43 @@ decisions:
     refused as stale (409), and the drain retries the same batch until age
     trims those records. That needs a second output lagging by more than
     a batch when the cursor is damaged.
+- **An ongoing outage counts its cycles.** The open row (`end_ts` NULL)
+  was written once, at the outage's first cycle, with `cycles` 1; the
+  count went on in the stream's memory (a restore recounted it there too)
+  and reached storage only with the close row. So for as long as an outage
+  lasted, the read API's `outages`, the UI's event list and Grafana's
+  Outages panel said 1 cycle (review, round seven: 100 unreached cycles
+  after 50 reached showed "ongoing | 1 cycles" beside "150 cycles, 33.3 %
+  reached"). Now:
+  - The ingester writes the open row after each part of a batch in which
+    the outage opened or went on, once per part, with its cycles so far
+    (`derive`). An outage that opens and closes within one part writes only
+    its close row; one a restore opens from the replayed cycles (none was
+    stored) is written the same way.
+  - Versions: an open row's is the seq of its last cycle so far, the close
+    row's the seq of the cycle that reached again. An agent's seqs only
+    grow and a stream's cycles are derived in seq order, so the close row's
+    version is above every open row's of that outage, and `FINAL` and
+    merges keep it whatever order the inserts land in: an events insert
+    retried, one that committed after its timeout, a part derived again
+    after a crash (the same rows, the same versions). A restore reads the
+    newest open row and recounts its cycles from `cycles`, as before; the
+    next part's row carries the count.
+  - Chosen over counting at read time: one row per down stream per part
+    (a `cycles` row per cycle is written anyway), and the read API, the UI
+    and Grafana's panel read the table as they did. A count at read time
+    would scan `cycles` for every open outage, in the API and in the
+    panel's SQL.
+  - `hopcorder_server_outages_total{event="open"}` counts outages opened,
+    not open rows written.
+  - Tests: `TestOpenOutageCountsItsCycles` (fake store: the review's
+    scenario in batches of 10 with a restart; after every batch the open
+    outage has its cycles so far; the close row is read with the rows in
+    either order; one outage opened in the metric) and
+    `TestOpenOutageCyclesClickHouse` (`clickhouse` tag: the same through
+    the read API and the dashboard's Outages panel, then the newest open row
+    inserted again after the close row, which `FINAL` and `OPTIMIZE TABLE
+    outages FINAL` still resolve to the close row). Both failed before:
+    "1 cycles" after the outage's first batch (want 10). `TestEvents`,
+    `TestRestoreAfterRestart` and `TestRestoreOpensUnrecordedOutage` expect
+    the new rows.

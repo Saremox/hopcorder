@@ -409,9 +409,10 @@ func TestRestoreOpensUnrecordedOutage(t *testing.T) {
 	if _, err := in.Ingest(t.Context(), []*record.Record{mk("lab", 4, brokenA...), mk("lab", 5, pathA...)}); err != nil {
 		t.Fatal(err)
 	}
+	// It closes in the batch that restored it: one row, the close row.
 	out := st.table("outages")
-	if len(out) != 2 || num(out[1]["start_seq"]) != 2 || num(out[1]["end_seq"]) != 5 || num(out[1]["cycles"]) != 3 ||
-		out[1]["last_hop_ip"] != "198.18.120.1" {
+	if len(out) != 1 || num(out[0]["start_seq"]) != 2 || num(out[0]["end_seq"]) != 5 || num(out[0]["cycles"]) != 3 ||
+		out[0]["last_hop_ip"] != "198.18.120.1" {
 		t.Errorf("outages %v, want one opened at 2 and closed at 5", out)
 	}
 }
