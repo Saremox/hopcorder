@@ -4638,3 +4638,19 @@ the ten round-seven mediums fixed (#66 to #75).
     and of the default 20Gi, and refuses 0, `2Gi`, a value above a fifth of
     the volume and an unparsable `persistence.size` (failed on the old
     chart); `smoke.sh` expects 107374182 in the running pod.
+- **Documented: on ClickHouse 25.8 grants do not cover `joinGet()` and `IN`
+  with Join and Set tables** (README's note on Grafana's own ClickHouse
+  user, `deploy/compose/clickhouse-init.sql`, the chart's read-only user
+  comment; review round eight, read M2). A user with `SELECT` on
+  `hopcorder.*` alone runs `joinGet('<any db>.<Join table>', 'col', key)`
+  (every value whose key can be guessed or enumerated with `numbers()`)
+  and `'x' IN <any db>.<Set table>`; `SELECT * FROM` either, `JOIN`, `IN
+  <MergeTree table>` and the `dict*` functions are refused. Reproduced on
+  25.8.33.6 for an SQL user (compose) and an XML user (the chart). No
+  setting turns it off, so there is no fix in hopcorder: its own stacks
+  hold only hopcorder's MergeTree tables and `system`, so there is nothing
+  to read there, and the docs now say not to give Grafana's user a
+  ClickHouse shared with other data. It should be reported upstream with
+  round seven's `GRANTEES` bug (the owner's call; not filed from here).
+  - Not added: a CI step that requires `joinGet` to be refused would fail
+    on every run until ClickHouse fixes it.

@@ -288,6 +288,10 @@ The section for a version is the text of its GitHub release.
   `clickhouse.deploy.maxTemporaryDataOnDisk` sets it (at most a fifth of
   the volume). The fixed 2 GB filled volumes under about 8 GiB, such as
   the chart's own 1Gi test volume.
+- Docs: Grafana's read-only ClickHouse user belongs on a ClickHouse
+  without other data. On ClickHouse 25.8 no grant covers `joinGet()` on a
+  Join table or `IN` with a Set table, so that user reads such tables of
+  any database; hopcorder's own stacks have none.
 
 **Security: server ingest**
 

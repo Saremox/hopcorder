@@ -874,6 +874,12 @@ and crash it, fill its disk with temporary data or its own logs, or pin
 memory in the query cache. Set Grafana's `server.domain` and `enforce_domain`
 when it runs on localhost, as the compose stack does, against DNS rebinding.
 
+Give that user a ClickHouse of its own (or one with hopcorder's data only),
+not one shared with other databases: ClickHouse 25.8 checks no grant for
+`joinGet()` on a Join-engine table or for `IN` with a Set-engine table, so a
+user granted `SELECT` on `hopcorder.*` alone reads the values of any
+database's Join tables (by key) and tests membership in its Set tables.
+
 That user protects the data and ClickHouse's settings, not its availability.
 A query that names a time zone (`toTimeZone(now(), 'Asia/Kolkata')`) makes
 ClickHouse 25.8 build a table of about 5 MiB for it and keep it for good,

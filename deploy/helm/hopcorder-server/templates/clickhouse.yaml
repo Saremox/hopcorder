@@ -139,6 +139,8 @@ data:
   {{- if $d.readOnlyUser.enabled }}
   # The read-only user (for Grafana): SELECT on the hopcorder database only,
   # as in deploy/compose/clickhouse-init.sql, which explains each setting.
+  # (ClickHouse 25.8 checks no grant for joinGet() on Join tables or IN on
+  # Set tables of any database; this ClickHouse has none, review round eight.)
   # readonly = 1: a query may change no setting but max_execution_time (1 to
   # 300 s), which the Grafana plugin sends; others turned off memory
   # tracking (one query OOM-killed ClickHouse), pinned memory in the query

@@ -31,6 +31,11 @@
 -- chart's users are in XML, which no GRANT can change.
 CREATE USER OR REPLACE grafana IDENTIFIED WITH sha256_password BY 'grafana' GRANTEES NONE;
 GRANT SELECT ON hopcorder.* TO grafana;
+-- ClickHouse 25.8 checks no grant for joinGet() on a Join-engine table or
+-- for IN <a Set-engine table>: a user with this grant alone reads Join tables
+-- (by key) and tests Set tables of any database (review round eight). This
+-- stack has no such tables; give Grafana's user only a ClickHouse without
+-- them, never one shared with other data.
 
 -- What its queries may do and cost. readonly = 1: a query may change no
 -- setting but those marked CHANGEABLE_IN_READONLY, which are what the
