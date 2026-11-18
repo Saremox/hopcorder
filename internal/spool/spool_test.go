@@ -802,3 +802,180 @@ func TestNewSpoolStartsAtTheClock(t *testing.T) {
 		t.Errorf("seq of a pre-existing spool after reopen %d, want 4", seq)
 	}
 }
+
+// rawUpdate runs fn in a write transaction on the closed spool in dir, with
+// bbolt alone: the damage of a value or a key that the page checks cannot
+// see (pages carry no checksums).
+func rawUpdate(t *testing.T, dir string, fn func(tx *bolt.Tx) error) {
+	t.Helper()
+	db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, boltOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(fn); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readAll reads and acknowledges every record consumer has pending and
+// returns their seqs, numbered from base (see rel), and data.
+func readAll(t *testing.T, s *Spool, consumer string, base uint64) ([]uint64, [][]byte) {
+	t.Helper()
+	es, err := s.Read(consumer, 1000, 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data [][]byte
+	for _, e := range es {
+		data = append(data, e.Data)
+	}
+	if len(es) > 0 {
+		if err := s.Ack(consumer, es[len(es)-1].Seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rel(base, seqsOf(es)), data
+}
+
+// Damage that raised a delivery cursor above the last seq (a flipped bit:
+// the corpus's case 1025, whenever the bit was clear) stalled that output
+// for good: it read nothing, every record appended later lay below its
+// cursor, and acknowledgements of the other outputs, or with none the
+// open itself, deleted the records it had not delivered (review, round
+// seven). At open the cursor goes back to before the oldest record stored:
+// the output delivers every stored record, some of them again, then those
+// appended later.
+func TestCursorAboveLastSeqIsRewound(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		consumers []string
+		acked     []uint64 // each consumer's cursor before the damage, from base
+		pending   uint64   // "a"'s after the open
+		want      string   // what "a" reads first
+	}{
+		{"one output", []string{"a"}, []uint64{3}, 7, "[4 5 6 7 8 9 10 11 12]"},
+		{"behind the other output", []string{"a", "b"}, []uint64{2, 6}, 8, "[3 4 5 6 7 8 9 10 11 12]"},
+		// The records between the two cursors are delivered again.
+		{"ahead of the other output", []string{"a", "b"}, []uint64{6, 2}, 8, "[3 4 5 6 7 8 9 10 11 12]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := open(t, dir, tc.consumers...)
+			base := s.Stats().LastSeq
+			appendN(t, s, 10)
+			for i, c := range tc.consumers {
+				if err := s.Ack(c, base+tc.acked[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			rawUpdate(t, dir, func(tx *bolt.Tx) error {
+				return putU64(tx.Bucket(bucketCursors), []byte("a"), base+tc.acked[0]|1<<52)
+			})
+			s = open(t, dir, tc.consumers...)
+			defer s.Close()
+			if p := s.Pending("a"); p != tc.pending {
+				t.Errorf("pending %d, want %d", p, tc.pending)
+			}
+			appendN(t, s, 2)
+			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != tc.want {
+				t.Errorf("read %v, want %s", got, tc.want)
+			}
+			appendN(t, s, 1)
+			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != "[13]" {
+				t.Errorf("read after the next append %v, want [13]", got)
+			}
+			if len(tc.consumers) > 1 {
+				if got, _ := readAll(t, s, "b", base); fmt.Sprint(got) != fmt.Sprint(seqRange(tc.acked[1]+1, 13)) {
+					t.Errorf("b read %v", got)
+				}
+			}
+		})
+	}
+}
+
+// seqRange is from..to.
+func seqRange(from, to uint64) []uint64 {
+	var out []uint64
+	for s := from; s <= to; s++ {
+		out = append(out, s)
+	}
+	return out
+}
+
+// Damage that raised the newest record's key above next_seq - 1 (a damaged
+// word: the review's at-bound corpus, case 834) stalled every output: each
+// delivered that record, acknowledged its key, and every record appended
+// later lay below its cursor (review, round seven). At open such a record
+// gets the next seq, keeping its data and the seq in it (which the server
+// deduplicates on), so nothing is lost. A next_seq lowered by damage, with
+// records above it, comes back above them; before, appends overwrote
+// those records.
+func TestKeyAboveNextSeqIsRenumbered(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		damage func(tx *bolt.Tx, base uint64) error
+		want   string // what "a" reads, numbered from base: the five records, in order
+	}{
+		{"newest key raised", func(tx *bolt.Tx, base uint64) error {
+			return rekey(tx, base+5, base+5|1<<62)
+		}, "[1 2 3 4 6]"},
+		{"two newest keys raised", func(tx *bolt.Tx, base uint64) error {
+			return errors.Join(rekey(tx, base+4, base+4+1<<40), rekey(tx, base+5, base+5|1<<62))
+		}, "[1 2 3 6 7]"},
+		// The stall as a restart found it: the raised key acknowledged.
+		{"newest key raised and acknowledged", func(tx *bolt.Tx, base uint64) error {
+			return errors.Join(rekey(tx, base+5, base+5|1<<62), putU64(tx.Bucket(bucketCursors), []byte("a"), base+5|1<<62))
+		}, "[1 2 3 4 6]"},
+		{"next_seq lowered", func(tx *bolt.Tx, base uint64) error {
+			return putU64(tx.Bucket(bucketMeta), keyNextSeq, base+3)
+		}, "[1 2 3 4 5]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := open(t, dir, "a")
+			base := s.Stats().LastSeq
+			appendN(t, s, 5)
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			rawUpdate(t, dir, func(tx *bolt.Tx) error { return tc.damage(tx, base) })
+			s = open(t, dir, "a")
+			defer s.Close()
+			got, data := readAll(t, s, "a", base)
+			if fmt.Sprint(got) != tc.want {
+				t.Errorf("read %v, want %s", got, tc.want)
+			}
+			if len(got) != 5 {
+				t.FailNow()
+			}
+			for i, d := range data {
+				if !bytes.HasPrefix(d, fmt.Appendf(nil, `{"seq":%d,`, base+uint64(i)+1)) {
+					t.Errorf("record %d: %.30s, want the one appended as %d", got[i], d, i+1)
+				}
+			}
+			last := got[4]
+			if seqs := appendN(t, s, 2); fmt.Sprint(rel(base, seqs)) != fmt.Sprint([]uint64{last + 1, last + 2}) {
+				t.Errorf("appended as %v after %d", rel(base, seqs), last)
+			}
+			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != fmt.Sprint([]uint64{last + 1, last + 2}) {
+				t.Errorf("read after appending %v, want %d and %d", got, last+1, last+2)
+			}
+		})
+	}
+}
+
+// rekey moves the record stored under seq from to seq to.
+func rekey(tx *bolt.Tx, from, to uint64) error {
+	recs := tx.Bucket(bucketRecords)
+	v := append([]byte(nil), recs.Get(seqKey(from))...)
+	if v == nil {
+		return fmt.Errorf("no record %d", from)
+	}
+	return errors.Join(recs.Delete(seqKey(from)), recs.Put(seqKey(to), v))
+}

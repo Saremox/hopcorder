@@ -4113,7 +4113,8 @@ decisions:
     leaf's overflow over a free page is no damage without a freelist (the
     page becomes the leaf's): kept, and the spool works.
     `HOPCORDER_SPOOL_CORPUS=3000`: every case in both formats kept or
-    quarantined, but case 1025 when its flipped bit raises a cursor (below).
+    quarantined, but case 1025 when its flipped bit raises a cursor (below;
+    fixed since).
     Crash safety: `TestKill9`, and the review's 60 rounds of kill -9 at the
     bound, with and without `fallocate`: no quarantine, no gap, the newest
     records kept.
@@ -4123,16 +4124,18 @@ decisions:
     then reuses a page with records on it (lost) or serves stale records
     again (the server deduplicates them). Pages carry no checksums, and
     damage to values went unseen before as well.
-  - Found, not fixed (the owner's call; also before this change): damage
-    that raises a cursor, or the last record's key, past `next_seq` stalls
-    that output for good. A flipped bit in cursor "a" (corpus case 1025 of
-    3,000 on this layout, when bit 28 of the clock is clear; on the
-    previous layout, case 473 raised cursor "b", which the child does not
-    read back) or the newest key raised by a damaged word (the review's
-    at-bound corpus, case 834 of 1,000, before and after this change): the
-    output delivers that seq, acknowledges it, and every later record lies
-    below its cursor. Refusing a cursor or key above `next_seq - 1` at
-    open would end it.
+  - Found, not fixed here (the owner's call; also before this change), and
+    fixed since, at open (see "A delivery cursor or record key above the
+    last seq" below): damage that raised a cursor, or the last record's
+    key, past `next_seq` stalled that output for good. A flipped bit in
+    cursor "a" (corpus case 1025 of 3,000 on this layout, when bit 28 of
+    the clock is clear; on the previous layout, case 473 raised cursor "b",
+    which the child does not read back) or the newest key raised by a
+    damaged word (the review's at-bound corpus, case 834 of 1,000, before
+    and after this change): the output delivered that seq, acknowledged
+    it, and every later record lay below its cursor. The fix repairs both
+    rather than refusing the file, as suggested here: a refused file takes
+    its undelivered records with it.
 - **ClickHouse's `DNSResolver` and `Cluster` loggers are off, and so are
   its MySQL, PostgreSQL and interserver listeners** (compose and the
   chart's `hopcorder.xml`). The five loggers set to `fatal` above did not
@@ -4339,3 +4342,68 @@ decisions:
     `TestProgressHeadersConstant`: constant at 1, every request fails with
     452; at 0, every one works. Without the header check the default-run
     test fails; without the setting, it and the constant test do.
+- **A delivery cursor or record key above the last seq is repaired at
+  open** (`initDB`, `renumber` and `rewound`, `internal/spool/spool.go`;
+  found with the freelist change above and left open there). Damage that
+  raised a cursor above `next_seq - 1` (a flipped bit: corpus case 1025
+  whenever that bit of the cursor was clear) or the newest record's key (a
+  damaged word: the review's at-bound corpus, case 834) passed every check
+  and stalled that output for good. With a raised cursor it read nothing,
+  every record appended later lay below the cursor, and the records it
+  had not delivered were deleted, at open and by the other outputs'
+  acknowledgements, as delivered. With a raised key it delivered that
+  record, acknowledged the key, and was in the same state. Neither happens
+  without damage: Append stores a record under `next_seq` and counts it
+  up in the same transaction, a new cursor starts at `next_seq - 1`, and
+  outputs acknowledge seqs they read. Now, in the transaction that loads
+  the cursors, before anything is deleted:
+  - Every record stored at or above `next_seq` gets the next seq, in key
+    order, and `next_seq` follows them. Its data, and with it the seq the
+    server deduplicates on, are unchanged; outputs use the key only to
+    acknowledge. If damage lowered `next_seq` instead, the records keep
+    their order and `next_seq` comes back above them (before, appends
+    reused their seqs and overwrote them).
+  - A cursor above the last seq goes back to before the oldest record
+    stored, or to the last seq if none is: the output delivers every stored
+    record, some of them again (the server and readers of a jsonl file
+    deduplicate by `(agent_id, seq)`), then the new ones.
+  - Both are logged as errors, with the values found.
+  - Why not refuse the file, as the note above suggested: a refused file is
+    moved aside and the spool starts empty, so every record some output
+    had not delivered (an outage's backlog, which is what the spool is
+    for) would go with it. The repair loses none. Raising `next_seq` above
+    a raised key would lose none either, but carries the damage to the
+    server: the new records' seqs (up to 2^64) become the agent's mark
+    there, and a later new spool's seqs, from the clock, would lie below
+    it, refused as stale or dropped as duplicates.
+  - §5.2 (locked) is kept: the file format, what `seq` and the cursors
+    mean, and delivery are unchanged, and a healthy file is only read (one
+    seek more at open).
+  - Tests (default run; the damaged state written with bbolt alone):
+    `TestCursorAboveLastSeqIsRewound` (one output, and behind and ahead of
+    a second one: the output reads every stored record, then the new ones,
+    and its pending count is right; before, it read nothing, and the
+    records it had not delivered were deleted at open) and `TestKeyAboveNextSeqIsRenumbered` (the newest key raised,
+    the two newest raised, the newest raised and acknowledged as a restart
+    after the stall finds it, `next_seq` lowered: the five records read
+    back in order with their data, and the records appended after them
+    are read; before, nothing appended after the raised record was read,
+    and with `next_seq` lowered appends reused stored seqs). Without the
+    renumbering the key cases fail; without the rewind the cursor cases
+    and "raised and acknowledged" do.
+  - Accepted: damage that raises `next_seq` still makes the seqs jump, and
+    the server's mark with them. Damage that lowers it with no record
+    stored above it is taken as right (a cursor above it goes back to it),
+    and the new records reuse seqs the server already has, as before: it
+    answers them as duplicates, or refuses them as stale once they lie
+    more than 100,000 below its mark.
+  - Accepted, also damage only: a renumbered record keeps its own, older
+    seq in its data and is delivered after the records appended after it.
+    In the same batch as them the server stores it (it sorts a batch by
+    seq); in a later batch, once the server's mark is past its seq, it is
+    dropped as a duplicate. And a rewound output delivers again the
+    records some other output still holds: a batch of nothing but those,
+    with its newest seq more than 100,000 below the server's mark, is
+    refused as stale (409), and the drain retries the same batch until age
+    trims those records. That needs a second output lagging by more than
+    a batch when the cursor is damaged.

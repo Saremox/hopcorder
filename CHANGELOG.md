@@ -235,6 +235,14 @@ The section for a version is the text of its GitHub release.
   progress headers off, and any answer with an exception code is an error.
   A profile that makes the setting constant at 1 makes every request fail
   instead, visibly: the server stays unready and says why.
+- The agent's spool no longer stops an output for good after damage to
+  its file (bit rot) that raised the output's delivery cursor, or the
+  newest record's key, above the last seq. The output delivered nothing
+  appended after that, and records it had not delivered could be deleted.
+  At start the spool now puts such a cursor back before the oldest record
+  it holds, so the output delivers those records, some again (the server
+  ignores duplicates; a jsonl file repeats them), and gives such a record
+  the next seq. Both are logged as errors; no record is lost.
 
 **Security: server ingest**
 
