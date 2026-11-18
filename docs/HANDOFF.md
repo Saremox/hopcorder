@@ -4481,3 +4481,38 @@ decisions:
     the test): "Cycles1440Reached95.6%Route changes3Outages2Loops6" under
     the other stream's header; on their own, the range and refresh cases
     kept cycle #1440's table too.
+- **A list cut at its limit says `truncated`.** `truncated` covered only
+  the response's byte budget: a list the `LIMIT` cut ended with
+  `"truncated": false`, and the UI, which asks for 10,000 rows and kept
+  only `rows`, counted and listed the newest 10,000 as if they were all
+  (review, round five: 24,000 loop events in 17 h gave 10,000 rows and
+  "Loops 10000"; a nightly 45-minute loop at 5 s with two looping addresses
+  is about 1,080 rows a night, so the 30-day view showed about 9 nights).
+  Now:
+  - Every list endpoint (`targets`, `cycles`, `path-changes`, `loops`,
+    `outages`) reads one row more than `limit` and sends `limit` rows; the
+    extra row only sets `truncated: true` (`runQuery`, as topology's caps
+    already did). The first query of `path-changes`, and of `cycles`
+    without a protocol, does the same (`rowsThatFit`'s `more`), and the
+    query that then reads the rows whole asks for one more than the rows
+    that fit. `truncated` keeps its meaning: rows were left out, now by the
+    limit as well as by the byte budget; README says so.
+  - The UI (`List` in `api.ts`) keeps `truncated` for the stream list and
+    the three event lists. A cut list's count reads "n+" (the stream view's
+    figures, the event list's tabs, the stream list's "of n+"), the stream
+    view says "Only the newest n route changes … of this range are listed
+    and counted; there are more", the event list ends "The newest n only",
+    and the stream list says only the first n by agent and target are
+    listed. n is the rows received, which the byte budget can make fewer
+    than 10,000 (route changes of many TTLs).
+  - Tests: `TestListLimitSaysTruncated` (every list endpoint against a
+    store that honours `{limit}`: 3 rows stored and `limit=2` give 2 rows,
+    truncated; 2 or 1 give all, not truncated; each asks for 3) and
+    `TestListLimitClickHouse` (`clickhouse` tag: the real queries, each
+    endpoint at a limit one below and at its row count) both failed before
+    with `truncated false` at the cut; `TestPathChangesReadOnlyWhatFits`
+    expects the second query's one row more. UI: `api.test.ts` ("says which
+    lists the server cut") and `format.test.ts` (`fmtCount`, `cutNote`),
+    and the e2e "a cut list says so" (the server's loops and targets
+    answers marked cut: "Loops6+", the note, the tab and the end of the
+    list, the stream list's note), which failed before on "Loops6".

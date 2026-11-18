@@ -60,6 +60,17 @@ describe('Client', () => {
     })
   })
 
+  it('says which lists the server cut', async () => {
+    const { client, calls } = fakeClient((u) => ({
+      body: u.pathname.endsWith('/loops') ? { rows: [{ seq: 2 }, { seq: 1 }], truncated: true } : { rows: [{ seq: 1 }], truncated: false },
+    }))
+    expect(await client.loops(stream, range)).toEqual({ rows: [{ seq: 2 }, { seq: 1 }], truncated: true })
+    expect(await client.outages(stream, range)).toEqual({ rows: [{ seq: 1 }], truncated: false })
+    expect((await client.pathChanges(stream, range)).truncated).toBe(false)
+    expect((await client.targets(range)).truncated).toBe(false)
+    expect(calls.map((c) => c.url.searchParams.get('limit'))).toEqual(['10000', '10000', '10000', '10000'])
+  })
+
   it('does not ask past the range', async () => {
     const { client, calls } = fakeClient(() => ({ body: { rows: [] } }))
     expect(await client.cycleAfter(stream, range, 100_000)).toBeNull()

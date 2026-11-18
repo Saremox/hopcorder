@@ -254,6 +254,12 @@ The section for a version is the text of its GitHub release.
   clears them as soon as another stream or range is chosen, and a failed
   load, a failed refresh included, shows the error and "not loaded" in
   their place.
+- Read API: a list cut at its `limit` now says `truncated: true`, as one cut
+  at the response's byte budget did; it said `false`. The UI asks for
+  10,000 events of each kind and showed what it got as the range's whole
+  count ("Loops 10000" for 24,000 loops). A cut list's count now reads
+  "10000+", and the stream view and the stream list say that only the
+  newest (or, for streams, the first) are listed.
 
 **Security: server ingest**
 

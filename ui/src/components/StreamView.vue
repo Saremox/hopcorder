@@ -3,7 +3,7 @@
 // time scrubber, the hop graph, the selected cycle and the range's events.
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import type { Client, Cycle, LoopEvent, Outage, PathChange, StreamKey, Topology } from '../api'
-import { asLabel, fmtPct, fmtRTT, fmtTime, hopLabel, toMs } from '../format'
+import { asLabel, cutNote, fmtCount, fmtPct, fmtRTT, fmtTime, hopLabel, toMs } from '../format'
 import { resolveRange, type Range } from '../state'
 import type { Theme } from '../theme'
 import { changeTimes, nextTime, outageAreas, prevTime, timelineSeries } from '../timeline'
@@ -22,6 +22,8 @@ const topo = shallowRef<Topology | null>(null)
 const changes = shallowRef<PathChange[]>([])
 const outages = shallowRef<Outage[]>([])
 const loops = shallowRef<LoopEvent[]>([])
+/** Which of the lists the server cut: they hold the range's newest events only. */
+const cut = shallowRef({ changes: false, outages: false, loops: false })
 const cycle = shallowRef<Cycle | null>(null)
 const loadingRange = ref(false)
 const loadingCycle = ref(false)
@@ -48,6 +50,7 @@ function clearRange() {
   changes.value = []
   outages.value = []
   loops.value = []
+  cut.value = { changes: false, outages: false, loops: false }
   rangeView.value = ''
   selectedNode.value = null
 }
@@ -72,9 +75,10 @@ async function loadRange() {
     ])
     if (ac.signal.aborted) return
     topo.value = t
-    changes.value = c
-    outages.value = o
-    loops.value = l
+    changes.value = c.rows
+    outages.value = o.rows
+    loops.value = l.rows
+    cut.value = { changes: c.truncated, outages: o.truncated, loops: l.truncated }
     rangeView.value = view
     rangeError.value = ''
   } catch (e) {
@@ -157,6 +161,13 @@ const error = computed(() => [rangeError.value, cycleError.value].filter((e) => 
 /** What the range's panels say while they have no data of this view. */
 const rangeStatus = computed(() => (rangeLoaded.value ? '' : loadingRange.value ? 'loading…' : 'not loaded'))
 const stat = (v: number | string) => (rangeLoaded.value ? v : '–')
+const listNote = computed(() =>
+  cutNote([
+    { what: 'route changes', rows: changes.value.length, cut: cut.value.changes },
+    { what: 'outages', rows: outages.value.length, cut: cut.value.outages },
+    { what: 'loops', rows: loops.value.length, cut: cut.value.loops },
+  ]),
+)
 const graphNote = computed(() =>
   [rangeLoaded.value ? `${layout.value.nodes.length} addresses over ${layout.value.maxTTL} TTLs` : '', loadingRange.value ? 'loading…' : '']
     .filter((s) => s !== '')
@@ -213,9 +224,9 @@ function onKey(ev: KeyboardEvent) {
       <dl class="stats">
         <div><dt>Cycles</dt><dd>{{ stat(summary.cycles) }}</dd></div>
         <div><dt>Reached</dt><dd>{{ stat(fmtPct(summary.reach)) }}</dd></div>
-        <div><dt>Route changes</dt><dd>{{ stat(changes.length) }}</dd></div>
-        <div><dt>Outages</dt><dd>{{ stat(outages.length) }}</dd></div>
-        <div><dt>Loops</dt><dd>{{ stat(loops.length) }}</dd></div>
+        <div><dt>Route changes</dt><dd>{{ stat(fmtCount(changes.length, cut.changes)) }}</dd></div>
+        <div><dt>Outages</dt><dd>{{ stat(fmtCount(outages.length, cut.outages)) }}</dd></div>
+        <div><dt>Loops</dt><dd>{{ stat(fmtCount(loops.length, cut.loops)) }}</dd></div>
       </dl>
     </header>
 
@@ -223,6 +234,7 @@ function onKey(ev: KeyboardEvent) {
     <p v-if="topo?.truncated" class="warn-note">
       This range has more addresses than the graph shows; the busiest are drawn. Pick a shorter range for all of them.
     </p>
+    <p v-if="listNote" class="warn-note list-note">{{ listNote }}</p>
 
     <section class="panel">
       <Timeline
@@ -277,7 +289,7 @@ function onKey(ev: KeyboardEvent) {
 
     <div class="columns">
       <CycleDetails :cycle="cycle" :change="change" :highlight="highlight" :loading="loadingCycle" :failed="cycleError !== ''" />
-      <EventList :changes="changes" :outages="outages" :loops="loops" :status="rangeStatus" :selected-seq="cycle?.seq" @seek="seek" />
+      <EventList :changes="changes" :outages="outages" :loops="loops" :cut="cut" :status="rangeStatus" :selected-seq="cycle?.seq" @seek="seek" />
     </div>
   </div>
 </template>

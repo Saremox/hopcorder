@@ -4,13 +4,15 @@
 // matches; if that is one, it is opened instead (only).
 import { computed, ref, shallowRef, watch } from 'vue'
 import { onlyStream, type Client, type Stream, type StreamKey } from '../api'
-import { fmtPct, fmtTime } from '../format'
+import { fmtCount, fmtPct, fmtTime } from '../format'
 import { resolveRange, streamLink, type Range } from '../state'
 
 const props = defineProps<{ client: Client; range: Range; now: number; match?: StreamKey }>()
 const emit = defineEmits<{ only: [stream: StreamKey] }>()
 
 const streams = shallowRef<Stream[]>([])
+/** The server cut the list: the range has more streams than it holds. */
+const cut = ref(false)
 const loading = ref(false)
 const error = ref('')
 const filter = ref('')
@@ -22,7 +24,9 @@ async function load() {
   ac = mine
   loading.value = true
   try {
-    streams.value = await props.client.targets(resolveRange(props.range, props.now), mine.signal, props.match)
+    const list = await props.client.targets(resolveRange(props.range, props.now), mine.signal, props.match)
+    streams.value = list.rows
+    cut.value = list.truncated
     error.value = ''
     const only = props.match && onlyStream(streams.value)
     if (only) emit('only', only)
@@ -47,9 +51,13 @@ const shown = computed(() => {
   <section class="panel streams">
     <header class="panel-head">
       <h1>Streams</h1>
-      <span class="muted">{{ loading ? 'loading…' : `${shown.length} of ${streams.length}` }}</span>
+      <span class="muted">{{ loading ? 'loading…' : `${shown.length} of ${fmtCount(streams.length, cut)}` }}</span>
       <input v-model="filter" class="filter" type="search" placeholder="Filter by agent, target, protocol or address" aria-label="Filter streams" />
     </header>
+    <p v-if="cut && !loading" class="warn-note list-note">
+      This range has more streams than the list holds: only the first {{ streams.length }} by agent and target are listed.
+      Pick a shorter range for the others.
+    </p>
     <p v-if="match && !loading && streams.length > 1" class="warn-note match-note">
       This link names no single stream of <span class="mono">{{ match.target }}</span> from {{ match.agent }}: pick one.
     </p>

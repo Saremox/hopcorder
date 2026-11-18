@@ -46,6 +46,19 @@ export function fmtPct(ratio: number): string {
   return p === 0 || p === 100 ? `${p}%` : p < 1 ? `${p.toFixed(2)}%` : `${p.toFixed(1)}%`
 }
 
+/** A count of a list's rows: "n+" when the server cut the list (see List). */
+export function fmtCount(n: number, cut: boolean): string {
+  return cut ? `${n}+` : String(n)
+}
+
+/** What to say about the lists of a range the server cut, which hold its newest rows; '' if none was cut. */
+export function cutNote(lists: { what: string; rows: number; cut: boolean }[]): string {
+  const cut = lists.filter((l) => l.cut).map((l) => `${l.rows} ${l.what}`)
+  if (cut.length === 0) return ''
+  const all = cut.length === 1 ? cut[0] : `${cut.slice(0, -1).join(', ')} and ${cut[cut.length - 1]}`
+  return `Only the newest ${all} of this range are listed and counted; there are more. Pick a shorter range for all of them.`
+}
+
 /** The name a hop is shown by: its reverse DNS name, else its address. */
 export function hopLabel(name: string | undefined, ip: string | undefined): string {
   return name || ip || '*'

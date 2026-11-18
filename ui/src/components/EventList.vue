@@ -3,11 +3,19 @@
 // selected moment there.
 import { computed, ref } from 'vue'
 import type { LoopEvent, Outage, PathChange } from '../api'
-import { fmtDuration, fmtTime, toMs } from '../format'
+import { fmtCount, fmtDuration, fmtTime, toMs } from '../format'
 
+// cut: the lists the server cut, which hold the range's newest events only.
 // status, unless empty, says why there are no events to show (loading, or
 // the load failed): the lists are then not the range's.
-const props = defineProps<{ changes: PathChange[]; outages: Outage[]; loops: LoopEvent[]; status: string; selectedSeq: number | undefined }>()
+const props = defineProps<{
+  changes: PathChange[]
+  outages: Outage[]
+  loops: LoopEvent[]
+  cut: { changes: boolean; outages: boolean; loops: boolean }
+  status: string
+  selectedSeq: number | undefined
+}>()
 const emit = defineEmits<{ seek: [t: number] }>()
 
 type Tab = 'changes' | 'outages' | 'loops'
@@ -45,9 +53,9 @@ const items = computed(() => {
 })
 
 const tabs = computed(() => [
-  { id: 'changes' as const, label: 'Route changes', n: props.changes.length },
-  { id: 'outages' as const, label: 'Outages', n: props.outages.length },
-  { id: 'loops' as const, label: 'Loops', n: props.loops.length },
+  { id: 'changes' as const, label: 'Route changes', n: fmtCount(props.changes.length, props.cut.changes) },
+  { id: 'outages' as const, label: 'Outages', n: fmtCount(props.outages.length, props.cut.outages) },
+  { id: 'loops' as const, label: 'Loops', n: fmtCount(props.loops.length, props.cut.loops) },
 ])
 </script>
 
@@ -76,5 +84,6 @@ const tabs = computed(() => [
       </li>
     </ol>
     <p v-else class="muted empty">None in this range.</p>
+    <p v-if="!status && cut[tab]" class="muted list-end">The newest {{ items.length }} only; the range has more.</p>
   </section>
 </template>

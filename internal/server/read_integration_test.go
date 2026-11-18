@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,5 +109,82 @@ func TestReadBudgetClickHouse(t *testing.T) {
 	if topo.Truncated || len(topo.Nodes) != 40 || len(topo.Edges) != 39 || len(topo.Timeline) == 0 {
 		t.Errorf("topology: truncated %v, %d nodes, %d edges, %d buckets", topo.Truncated, len(topo.Nodes),
 			len(topo.Edges), len(topo.Timeline))
+	}
+}
+
+// Every list endpoint, with the real queries, sends the newest limit rows
+// and says truncated when the limit left rows out, and only then (review
+// round five: 24,000 loops gave 10,000 rows with truncated false). Ten
+// cycles of one stream alternate between reaching the destination and a
+// loop (two looping addresses): 10 cycles, 9 route changes, 5 outages and
+// 10 loop rows; a second target makes two streams.
+func TestListLimitClickHouse(t *testing.T) {
+	c := testClickHouse(t)
+	var recs []*record.Record
+	for seq := uint64(1); seq <= 10; seq++ {
+		if seq%2 == 1 {
+			recs = append(recs, mk("lab", seq, pathA...))
+		} else {
+			recs = append(recs, mk("lab", seq, "10.0.0.1", "198.18.120.1", "198.18.120.2", "198.18.120.1", "198.18.120.2", "*"))
+		}
+	}
+	other := mk("lab", 11, pathA...)
+	other.Target = "dc2.example"
+	recs = append(recs, other)
+	if _, err := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil).Ingest(t.Context(), recs); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Options{Store: c, Pinger: c, Enricher: fakeEnrich{}, Logger: slog.New(slog.DiscardHandler)})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	const window = "&from=2026-11-16T22:00:00Z&to=2026-11-17T01:00:00Z"
+	const stream = "agent=lab&target=dc1.example"
+	for _, tc := range []struct {
+		path      string
+		limit     int
+		want      string // seqs; for targets, a 0 a stream, for outages, start_seqs
+		truncated bool
+	}{
+		{"targets?agent=lab", 1, "[0]", true},
+		{"targets?agent=lab", 2, "[0 0]", false},
+		{"cycles?" + stream + "&protocol=icmp", 9, "[10 9 8 7 6 5 4 3 2]", true},
+		{"cycles?" + stream + "&protocol=icmp", 10, "[10 9 8 7 6 5 4 3 2 1]", false},
+		{"cycles?" + stream, 9, "[10 9 8 7 6 5 4 3 2]", true},
+		{"cycles?" + stream, 10, "[10 9 8 7 6 5 4 3 2 1]", false},
+		{"path-changes?" + stream, 8, "[10 9 8 7 6 5 4 3]", true},
+		{"path-changes?" + stream, 9, "[10 9 8 7 6 5 4 3 2]", false},
+		{"outages?" + stream, 4, "[10 8 6 4]", true},
+		{"outages?" + stream, 5, "[10 8 6 4 2]", false},
+		{"loops?" + stream, 9, "[10 10 8 8 6 6 4 4 2]", true},
+		{"loops?" + stream, 10, "[10 10 8 8 6 6 4 4 2 2]", false},
+	} {
+		resp, err := http.Get(fmt.Sprintf("%s/api/v1/query/%s&limit=%d%s", ts.URL, tc.path, tc.limit, window))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Rows []struct {
+				Seq      uint64 `json:"seq"`
+				StartSeq uint64 `json:"start_seq"`
+			} `json:"rows"`
+			Truncated bool `json:"truncated"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&body)
+		_ = resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d %v", tc.path, resp.StatusCode, err)
+		}
+		var seqs []uint64
+		for _, r := range body.Rows {
+			if strings.HasPrefix(tc.path, "outages") {
+				seqs = append(seqs, r.StartSeq)
+			} else {
+				seqs = append(seqs, r.Seq)
+			}
+		}
+		if got := fmt.Sprint(seqs); got != tc.want || body.Truncated != tc.truncated {
+			t.Errorf("%s limit %d: %s, truncated %v; want %s, truncated %v", tc.path, tc.limit, got,
+				body.Truncated, tc.want, tc.truncated)
+		}
 	}
 }
