@@ -40,8 +40,20 @@ policy (the image gives it an engine), is off; hopcorder does not trace.
             <logger><name>HTTPHandler</name><level>fatal</level></logger>
             <logger><name>TCPHandler</name><level>fatal</level></logger>
             <logger><name>BackupsWorker</name><level>fatal</level></logger>
+            <!-- A host name a query passes to hasColumnInTable() (up to
+                 1 MB): logged four times when it fails to resolve, again
+                 each time the DNS cache retries it, and once more by Cluster
+                 (review round seven). -->
+            <logger><name>DNSResolver</name><level>fatal</level></logger>
+            <logger><name>Cluster</name><level>fatal</level></logger>
         </levels>
     </logger>
+    <!-- No MySQL, PostgreSQL or interserver listener: hopcorder uses HTTP
+         (and clickhouse-client the native port), and the PostgreSQL
+         handlers also log a failing query's whole message. -->
+    <mysql_port remove="1"/>
+    <postgresql_port remove="1"/>
+    <interserver_http_port remove="1"/>
     <user_files_path>/srv/</user_files_path>
     <format_schema_path>/srv/</format_schema_path>
     <!-- remote() and the like resolve their host before the grant check;
