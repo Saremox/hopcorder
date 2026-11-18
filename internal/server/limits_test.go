@@ -417,6 +417,88 @@ func TestRestoreOpensUnrecordedOutage(t *testing.T) {
 	}
 }
 
+// If the cycle that ended an outage open in storage derived no events (its
+// batch's restore failed), the restore that then works closes the outage
+// there, with its cycles until then, and counts the close (review, round
+// nine: it stayed ongoing for good, and a restore of the stream down for
+// its whole replay took it up again, with the reached cycles). A stream
+// that is down again is in an outage from the first unreached cycle after
+// the last that reached, which can lie before the replay.
+func TestRestoreClosesAnOutageLeftOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		skipped uint64 // the last seq of the batches whose restore fails, from 61
+		want    map[uint64]string
+		events  string // outages opened and closed after the restart
+	}{
+		{"reached", 70, map[uint64]string{51: "end 61, 10 cycles"}, "close 1 open 0"},
+		{"down for the replay", 120, map[uint64]string{51: "end 61, 10 cycles", 81: "end 0, 50 cycles"}, "close 1 open 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newHookStore()
+			in := NewIngester(st, nil, quietLogger(), nil)
+			spec := func(seq uint64) []string {
+				if seq > 50 && seq <= 60 || tc.skipped > 80 && seq > 80 && seq <= 130 {
+					return brokenA
+				}
+				return pathA
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				var recs []*record.Record
+				for seq := from; seq <= to; seq++ {
+					recs = append(recs, mk("lab", seq, spec(seq)...))
+				}
+				if _, err := in.Ingest(t.Context(), recs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 51; from += 10 { // down from 51, open at 60
+				ingest(from, from+9)
+			}
+			reg := prometheus.NewRegistry()
+			in = NewIngester(st, nil, quietLogger(), newServerMetrics(reg)) // a restart
+			var failing atomic.Bool
+			failing.Store(true)
+			st.query = func(q string) error {
+				if failing.Load() && isRestore(q) {
+					return context.DeadlineExceeded
+				}
+				return nil
+			}
+			for from := uint64(61); from < tc.skipped; from += 10 {
+				ingest(from, from+9)
+			}
+			failing.Store(false)
+			ingest(tc.skipped+1, tc.skipped+10)
+			if got := outagesOf(st.table("outages")); fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("outages %v, want %v", got, tc.want)
+			}
+			if got := outageEvents(t, reg); got != tc.events {
+				t.Errorf("outages counted: %s, want %s", got, tc.events)
+			}
+		})
+	}
+}
+
+// outageEvents is hopcorder_server_outages_total by event.
+func outageEvents(t *testing.T, reg *prometheus.Registry) string {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := map[string]float64{}
+	for _, mf := range mfs {
+		if mf.GetName() == "hopcorder_server_outages_total" {
+			for _, m := range mf.GetMetric() {
+				n[m.GetLabel()[0].GetValue()] = m.GetCounter().GetValue()
+			}
+		}
+	}
+	return fmt.Sprintf("close %v open %v", n["close"], n["open"])
+}
+
 type bigEnrich struct{}
 
 var (

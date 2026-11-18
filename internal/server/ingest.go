@@ -907,10 +907,46 @@ func (in *Ingester) loadHighWater(ctx context.Context, id string) (uint64, error
 	return hw, err
 }
 
+// restoreWhere selects a stream's rows in a restore's queries.
+const restoreWhere = `agent_id = {agent:String} AND target = {target:String} AND protocol = {protocol:String}
+	AND flow_id = {flow:UInt16}`
+
+// storedCycle is a stored cycle as a restore reads it back (restoreCols).
+type storedCycle struct {
+	Seq       uint64   `json:"seq"`
+	TS        string   `json:"ts"`
+	TargetIP  string   `json:"target_ip"`
+	Reached   bool     `json:"reached"`
+	PathLen   int      `json:"path_len"`
+	PathHash  string   `json:"path_hash"`
+	HopTTL    []int    `json:"hops.ttl"`
+	HopStatus []string `json:"hops.status"`
+	HopIP     []string `json:"hops.ip"`
+}
+
+const restoreCols = `seq, ts, target_ip, reached, path_len, path_hash, hops.ttl, hops.status, hops.ip`
+
+// record is c as stream k's record, with what a restore uses of it.
+func (c storedCycle) record(k streamKey) *record.Record {
+	r := &record.Record{AgentID: k.Agent, Target: k.Target, Protocol: k.Protocol, FlowID: k.Flow,
+		Seq: c.Seq, Reached: c.Reached, PathLen: c.PathLen, PathHash: c.PathHash}
+	r.TS = parseTime64(c.TS)
+	r.TargetIP, _ = netip.ParseAddr(c.TargetIP)
+	for i := range c.HopTTL {
+		h := record.Hop{TTL: c.HopTTL[i], Status: record.Status(c.HopStatus[i])}
+		if i < len(c.HopIP) {
+			h.IP, _ = netip.ParseAddr(c.HopIP[i])
+		}
+		r.Hops = append(r.Hops, h)
+	}
+	return r
+}
+
 // restore primes stream s from storage before its cycle first (after a
 // server restart or after s was dropped): the stream's last cycles are
-// replayed into the path tracker, and an outage left open is resumed. Only
-// a complete restore marks s loaded; on an error s is left as it was.
+// replayed into the path tracker, an outage left open is resumed, and one
+// left open that had ended is closed (restoreOutage). Only a complete
+// restore marks s loaded and adds to ev; on an error s is left as it was.
 // Queries run until deadline, not cancelled with the request.
 func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, first *record.Record, ev *events) error {
 	ctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
@@ -918,29 +954,15 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 	k := s.key
 	params := clickhouse.Params{"agent": k.Agent, "target": k.Target, "protocol": k.Protocol,
 		"flow": strconv.Itoa(k.Flow), "before": strconv.FormatUint(first.Seq, 10), "depth": strconv.Itoa(replayDepth)}
-	where := `agent_id = {agent:String} AND target = {target:String} AND protocol = {protocol:String}
-		AND flow_id = {flow:UInt16}`
 
-	type cyc struct {
-		Seq       uint64   `json:"seq"`
-		TS        string   `json:"ts"`
-		TargetIP  string   `json:"target_ip"`
-		Reached   bool     `json:"reached"`
-		PathLen   int      `json:"path_len"`
-		PathHash  string   `json:"path_hash"`
-		HopTTL    []int    `json:"hops.ttl"`
-		HopStatus []string `json:"hops.status"`
-		HopIP     []string `json:"hops.ip"`
-	}
 	// ts bounds what ClickHouse reads: the sort key is (agent_id, target,
 	// protocol, ts), so without it a restore reads the whole history of
 	// every flow of the agent, target and protocol.
-	var rows []cyc
+	var rows []storedCycle
 	for _, back := range []time.Duration{min(restoreRecent, in.maxRecordAge), in.maxRecordAge} {
 		var err error
-		rows, err = clickhouseQuery[cyc](ctx, in.store, `SELECT seq, ts, target_ip, reached, path_len,
-			path_hash, hops.ttl, hops.status, hops.ip FROM cycles WHERE `+where+` AND seq < {before:UInt64}
-			AND ts >= {since:DateTime64(3, 'UTC')} ORDER BY seq DESC LIMIT {depth:UInt32}`,
+		rows, err = clickhouseQuery[storedCycle](ctx, in.store, `SELECT `+restoreCols+` FROM cycles WHERE `+restoreWhere+`
+			AND seq < {before:UInt64} AND ts >= {since:DateTime64(3, 'UTC')} ORDER BY seq DESC LIMIT {depth:UInt32}`,
 			withParam(params, "since", clickhouse.Time(first.TS.Add(-back))))
 		if err != nil {
 			return fmt.Errorf("replay cycles: %w", err)
@@ -952,22 +974,62 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 	slices.Reverse(rows)
 	recs := make([]*record.Record, 0, len(rows))
 	for _, c := range rows {
-		r := &record.Record{AgentID: k.Agent, Target: k.Target, Protocol: k.Protocol, FlowID: k.Flow,
-			Seq: c.Seq, Reached: c.Reached, PathLen: c.PathLen, PathHash: c.PathHash}
-		r.TS = parseTime64(c.TS)
-		r.TargetIP, _ = netip.ParseAddr(c.TargetIP)
-		for i := range c.HopTTL {
-			h := record.Hop{TTL: c.HopTTL[i], Status: record.Status(c.HopStatus[i])}
-			if i < len(c.HopIP) {
-				h.IP, _ = netip.ParseAddr(c.HopIP[i])
-			}
-			r.Hops = append(r.Hops, h)
-		}
-		recs = append(recs, r)
+		recs = append(recs, c.record(k))
 	}
 	restored := stream{key: k}
 	restored.replay(recs)
-	if len(recs) == 0 || !recs[len(recs)-1].Reached {
+	var found events
+	o, err := in.restoreOutage(ctx, k, params, first, recs, &found)
+	if err != nil {
+		return err
+	}
+	ev.outages = append(ev.outages, found.outages...)
+	ev.opened += found.opened
+	s.tracker, s.last, s.outage, s.loaded = restored.tracker, restored.last, o, true
+	return nil
+}
+
+// restoreOutage returns the outage that stream k, restored before its cycle
+// first, goes on with, if any; recs are its replayed cycles (its last
+// stored cycles before first, oldest first).
+//
+// An outage that storage holds open although a cycle after its start
+// reached the destination ended at the first such cycle, in cycles that
+// derived no events: those of a batch in which the stream could not be
+// restored (review, round nine; before, it stayed ongoing for good, and a
+// restore of the stream down for its whole replay took it up again). Its
+// close row is added to ev, as derive writes one, and if the stream is
+// down, the outage it is in begins with the first cycle after the last
+// that reached.
+func (in *Ingester) restoreOutage(ctx context.Context, k streamKey, params clickhouse.Params, first *record.Record,
+	recs []*record.Record, ev *events) (*outageRow, error) {
+	// newest is the stream's newest outage that started after lo and before
+	// hi, open or closed. (Not "end_ts IS NULL" with "NULL AS end_ts"
+	// selected, as until review round eight: ClickHouse reads a SELECT alias
+	// in WHERE, so that filter was always true and a closed outage came back
+	// as open.)
+	newest := func(lo, hi uint64) (*outageRow, error) {
+		rows, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
+			toString(start_ts) AS start_ts, end_seq, end_ts, cycles, last_hop_ttl, last_hop_ip, version
+			FROM outages FINAL WHERE `+restoreWhere+` AND start_seq < {before:UInt64}
+			AND start_seq > {after:UInt64} ORDER BY start_seq DESC LIMIT 1`,
+			withParam(withParam(params, "before", strconv.FormatUint(hi, 10)), "after", strconv.FormatUint(lo, 10)))
+		if err != nil || len(rows) == 0 {
+			return nil, err
+		}
+		return &rows[0], nil
+	}
+	after := uint64(0) // the last replayed cycle that reached the destination
+	for _, r := range slices.Backward(recs) {
+		if r.Reached {
+			after = r.Seq
+			break
+		}
+	}
+	down := len(recs) == 0 || !recs[len(recs)-1].Reached
+	var o *outageRow
+	current, reopened, newestKnown := false, false, false
+	if down {
 		// The stream may have been down when its state was lost (or its
 		// last cycles lie beyond the window): resume its open outage. It
 		// started after the last replayed cycle that reached the
@@ -975,70 +1037,163 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 		// outage can be older than any window, and a stream that was down
 		// for the whole replay has a row there per outage, not per cycle (a
 		// stream that flaps has one per two cycles, so the bound matters).
-		after := uint64(0)
-		for _, r := range slices.Backward(recs) {
-			if r.Reached {
-				after = r.Seq
-				break
-			}
-		}
-		// The newest outage that started in that stretch, open or closed.
-		// (Not "end_ts IS NULL" with "NULL AS end_ts" selected, as before:
-		// ClickHouse reads a SELECT alias in WHERE, so that filter was always
-		// true and a closed outage came back as open; review, round eight.)
-		open, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
-			toString(start_ts) AS start_ts, end_seq, end_ts, cycles, last_hop_ttl, last_hop_ip, version
-			FROM outages FINAL WHERE `+where+` AND start_seq < {before:UInt64}
-			AND start_seq > {after:UInt64} ORDER BY start_seq DESC LIMIT 1`,
-			withParam(params, "after", strconv.FormatUint(after, 10)))
+		found, err := newest(after, first.Seq)
 		if err != nil {
-			return fmt.Errorf("find open outage: %w", err)
+			return nil, fmt.Errorf("find open outage: %w", err)
 		}
 		// It goes on if it is open, or if it closed at or after first: then
 		// first's part is derived again (after a crash before the mark), and
 		// closes it there again, with the same row. One that closed before
 		// first is over; resumed, its next rows (with higher versions) would
 		// replace its close row.
-		if len(open) == 1 {
-			if open[0].EndTS != nil && open[0].EndSeq < first.Seq {
-				open = nil
-			} else {
-				open[0].EndTS, open[0].EndSeq = nil, 0
-			}
-		}
 		switch {
-		case len(open) == 1:
-			type n struct {
-				N int `json:"n"`
-			}
-			cnt, err := clickhouseQuery[n](ctx, in.store, `SELECT count() AS n FROM cycles WHERE `+where+`
-				AND seq >= {start:UInt64} AND seq < {before:UInt64} AND ts >= {start_ts:DateTime64(3, 'UTC')}`,
-				withParam(withParam(params, "start", strconv.FormatUint(open[0].StartSeq, 10)), "start_ts", open[0].StartTS))
-			if err != nil {
-				return fmt.Errorf("count outage cycles: %w", err)
-			}
-			if len(cnt) == 1 {
-				open[0].Cycles = cnt[0].N
-			}
-			restored.outage = &open[0]
-		case len(recs) > 0:
-			// Down, but no open outage stored: its start was in cycles that
-			// derived no events (a batch whose restore did not happen in
-			// time, or whose events could not be stored). It starts at the
-			// first of the trailing unreached cycles replayed; its row is
-			// written after the part, as any open outage's (derive).
-			i := len(recs)
-			for i > 0 && !recs[i-1].Reached {
-				i--
-			}
-			o := newOutage(recs[i], len(recs)-i)
-			o.Version = recs[len(recs)-1].Seq
-			restored.outage = &o
-			ev.opened++
+		case found == nil:
+		case found.EndTS == nil:
+			o, current = found, true
+		case found.EndSeq >= first.Seq:
+			found.EndTS, found.EndSeq = nil, 0
+			o, current, reopened = found, true, true
+		}
+		newestKnown = found != nil
+	}
+	if !newestKnown && after > 0 {
+		// The stream's newest outage started before the last replayed cycle
+		// that reached, so it ended by then: if storage holds it open, its
+		// end derived no events. Looked for in the replay first, which
+		// bounds the lookup for a stream that flaps (round four), then
+		// before it.
+		var found *outageRow
+		var err error
+		if slices.ContainsFunc(recs, func(r *record.Record) bool { return !r.Reached }) {
+			found, err = newest(recs[0].Seq-1, after)
+		}
+		if err == nil && found == nil {
+			found, err = newest(0, recs[0].Seq)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("find outage left open: %w", err)
+		}
+		if found != nil && found.EndTS == nil {
+			o = found
 		}
 	}
-	s.tracker, s.last, s.outage, s.loaded = restored.tracker, restored.last, restored.outage, true
-	return nil
+
+	if o != nil {
+		sp, err := in.outageSpan(ctx, params, o)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case reopened || (current && sp.Reached == 0):
+			o.Cycles = sp.N
+			return o, nil
+		case sp.Reached > 0:
+			// It ended at the first of those. A stream down for its whole
+			// replay is in an outage that began after the last of them,
+			// which can lie before the replay; a stream down after a
+			// replayed cycle that reached is in one opened below, as one
+			// whose start derived no events.
+			n, err := in.closeLeftOpen(ctx, k, params, *o, sp, down && after == 0 && len(recs) > 0, ev)
+			if err != nil {
+				return nil, err
+			}
+			if n != nil {
+				n.Version = recs[len(recs)-1].Seq
+				ev.opened++
+				return n, nil
+			}
+		}
+	}
+	if !down || len(recs) == 0 {
+		return nil, nil
+	}
+	// Down, but no open outage stored: its start was in cycles that derived
+	// no events (a batch whose restore did not happen in time, or whose
+	// events could not be stored). It starts at the first of the trailing
+	// unreached cycles replayed; its row is written after the part, as any
+	// open outage's (derive).
+	i := len(recs)
+	for i > 0 && !recs[i-1].Reached {
+		i--
+	}
+	n := newOutage(recs[i], len(recs)-i)
+	n.Version = recs[len(recs)-1].Seq
+	ev.opened++
+	return &n, nil
+}
+
+// outageSpan is what storage holds of a stream's cycles from an outage's
+// start to the cycle being restored before.
+type outageSpan struct {
+	N           int    `json:"n"`
+	Reached     int    `json:"n_reached"`    // of them, how many reached the destination
+	CloseSeq    uint64 `json:"close_seq"`    // the first of those
+	CloseTS     string `json:"close_ts"`     // and its ts
+	LastReached uint64 `json:"last_reached"` // the last of those
+}
+
+// outageSpanFrom is the window of outageSpan's queries. (Their aliases are
+// no column names: ClickHouse reads an alias in WHERE and in the other
+// expressions before a column of the same name; review, round eight.)
+const outageSpanFrom = ` FROM cycles WHERE ` + restoreWhere + ` AND seq >= {start:UInt64} AND seq < {before:UInt64}
+	AND ts >= {start_ts:DateTime64(3, 'UTC')}`
+
+func outageParams(params clickhouse.Params, o *outageRow) clickhouse.Params {
+	return withParam(withParam(params, "start", strconv.FormatUint(o.StartSeq, 10)), "start_ts", o.StartTS)
+}
+
+func (in *Ingester) outageSpan(ctx context.Context, params clickhouse.Params, o *outageRow) (outageSpan, error) {
+	rows, err := clickhouseQuery[outageSpan](ctx, in.store, `SELECT count() AS n, countIf(reached) AS n_reached,
+		minIf(seq, reached) AS close_seq, argMinIf(ts, seq, reached) AS close_ts,
+		maxIf(seq, reached) AS last_reached`+outageSpanFrom, outageParams(params, o))
+	if err != nil {
+		return outageSpan{}, fmt.Errorf("count outage cycles: %w", err)
+	}
+	if len(rows) != 1 {
+		return outageSpan{N: o.Cycles}, nil
+	}
+	return rows[0], nil
+}
+
+// closeLeftOpen adds to ev the close row of outage o, which storage holds
+// open although sp has a cycle after its start that reached: o ended at
+// the first, as observe would have closed it. With downSince (the stream
+// was down for its whole replay), it also returns the outage the stream is
+// in at the cycle being restored before: from the first cycle after the
+// last that reached, with its cycles until then, still to be given its
+// version.
+func (in *Ingester) closeLeftOpen(ctx context.Context, k streamKey, params clickhouse.Params, o outageRow,
+	sp outageSpan, downSince bool, ev *events) (*outageRow, error) {
+	p := withParam(withParam(outageParams(params, &o), "close", strconv.FormatUint(sp.CloseSeq, 10)),
+		"last", strconv.FormatUint(sp.LastReached, 10))
+	type counts struct {
+		Closed    int `json:"closed"`
+		SinceLast int `json:"since_last"`
+	}
+	cnt, err := clickhouseQuery[counts](ctx, in.store, `SELECT countIf(seq < {close:UInt64}) AS closed,
+		countIf(seq > {last:UInt64}) AS since_last`+outageSpanFrom, p)
+	if err != nil {
+		return nil, fmt.Errorf("count cycles of an outage left open: %w", err)
+	}
+	if len(cnt) != 1 {
+		return nil, errors.New("count cycles of an outage left open: no row")
+	}
+	o.EndSeq, o.EndTS, o.Version, o.Cycles = sp.CloseSeq, tsPtr(parseTime64(sp.CloseTS)), sp.CloseSeq, cnt[0].Closed
+	ev.outages = append(ev.outages, o)
+	if !downSince {
+		return nil, nil
+	}
+	rows, err := clickhouseQuery[storedCycle](ctx, in.store, `SELECT `+restoreCols+` FROM cycles WHERE `+restoreWhere+`
+		AND seq > {last:UInt64} AND seq < {before:UInt64} AND ts >= {start_ts:DateTime64(3, 'UTC')}
+		ORDER BY seq LIMIT 1`, p)
+	if err != nil {
+		return nil, fmt.Errorf("find the first cycle of the outage: %w", err)
+	}
+	if len(rows) != 1 {
+		return nil, nil
+	}
+	n := newOutage(rows[0].record(k), cnt[0].SinceLast)
+	return &n, nil
 }
 
 // parseTime64 reads a DateTime64 as the client returns it (ISO 8601), or

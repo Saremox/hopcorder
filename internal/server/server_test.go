@@ -118,15 +118,54 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 				}
 			}
 		}
-	case strings.Contains(q, "SELECT count() AS n FROM cycles"):
+	case strings.Contains(q, "AS n_reached"), strings.Contains(q, "AS since_last"): // restore: an outage's cycles
 		start, _ := strconv.ParseUint(p["start"], 10, 64)
-		n := 0
+		closeSeq, _ := strconv.ParseUint(p["close"], 10, 64)
+		last, _ := strconv.ParseUint(p["last"], 10, 64)
+		var n, reached, closed, sinceLast int
+		var first, lastReached uint64
+		closeTS := ""
 		for _, c := range f.rows["cycles"] {
-			if f.stream(c, p) && num(c["seq"]) >= start && num(c["seq"]) < before {
-				n++
+			s := num(c["seq"])
+			if !f.stream(c, p) || s < start || s >= before || c["ts"].(string) < p["start_ts"] {
+				continue
+			}
+			n++
+			if c["reached"] == true {
+				reached++
+				if first == 0 || s < first {
+					first, closeTS = s, c["ts"].(string)
+				}
+				lastReached = max(lastReached, s)
+			}
+			if s < closeSeq {
+				closed++
+			}
+			if s > last {
+				sinceLast++
 			}
 		}
-		out = []string{fmt.Sprintf(`{"n":%d}`, n)}
+		if strings.Contains(q, "AS since_last") {
+			out = []string{fmt.Sprintf(`{"closed":%d,"since_last":%d}`, closed, sinceLast)}
+		} else {
+			b, _ := json.Marshal(map[string]any{"n": n, "n_reached": reached, "close_seq": first, "close_ts": closeTS,
+				"last_reached": lastReached})
+			out = []string{string(b)}
+		}
+	case strings.Contains(q, "ORDER BY seq LIMIT 1"): // restore: the first cycle of an outage
+		last, _ := strconv.ParseUint(p["last"], 10, 64)
+		var best map[string]any
+		for _, c := range f.rows["cycles"] {
+			s := num(c["seq"])
+			if f.stream(c, p) && s > last && s < before && c["ts"].(string) >= p["start_ts"] &&
+				(best == nil || s < num(best["seq"])) {
+				best = c
+			}
+		}
+		if best != nil {
+			b, _ := json.Marshal(best)
+			out = []string{string(b)}
+		}
 	case strings.Contains(q, "FROM cycles WHERE agent_id = {agent:String}"): // restore
 		var cs []map[string]any
 		for _, c := range f.rows["cycles"] {
@@ -140,7 +179,7 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 			b, _ := json.Marshal(c)
 			out = append(out, string(b))
 		}
-	case strings.Contains(q, "FROM outages FINAL WHERE agent_id"): // restore open outage
+	case strings.Contains(q, "FROM outages FINAL WHERE agent_id"): // restore: the newest outage, open or closed
 		latest := map[uint64]map[string]any{}
 		for _, o := range f.rows["outages"] {
 			if f.stream(o, p) {
@@ -152,7 +191,7 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 		var best map[string]any
 		after, _ := strconv.ParseUint(p["after"], 10, 64)
 		for _, o := range latest {
-			if o["end_ts"] == nil && num(o["start_seq"]) < before && num(o["start_seq"]) > after &&
+			if num(o["start_seq"]) < before && num(o["start_seq"]) > after &&
 				(best == nil || num(o["start_seq"]) > num(best["start_seq"])) {
 				best = o
 			}
