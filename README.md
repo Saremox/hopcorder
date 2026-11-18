@@ -201,7 +201,11 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   about 2 GiB, keeps its own logs for 7 days on a disk of their own that
   leaves a quarter of the volume to the data, and lets only the server reach
   it and it reach nothing (a NetworkPolicy; add Grafana with
-  `clickhouse.deploy.networkPolicy.from`).
+  `clickhouse.deploy.networkPolicy.from`). Run it only with a CNI that
+  enforces NetworkPolicy: without one, any pod reaches ClickHouse's HTTP
+  port, and a client that holds its 256 connections open, one header byte
+  at a time, keeps every new client out for as long as it goes on
+  (ClickHouse has no deadline for a request's header).
   `clickhouse.deploy.readOnlyUser.enabled` adds a read-only user for Grafana
   (SELECT on the hopcorder database, bounded queries), with its password in a
   generated Secret. Whoever can query Grafana's data source can still crash
