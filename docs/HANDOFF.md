@@ -554,7 +554,9 @@ added in the commit that introduced it.
   jittered to 50–100%.
 - **`--once`** does not open the spool (so it can run next to a running agent)
   and prints records with `seq: 0`; a new spool starts its seqs at the clock
-  (time in microseconds, since round two), an existing one keeps counting.
+  (time in microseconds, since round two), and an existing one goes on from
+  the clock too when that is ahead of its counter (since round eight), from
+  its counter otherwise.
 - **SIGHUP reload** (§5.4 stretch, done after review): the file is re-read
   and the original command-line flags and positional targets are re-applied.
   Invalid: logged, nothing changes. Valid: the daemon (spool, outputs,
@@ -1586,6 +1588,9 @@ decisions:
   slower than the clock, so a new one starts above anything an earlier
   one reached, as long as the clock is right. An existing spool keeps its
   counter. This replaces "the spool assigns seqs from 1" (§10).
+  (Round eight: an existing spool keeps its counter only while the clock
+  is behind it, and otherwise goes on from the clock as well, so that a
+  spool restored to an earlier state reuses no seq. See round eight.)
   - On a host without an RTC whose clock is still at 1970 when a new
     spool is created, the first seq is tiny: the old behaviour, no worse.
   - Seqs near 1.8·10^15 stay below 2^53, so JavaScript numbers hold them
@@ -4408,7 +4413,9 @@ decisions:
     with its newest seq more than 100,000 below the server's mark, is
     refused as stale (409), and the drain retries the same batch until age
     trims those records. That needs a second output lagging by more than
-    a batch when the cursor is damaged.
+    a batch when the cursor is damaged. (Round eight: the server holds
+    those records, so it answers them as duplicates now; see round eight,
+    "A spool back at an earlier state".)
 - **An ongoing outage counts its cycles.** The open row (`end_ts` NULL)
   was written once, at the outage's first cycle, with `cycles` 1; the
   count went on in the stream's memory (a restore recounted it there too)
@@ -4654,3 +4661,149 @@ the ten round-seven mediums fixed (#66 to #75).
   round seven's `GRANTEES` bug (the owner's call; not filed from here).
   - Not added: a CI step that requires `joinGet` to be refused would fail
     on every run until ClickHouse fixes it.
+- **A spool back at an earlier state goes on above its seqs** (`raise` and
+  `Pending`, `internal/spool/spool.go`; `holdsAll`,
+  `internal/server/ingest.go`; review round eight, agent M1, MEDIUM; the
+  counter dates from M1). An existing spool went on from the `next_seq` it
+  held. When its file went back to an earlier state while the server kept
+  its mark (a VM snapshot reverted, or a disk-only snapshot booted; a
+  volume restored from a backup; a power loss on storage that ignores
+  flushes, such as an SD card), the agent assigned again the seqs it had
+  sent since: the server took the new cycles for retries (`seq` at or
+  below the mark, answered 2xx), and the agent deleted them as delivered.
+  As many cycles as the rolled-back interval held were lost, with nothing
+  to show it but the server's duplicate count. Reproduced by the review
+  (30 cycles delivered, 20 stored, 10 dropped) and here with the real
+  agent and server on ClickHouse (runs of 6 s, the spool copied after the
+  first and put back after the second: 24 of 36 cycles stored, 12 dropped).
+  - Now `initDB` raises `next_seq` to the clock (`clockSeq`, a new
+    spool's first seq) when that is ahead, in the transaction that loads
+    the state, after `renumber` and the cursor checks, which compare with
+    the counter as it was (so a damaged cursor or key between it and the
+    clock is still found). A spool counts up by one per record, far slower
+    than the clock, so no seq at or above the clock was assigned before,
+    by this spool or by any earlier state of its file, as long as the
+    clock was not set back. The seqs skipped hold no record: a cursor at
+    the last seq (an output that had delivered everything) moves to the
+    new last seq, and a new output starts there.
+  - §5.2 (locked) is kept: `seq` is persisted, monotonic per agent and the
+    idempotency key, as before (it was never consecutive: a new spool has
+    started at the clock since round two); a cursor still means delivered
+    up to there; no record is moved, renumbered or deleted; the raise is
+    committed with the open's transaction or not at all (a `kill -9`
+    before it: the next open raises). What changes is round two's "an
+    existing spool keeps its counter": only while the clock is behind it.
+  - The seqs now skip ahead at every start and every reload (a reload
+    reopens the spool). What took them for consecutive:
+    - `Pending` was the last seq less the cursor, after a skip the size of
+      the skip. The drain's batch-full check (`waitForBatch`) would ship
+      every partial batch at once, `hopcorder_output_pending_records` read
+      billions, and the shutdown's `waitIdle` waited out its grace for an
+      output with nothing left to deliver. Now it is that but at most the
+      records stored: never less than the records after the cursor, so 0
+      only when there is nothing to read. An output ahead of another one
+      may count the other's records as its own until it delivers one
+      appended after the skip; the cursor move above makes it exact for
+      one that had delivered everything. The records the bounds dropped no
+      longer count beyond those stored ("including any that the bounds
+      have since dropped"): they cannot be read, and nothing used them.
+    - The server's stale window: a batch wholly more than 100,000 seqs
+      below the mark gets 409, and the drain retries it until the bounds
+      drop it. With skips of hours of microseconds a real re-delivery can
+      lie that far below: a restored spool's backlog when the agent
+      restarted between the snapshot and the restore; a retry cut shorter
+      (a batch across a skip stored but not acknowledged, read again with
+      a lower `batch_max_records` after a reload); round seven's rewound
+      cursor. Measured with the spool's fix alone: a snapshot taken while
+      the server was down (12 records, batches of 4), restored after a
+      restart, got 409 16 times and held the last run's 16 cycles back for
+      as long as it ran (until the age bound would have dropped the
+      backlog, 7 days by default). So the server now looks such a batch up
+      (`holdsAll`: `SELECT DISTINCT seq, toUnixTimestamp64Milli(ts)` in
+      the batch's window) and answers it as duplicates if it holds every
+      record at its seq with its ts, to the millisecond cycles keeps;
+      otherwise 409 as before (a wiped spool with its clock behind, a
+      second agent with the same `agent_id`: at those seqs their cycles
+      differ or are missing). Same run with both: 40 of 40 cycles stored,
+      the 12 delivered again counted as duplicates. Only that path, which
+      a healthy agent does not take, runs the lookup.
+    - Unaffected: trim, the bounds and the dropped count go by key and
+      age; the room accounting by bytes and pages; `renumber` and
+      `rewound` run before the raise; the addresses bucket holds no seqs;
+      the server's dedup, parts, restores and outage versions only need
+      seqs to grow, and JavaScript numbers hold them exactly (round two).
+  - Options weighed:
+    - The server alone (the review's (a): 409 for a "duplicate" whose
+      stored cycle has another ts): loud, but the agent retries that batch
+      until the bounds drop it, 7 days by default, with every newer record
+      behind it, and every batch with a duplicate in it costs a lookup.
+      The lookup is used the other way round instead: to let through a
+      batch the server holds.
+    - Documentation only (delete a restored spool, or give the agent a new
+      `agent_id`): the loss stays silent, so nobody knows to do it, and
+      deleting the spool loses its backlog.
+    - Raising only after a rollback: the spool cannot tell one from
+      downtime (both leave an old counter), and a mark kept elsewhere on
+      the same disk goes back with it. A margin (raising only when the
+      clock is ahead by more than a minute, say) changes nothing for the
+      server and leaves a restart within the margin of the snapshot
+      reusing seqs.
+    - Keys apart from the seqs in the data (keys counting up by one, an
+      offset for the seqs): `Pending` would stay a subtraction, but the
+      cursors would no longer be seqs, which is what §5.2 locks.
+  - Accepted:
+    - A clock behind the spool's last seq (no RTC and no NTP yet at boot,
+      a Raspberry Pi's fake-hwclock; a clock set back) keeps the old
+      behaviour: the spool goes on from its counter, and one that went
+      back reuses seqs. The open logs it as a warning; README says to
+      start the agent once the clock is set.
+    - A VM reverted with its memory resumes the running agent, which does
+      not reopen its spool: it goes on from the snapshot's seqs, and the
+      server drops its cycles as duplicates until it restarts. README says
+      to restart it after such a revert.
+    - Two agents with the same `agent_id` take turns: the one that started
+      or reloaded last is stored, the other refused until it starts again
+      (before, the one whose spool was older was refused for good). Still
+      a misconfiguration (README).
+    - Every open writes `next_seq` (one page); an unchanged healthy file
+      was only read before (round seven).
+  - Tests (default run, unless tagged):
+    - `TestRolledBackSpoolGoesOnAboveItsSeqs`: the bbolt file copied,
+      three opens that append and acknowledge, the copy put back: the next
+      seqs lie above all of theirs, and the output reads the snapshot's
+      undelivered record, then the new ones. Failed before (the new seqs
+      were the old ones again).
+    - `TestNewSpoolStartsAtTheClock` (now also: a reopen a day later goes
+      on from the clock, one with the clock behind from the counter, with
+      the warning, and a spool counting from 1 from the clock; failed
+      before) and `TestClockBehindKeepsTheCounter` (1 µs, 1 h and 50
+      years behind: last seq, records, pending and the next seq as they
+      were).
+    - `TestPendingAcrossTheClock`; `TestDrainAcrossTheClock` (output: with
+      4 of 10 pending after a skip a partial batch keeps waiting, the full
+      batch spans the skip, in order); `TestWaitIdleAcrossTheClock`
+      (`cmd/hopcorder`: the shutdown's wait waits with 3 records to
+      deliver and ends at once when they are, nothing appended since).
+      Without the bound on `Pending` all three fail, without the cursor
+      move the first and the last.
+    - `TestKill9` has a mode `reopen`: the child reopens its spool every
+      ten appends, each open going on from the clock; after the kill the
+      seqs it reported only went up, and the next lies above them. Every
+      mode reopens with the clock behind (right after the last commit, as
+      before) and then ahead (from the clock).
+    - `TestCursorAboveLastSeqIsRewound` and `TestKeyAboveNextSeqIsRenumbered`
+      also damage a cursor or a key to just above the last seq, below the
+      clock, and open with the clock behind and ahead: raising before the
+      cursor checks fails the first, raising before `renumber` both.
+    - Server: `TestStaleRedeliveryIsDuplicates` (fake store) and
+      `TestStaleRedeliveryClickHouse` (`clickhouse` tag, the query with
+      sub-millisecond ts): a batch far below the mark that the server
+      holds is duplicates (409 before); one with another ts at a held seq,
+      or with a seq not held, 409.
+    - Tests that compared seqs across a reopen open with the clock behind
+      where they check what an open keeps (`reopen` in the spool's tests,
+      `openSpool` in the daemon's), ahead where they check what follows,
+      or count with the skip (`checkNewestKept`). The daemon's tests
+      create the spool an hour ahead, so that a run's seqs are known;
+      `TestOutageAndRecovery` puts it two hours ahead for the run after
+      its restart, and checks every seq of both runs.

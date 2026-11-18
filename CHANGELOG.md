@@ -292,6 +292,21 @@ The section for a version is the text of its GitHub release.
   without other data. On ClickHouse 25.8 no grant covers `joinGet()` on a
   Join table or `IN` with a Set table, so that user reads such tables of
   any database; hopcorder's own stacks have none.
+- Agent: a spool back at an earlier state (a VM snapshot reverted, a
+  volume restored from a backup, a disk that lost writes it had confirmed)
+  no longer reuses seqs the server has. It went on from the seq it held,
+  and the server dropped the cycles recorded after it as duplicates,
+  silently, until their seqs passed the ones it had stored (in a
+  reproduction, 12 of 36 cycles). Each time the agent opens its spool (a
+  start or a reload) the seqs now go on from the clock, as a new spool's
+  start there, whenever that is ahead: above every seq the agent sent
+  before, as long as the clock is right (a clock behind is logged). So the
+  seqs skip ahead at every start and reload; the pending count (the
+  `hopcorder_output_pending_records` metric, batching, the wait at
+  shutdown) counts records, not seqs. The server answers a batch far below
+  an agent's seqs as duplicates, not 409, when it holds every one of its
+  cycles as they are: a restored spool's backlog lies that far below, and
+  its delivery would have stalled until the age bound dropped it.
 
 **Security: server ingest**
 

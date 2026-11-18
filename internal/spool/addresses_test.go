@@ -47,7 +47,7 @@ func TestAddressesPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s = open(t, dir, "c")
+	s = reopen(t, dir, "c") // the clock behind: the seq stays where it was
 	defer s.Close()
 	got, err := s.Addresses()
 	if err != nil || !maps.Equal(got, want) {

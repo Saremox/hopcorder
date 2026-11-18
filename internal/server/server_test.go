@@ -100,6 +100,24 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 				out = append(out, fmt.Sprintf(`{"seq":%d}`, s))
 			}
 		}
+	case strings.Contains(q, "SELECT DISTINCT seq, toUnixTimestamp64Milli(ts) AS ms FROM cycles"): // holdsAll
+		lo, _ := strconv.ParseUint(p["lo"], 10, 64)
+		hi, _ := strconv.ParseUint(p["hi"], 10, 64)
+		seen := map[string]bool{}
+		for _, c := range f.rows["cycles"] {
+			s, ts := num(c["seq"]), c["ts"].(string)
+			if c["agent_id"] == p["agent"] && s >= lo && s <= hi && ts >= p["from"] && ts <= p["to"] {
+				at, err := time.Parse("2006-01-02 15:04:05.000", ts)
+				if err != nil {
+					f.mu.Unlock()
+					return err
+				}
+				if l := fmt.Sprintf(`{"seq":%d,"ms":%d}`, s, at.UnixMilli()); !seen[l] {
+					seen[l] = true
+					out = append(out, l)
+				}
+			}
+		}
 	case strings.Contains(q, "SELECT count() AS n FROM cycles"):
 		start, _ := strconv.ParseUint(p["start"], 10, 64)
 		n := 0
@@ -753,6 +771,42 @@ func TestStaleBatchRefused(t *testing.T) {
 	}
 	if code, _ := post(t, ts.URL, "", ndjson(mk("lab", 1, pathA...), mk("lab", 2, pathA...))); code != http.StatusConflict {
 		t.Errorf("stale batch: %d", code)
+	}
+}
+
+// A batch far below the agent's mark that the server holds cycle for
+// cycle (seq and ts) is one it stored before, delivered again: answered as
+// duplicates, not refused (review, round eight). Since then an agent's
+// seqs jump at every open of its spool (they go on from the clock), so the
+// backlog of a spool that went back to an earlier state, or a retry cut
+// shorter, can lie that far below. A batch with a seq the server holds as
+// another cycle (another ts), or does not hold, is still refused.
+func TestStaleRedeliveryIsDuplicates(t *testing.T) {
+	st := newFakeStore()
+	_, ts := newTestServerAt(t, st, t0.Add((staleWindow+50)*5*time.Second))
+	old := func() []*record.Record { return []*record.Record{mk("lab", 10, pathA...), mk("lab", 11, pathA...)} }
+	if code, res := post(t, ts.URL, "", ndjson(old()...)); code != 200 || res.Accepted != 2 {
+		t.Fatalf("first: %d %+v", code, res)
+	}
+	if code, res := post(t, ts.URL, "", ndjson(mk("lab", staleWindow+50, pathA...))); code != 200 || res.Accepted != 1 {
+		t.Fatalf("after the jump: %d %+v", code, res)
+	}
+	if code, res := post(t, ts.URL, "", ndjson(old()...)); code != 200 || res.Duplicates != 2 {
+		t.Errorf("delivered again: %d %+v, want 200 and 2 duplicates", code, res)
+	}
+	other := old()
+	other[1].TS = other[1].TS.Add(time.Second) // another cycle at a seq the server holds
+	for name, recs := range map[string][]*record.Record{
+		"another cycle": other,
+		"one not held":  {mk("lab", 10, pathA...), mk("lab", 12, pathA...)},
+		"none held":     {mk("lab", 12, pathA...)},
+	} {
+		if code, _ := post(t, ts.URL, "", ndjson(recs...)); code != http.StatusConflict {
+			t.Errorf("%s: %d, want 409", name, code)
+		}
+	}
+	if n := len(st.table("cycles")); n != 3 {
+		t.Errorf("%d cycles stored, want 3", n)
 	}
 }
 
