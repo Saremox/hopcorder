@@ -5071,7 +5071,9 @@ requests within the limits. Two HIGH findings were found next to them.
   read only), `/ping` included. With `httpGet /ping` probes, kubelet would
   then have taken ClickHouse out of its Service and restarted it every
   minute, dropping the server's pooled connections as well, for as long
-  as the attack lasted.
+  as the attack lasted. (Round eleven: startup and liveness now only
+  connect, and no password is on the command line; see "The bundled
+  ClickHouse's startup and liveness probes only connect".)
   - Measured with the CI values' render at 1Gi under the round-ten
     slowloris (300 connections): from outside the container `/ping` and
     authenticated queries were reset; the exec probe answered every time.
@@ -5146,3 +5148,44 @@ found next to them.
     `TestLostOpenRowThenSkippedRestoreIsRecorded` (a failed restore and a
     used-up budget: `[]` before, `[56 to 63: 7 cycles]` after); #85's
     `TestLostCloseRowIsRepairedAtTheNextBatch` still passes.
+- **The bundled ClickHouse's startup and liveness probes only connect**
+  (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000'`; readiness keeps
+  `SELECT 1`, in the chart's StatefulSet; review round eleven, H2, HIGH under
+  round ten's H1 condition, a CNI that does not enforce the chart's
+  NetworkPolicy). HTTP and native connections are served from one pool of
+  `max_connections` threads. A client that holds the HTTP connections and
+  retries every 10 ms takes back every thread that frees: the native
+  listener keeps one thread once it has served a connection, so a lone
+  #86 probe passed, but two at once (readiness and liveness tick together)
+  lost one about 30% of the time each, and after a restart during the
+  attack the native listener had no thread and every probe was refused.
+  Six liveness failures in a row (hours at 30%) or any restart (a drain, an
+  OOM kill) then left ClickHouse failing its startup probe for good, out of
+  its Service, while the attack went on: round ten's H1 end state.
+  - The kernel completes a TCP handshake whatever the pool's state (5 of 5
+    in that state, while `SELECT 1` failed 5 of 5), so startup and liveness
+    pass and nothing restarts ClickHouse; readiness has the kept native
+    thread to itself in steady state, and after a restart under the attack
+    fails until the attack ends, without a restart. Trade-off: liveness
+    no longer catches a ClickHouse that accepts connections and hangs.
+- **No password on the probe's command line** (`clickhouse-client` takes
+  `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` from the container's
+  environment; review round eleven, M1 and M2, both from #86). With
+  `--password "$CLICKHOUSE_PASSWORD"` the server user's password, which has
+  access to every database, was in the argv of a process every 5 s: 40 of
+  40 probes were caught in `/proc/*/cmdline`, readable by any process on
+  the node and recorded by exec auditing, before the client masks it. And a
+  password beginning with `-` (1 in 64 base64url secrets, through
+  `clickhouse.passwordSecret`) was taken for an option: every probe failed,
+  and the error, with the password in it, went to the pod's Events.
+  - Measured on 25.8 in a chart-config container (password `-dash-pw`)
+    under the reviewer's `slowfill` (300 connections, retrying every
+    10 ms): the two probes started together passed 20 of 20 each; after a
+    restart during the attack the connect check passed at every 5 s for
+    80 s while `SELECT 1` was reset, and `SELECT 1` answered as `hopcorder`
+    once the attack stopped. The argv form fails with that password; the
+    connect check fails on a closed port.
+  - Checks: the helm job requires the startup and liveness probes to be the
+    connect check, readiness to be the env-only `SELECT 1`, no `httpGet` and
+    no `--password` in the ClickHouse StatefulSet (failed on the old chart);
+    the kind smoke test's `helm install --wait` needs them to pass.

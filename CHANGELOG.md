@@ -271,6 +271,14 @@ The section for a version is the text of its GitHub release.
   real start again. Since #85 its stream was rebuilt from storage, which
   never had the row: a catch-up batch recorded the outage with a later
   start, and a skipped restore not at all.
+- Server chart: the bundled ClickHouse's startup and liveness probes only
+  connect to its native port; readiness still queries. A client holding
+  ClickHouse's connections could make the querying probes fail, and after
+  any restart during the attack ClickHouse never became ready again.
+- Server chart: the ClickHouse probe takes the password from its
+  environment instead of its command line, where any process on the node
+  could read it; a password beginning with `-` no longer makes every probe
+  fail.
 
 **Fixed (review round ten)**
 
