@@ -485,6 +485,19 @@ func TestPathTracker(t *testing.T) {
 		}},
 		// A path that grew by a silent hop is no change until that hop
 		// answers, as with a router replaced while silent.
+		// The destination down, the router before it answering its TTL with
+		// a host unreachable (ARP failed): losing reachability is no route
+		// change, nor is getting it back (review, round seven).
+		{"outage answered with an unreachable", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "u1:10.0.0.3")), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "u1:10.0.0.3")), false},
+			{base(), false},
+		}},
+		{"router before the destination changed, answering with an unreachable", []step{
+			{base(), false},
+			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.9.9.9", "u1:10.9.9.9")), true},
+		}},
 		{"path grew by a silent hop", []step{
 			{base(), false},
 			{rec(dst, hops("x:10.0.0.1", "x:10.0.0.2", "x:10.0.0.3", "*", "r:"+dst)), false},

@@ -699,7 +699,8 @@ added in the commit that introduced it.
   wildcards, and reports a change when a TTL answers from a different
   address, a reached destination is at a different distance, or the target
   address changed (since round six: further away only behind a TTL that
-  answered, see there). Gaining or losing reachability alone is not a path
+  answered; since round seven: an unreachable hop is not compared; see
+  there). Gaining or losing reachability alone is not a path
   change.
   `hopcorder_path_changes_total` uses it; **M2's path-change table must use
   the same algorithm** per `(agent_id, target, protocol, flow_id)` stream
@@ -3840,3 +3841,21 @@ decisions:
   `grafana` job requires the files to grow by less than 1 MB for a
   failing query with a 4 MB message (16 MB before); the helm job checks
   the rendered levels.
+- **An unreachable hop is no evidence of the route.** The tracker compared
+  an ICMP unreachable at TTL k with the address last seen at TTL k, like a
+  time exceeded, and stored its sender there. When the destination went
+  down and the router before it answered its TTL with an unreachable (ARP
+  failed on the destination's LAN, a REJECT rule, a withdrawn route), the
+  outage counted as a route change at TTL d (destination → router), and
+  its end as another: two in `hopcorder_path_changes_total`, the server's
+  `path_changes`, the UI and Grafana, on an unchanged route (review, round
+  seven: the real binary with r2 rejecting for 10 s, +2 for each of icmp,
+  udp and tcp; a black hole or no route gave 0). Now
+  (`record.routerHop`) unreachable hops are left out of the comparison
+  and of the addresses kept, as the loop rule leaves them out: their
+  sender is the router before the TTL, or one with no route. The time
+  exceeded hops before them still catch a real change (the router before
+  the destination replaced: a change, tested).
+  - Tests: `TestPathTracker` ("outage answered with an unreachable":
+    none, there or back; it failed before; "router before the destination
+    changed, answering with an unreachable": a change).

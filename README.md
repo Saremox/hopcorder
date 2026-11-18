@@ -389,7 +389,8 @@ Derived per cycle:
   don't count route changes by comparing hashes. hopcorder decides route
   changes (for `hopcorder_path_changes_total`) by remembering the last
   address at each TTL and treating silent hops as wildcards: a change is a
-  TTL answering from a different address, a reached destination closer
+  TTL answering from a different address (an ICMP unreachable does not
+  count: its sender is the router before the TTL), a reached destination closer
   than before or further away behind a TTL that answered, or a different
   target address. A destination further away behind TTLs that are all
   silent is no change: that is what a lost reply from the destination

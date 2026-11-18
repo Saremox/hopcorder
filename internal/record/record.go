@@ -497,7 +497,7 @@ func (p *PathTracker) ObserveChange(rec *Record) (PathChange, bool) {
 		p.started, p.target, p.ips, p.dist = true, rec.TargetIP, nil, 0
 	}
 	for _, h := range rec.Hops {
-		if h.Status.Responded() && h.IP.IsValid() && h.TTL >= 1 {
+		if routerHop(h) {
 			for len(p.ips) < h.TTL {
 				p.ips = append(p.ips, netip.Addr{})
 			}
@@ -518,7 +518,7 @@ func (p *PathTracker) differs(rec *Record) (PathChange, bool) {
 	}
 	var ch PathChange
 	for _, h := range rec.Hops {
-		if !h.Status.Responded() || h.TTL < 1 || h.TTL > len(p.ips) {
+		if !routerHop(h) || h.TTL > len(p.ips) {
 			continue
 		}
 		if known := p.ips[h.TTL-1]; known.IsValid() && known != h.IP {
@@ -535,6 +535,18 @@ func (p *PathTracker) differs(rec *Record) (PathChange, bool) {
 		return PathChange{Reason: ReasonDistance, PrevDistance: p.dist, Distance: rec.PathLen}, true
 	}
 	return PathChange{}, false
+}
+
+// routerHop reports whether h tells which address answers at its TTL, for
+// the router comparison: a time exceeded or the destination's reply. An
+// unreachable is left out, as the loop rule leaves it out: it comes from
+// the router before the one the TTL would reach when that one cannot be
+// reached, or from a router with no route, so its sender is not the
+// address at that TTL. Compared, an outage that a router answered with an
+// unreachable (an ARP failure on the destination's LAN, a REJECT rule)
+// counted as two route changes, there and back (review, round seven).
+func routerHop(h Hop) bool {
+	return h.Status.Responded() && h.Status != StatusUnreachable && h.IP.IsValid() && h.TTL >= 1
 }
 
 // grew reports whether rec, reached further away than p.dist, shows that
