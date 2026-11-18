@@ -349,28 +349,34 @@ spec:
             - name: http
               containerPort: 8123
               protocol: TCP
-          # The probes query over the native port on loopback, not HTTP: a
-          # client that holds all of ClickHouse's 256 HTTP connections open
-          # (one header byte at a time; ClickHouse has no deadline for a
-          # whole request header) shut 8123 for as long as it went on, and
-          # /ping probes would then have taken ClickHouse out of its Service
-          # and restarted it over and over, dropping the server's connections
-          # too (review round ten). clickhouse-client takes about 50 ms and
-          # 21 MB of its own memory.
+          # The probes use the native port on loopback, not HTTP: a client
+          # that holds ClickHouse's 256 connections open (one header byte at
+          # a time; ClickHouse has no deadline for a request header) shut
+          # 8123 for as long as it went on, and /ping probes would have
+          # taken ClickHouse out of its Service and restarted it over and
+          # over (review round ten). HTTP and native connections share those
+          # 256, so under such a client even a native query can be refused:
+          # startup and liveness only connect (a restart does not help, and
+          # would leave ClickHouse unable to start while the client went on;
+          # review round eleven), readiness runs SELECT 1. clickhouse-client
+          # takes the credentials from CLICKHOUSE_USER and CLICKHOUSE_PASSWORD
+          # in its environment: on its command line the password was visible
+          # to the node's users, and one starting with "-" was taken for an
+          # option.
           startupProbe:
             exec:
-              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
+              command: [bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9000']
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             exec:
-              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
+              command: [clickhouse-client, --host, 127.0.0.1, --query, 'SELECT 1']
             periodSeconds: 5
             timeoutSeconds: 5
           livenessProbe:
             exec:
-              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
+              command: [bash, -c, 'exec 3<>/dev/tcp/127.0.0.1/9000']
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
