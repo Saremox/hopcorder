@@ -582,6 +582,12 @@ jobs:
             ServerErrorHandler HedgedConnectionsFactory; do
             grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
           done
+          # The logger named after the function that logs a stack trace for
+          # every answer a client closed early on (unauthenticated: a flood).
+          cancel='<logger><name>bool DB::WriteBufferFromHTTPServerResponse::cancelWithException(HTTPServerRequest &amp;, int, const std::string &amp;, WriteBuffer *)</name><level>fatal</level></logger>'
+          grep -qF "$cancel" <<<"$ch" || { echo "hopcorder.xml: cancelWithException logs stack traces"; exit 1; }
+          grep -qF "$cancel" deploy/compose/clickhouse-config.xml ||
+            { echo "compose clickhouse-config.xml: cancelWithException logs stack traces"; exit 1; }
           # All temporary data together is capped (wait_end_of_query), by
           # default at a tenth of the volume: 1Gi here, 20Gi by default.
           grep -qF '<max_temporary_data_on_disk_size>107374182</max_temporary_data_on_disk_size>' <<<"$ch" ||

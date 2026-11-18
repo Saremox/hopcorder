@@ -267,6 +267,9 @@ The section for a version is the text of its GitHub release.
 
 **Fixed (review round nine)**
 
+- ClickHouse (compose and the chart's bundled ClickHouse) no longer logs a
+  stack trace for each answer a client closed early on: unauthenticated
+  requests that did so wrote megabytes a second to the chart's console.
 - ClickHouse (compose and the chart's bundled ClickHouse) no longer logs
   the user name of a login a query makes it attempt to itself
   (`hasColumnInTable('0.0.0.0:9000', ...)`): up to 1 MB per query of

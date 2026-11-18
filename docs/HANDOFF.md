@@ -5005,3 +5005,19 @@ two HIGH findings were found next to them.
     job requires no line of theirs with a 100 KB name in compose's log
     files; `smoke.sh` bounds the console's growth for a 1 MB name (not run
     here: no kind).
+- **No stack trace for an answer a client closed early on** (the logger
+  named `bool DB::WriteBufferFromHTTPServerResponse::cancelWithException(
+  HTTPServerRequest &, int, const std::string &, WriteBuffer *)` at
+  `fatal` in compose and the chart, `&amp;` in the XML; review round nine,
+  M2). A client that sends wrong credentials (`X-ClickHouse-User: nobody`,
+  `X-ClickHouse-Key: wrong`) and closes after the first bytes of the 403
+  made ClickHouse log "Failed to send exception to the response write
+  buffer ... Connection reset by peer" with a stack trace, about 1.3 KB a
+  request at Error, unauthenticated: 69 MB in 10 s from one client of 8
+  threads here, CPU-bound, into the node's container log (bounded by
+  kubelet's rotation, reachable where 8123 is: round nine's H2).
+  - Measured with the chart's rendered config: 4 threads for 5 s wrote
+    1,178,258 bytes to the console before, 0 after.
+  - Check: the helm job requires the logger at `fatal` in the rendered
+    config and in compose's file (static: reproducing it needs a client
+    that closes at the right moment, which would make a flaky CI step).
