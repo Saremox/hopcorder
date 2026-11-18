@@ -4853,7 +4853,9 @@ two HIGH findings were found next to them.
   - Accepted: a client that holds 256 connections still blocks other
     clients, authenticated queries included, while it holds them (about 30
     to 50 s here), the same class as the server's own reading slots. An
-    enforcing NetworkPolicy remains the real boundary.
+    enforcing NetworkPolicy remains the real boundary. (Round ten: "while it
+    holds them" is for as long as it goes on, one header byte every 20 s;
+    the chart's probes no longer use HTTP, see there.)
   - Checks: CI's `grafana` job requires the settings and a 400 for 40
     header fields before authentication (failed with the old config: 401);
     the helm job requires them in the rendered config and the mount;
@@ -5056,3 +5058,32 @@ requests within the limits. Two HIGH findings were found next to them.
     (the outages insert fails all three times in the batch that closes an
     outage; at the next batch, and after a second outage and a restart,
     storage holds it closed), which failed before at both points.
+- **The bundled ClickHouse's probes query over the native port on loopback**
+  (`exec` of `clickhouse-client --host 127.0.0.1 ... SELECT 1`, a 5 s
+  timeout, in the chart's StatefulSet; review round ten, H1, HIGH under the
+  same condition as F1 and round nine's H2: a CNI that does not enforce
+  the chart's NetworkPolicy). A client that holds all 256 HTTP connections
+  open within #81's limits, one header byte every 20 s, kept every new
+  HTTP connection out for the whole 360 s run (ClickHouse 25.8 has no
+  deadline for a whole request header; `http_receive_timeout` bounds each
+  read only), `/ping` included. With `httpGet /ping` probes, kubelet would
+  then have taken ClickHouse out of its Service and restarted it every
+  minute, dropping the server's pooled connections as well, for as long
+  as the attack lasted.
+  - Measured with the CI values' render at 1Gi under the round-ten
+    slowloris (300 connections): from outside the container `/ping` and
+    authenticated queries were reset; the exec probe answered every time.
+    `clickhouse-client` takes about 50 ms and 21 MB of anonymous memory
+    (its 119 MB of binary pages are shared with the server's).
+  - Still open, and not fixable in hopcorder (ClickHouse has no header
+    deadline): such a client keeps new HTTP clients out while it goes on,
+    the server's new connections included; the server keeps working on the
+    connections it holds. README now says to run the bundled ClickHouse
+    only with a CNI that enforces NetworkPolicy, which admits only the
+    server (and `networkPolicy.from`) to 8123. Compose is low: only the
+    stack's containers and the host reach it, and nothing restarts.
+  - Checks: the helm job requires the three probes to be the loopback exec
+    check and no `httpGet` in the ClickHouse StatefulSet (failed on the old
+    chart); the kind smoke test's `helm install --wait` needs them to pass
+    (not run here: no kind; the command was run in a chart-config
+    container).

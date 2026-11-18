@@ -345,22 +345,30 @@ spec:
             - name: http
               containerPort: 8123
               protocol: TCP
+          # The probes query over the native port on loopback, not HTTP: a
+          # client that holds all of ClickHouse's 256 HTTP connections open
+          # (one header byte at a time; ClickHouse has no deadline for a
+          # whole request header) shut 8123 for as long as it went on, and
+          # /ping probes would then have taken ClickHouse out of its Service
+          # and restarted it over and over, dropping the server's connections
+          # too (review round ten). clickhouse-client takes about 50 ms and
+          # 21 MB of its own memory.
           startupProbe:
-            httpGet:
-              path: /ping
-              port: http
+            exec:
+              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
-            httpGet:
-              path: /ping
-              port: http
+            exec:
+              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
             periodSeconds: 5
+            timeoutSeconds: 5
           livenessProbe:
-            httpGet:
-              path: /ping
-              port: http
+            exec:
+              command: [sh, -c, 'exec clickhouse-client --host 127.0.0.1 --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "SELECT 1"']
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 6
           resources:
             {{- toYaml $d.resources | nindent 12 }}

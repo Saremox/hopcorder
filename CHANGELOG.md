@@ -267,6 +267,12 @@ The section for a version is the text of its GitHub release.
 
 **Fixed (review round ten)**
 
+- Server chart: the bundled ClickHouse's probes query over its native port
+  on loopback instead of HTTP `/ping`. A client that held ClickHouse's HTTP
+  connections open would have made the probes fail and Kubernetes restart
+  ClickHouse over and over. The chart now says plainly that it needs a CNI
+  that enforces NetworkPolicy.
+
 - Server: an outage whose close could not be stored (ClickHouse went away
   right after the cycles that ended it were stored) no longer stays
   ongoing until the server restarts, or for good. The stream is restored

@@ -599,6 +599,12 @@ jobs:
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=2Gi
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=5000000000
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.persistence.size=lots
+          # Its probes query over the native port on loopback, not HTTP: a
+          # client holding the HTTP connections open would fail /ping probes
+          # and get ClickHouse restarted over and over.
+          sts=$(awk '/^kind: StatefulSet/,/^---/' <<<"$ch")
+          [ "$(grep -c "clickhouse-client --host 127.0.0.1 --user" <<<"$sts")" = 3 ] && ! grep -q 'httpGet' <<<"$sts" ||
+            { echo "the ClickHouse StatefulSet's probes are not the loopback native check"; exit 1; }
           # Connections and what an HTTP request may hold before ClickHouse
           # authenticates it are bounded (limits.xml, mounted in users.d).
           grep -qF '<max_connections>256</max_connections>' <<<"$ch" || { echo "hopcorder.xml: max_connections unbounded"; exit 1; }
