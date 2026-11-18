@@ -3881,3 +3881,21 @@ decisions:
   - Tests: `TestDefaultFlowIDIsNoEphemeralPort` (1024 to 29999; failed
     with 33434) and `TestDefaultFlowIDsAgree` (the probe package's and the
     config's); the tests that assert the default use the constant.
+- **Grafana's compose user may grant nothing (`GRANTEES NONE`).** In
+  ClickHouse 25.8, `GRANT CURRENT GRANTS ON *.* TO <grantee> WITH REPLACE
+  OPTION` ran as the read-only user, `readonly = 1` and the missing grant
+  option notwithstanding: `WITH REPLACE OPTION` first revokes everything
+  the grantee has, and with `CURRENT GRANTS` neither is checked. It took
+  every privilege from the grantee, the user itself, any other SQL user
+  (the server's `hopcorder`) or role, rewriting its `access/` file, for
+  good: the init script runs only on an empty volume (review, round seven,
+  final sweep; reproduced: afterwards Grafana's `SELECT` was refused). One
+  anonymous viewer broke every dashboard, or stopped ingest. The user is
+  now created with `GRANTEES NONE`: the statement is refused ("not
+  allowed as grantee") for every grantee, and SELECT and every dashboard
+  query still work. The chart's users are in XML (`users.d`), which
+  refuses it (`ACCESS_STORAGE_READONLY`). A ClickHouse bug worth
+  reporting upstream.
+  - Check: CI's `grafana` job runs the statement as Grafana's user for
+    itself and for the server's user, requires the refusal, and that
+    Grafana can still read.
