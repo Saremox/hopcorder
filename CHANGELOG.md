@@ -199,6 +199,13 @@ The section for a version is the text of its GitHub release.
   read-only user, from the `DNSResolver` and `Cluster` loggers, which are
   now set to `fatal`. Its unused MySQL, PostgreSQL and interserver
   listeners are removed.
+- ClickHouse (compose and the chart's bundled ClickHouse) caps its
+  temporary data at 2 GB for all queries together
+  (`clickhouse.deploy.maxTemporaryDataOnDisk` in the chart). With
+  `wait_end_of_query=1` in the URL, which no setting refuses, an HTTP client
+  with the password of Grafana's read-only user made ClickHouse buffer a
+  result on the data volume until it was full, and the server's inserts
+  failed meanwhile.
 
 **Security: server ingest**
 

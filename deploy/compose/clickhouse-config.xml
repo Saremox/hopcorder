@@ -54,6 +54,13 @@ policy (the image gives it an engine), is off; hopcorder does not trace.
     <mysql_port remove="1"/>
     <postgresql_port remove="1"/>
     <interserver_http_port remove="1"/>
+    <!-- All temporary data together, from every user: a query's spill (the
+         server's own; Grafana's user may not spill) and a result buffered
+         for wait_end_of_query, a URL parameter, not a setting, which a
+         direct HTTP client with Grafana's password could send to fill the
+         data volume (review round seven). 2 GB: the server's read queries
+         need far less (results of at most 64 MiB, 8 at a time). -->
+    <max_temporary_data_on_disk_size>2000000000</max_temporary_data_on_disk_size>
     <user_files_path>/srv/</user_files_path>
     <format_schema_path>/srv/</format_schema_path>
     <!-- remote() and the like resolve their host before the grant check;

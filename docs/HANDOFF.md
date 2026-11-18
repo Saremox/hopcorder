@@ -4157,3 +4157,36 @@ decisions:
     (both failed before); the helm job checks the rendered levels and
     the removed ports; `deploy/helm/ci/smoke.sh` requires the console to
     grow by less than 100 KB for a 1 MB name (not run here: no kind).
+- **All temporary data on ClickHouse's volume is capped**
+  (`max_temporary_data_on_disk_size`, a server setting: 2 GB in compose,
+  `clickhouse.deploy.maxTemporaryDataOnDisk` in the chart, 2000000000 by
+  default, about a tenth of the 20Gi volume; the chart refuses less than 1
+  or a value that is not a byte count). `wait_end_of_query=1`, a URL
+  parameter and not a setting, so `readonly` does not refuse it, makes
+  ClickHouse keep a whole result in a temporary file under `tmp/` on the
+  data volume until the query ends. A direct HTTP client with Grafana's
+  password (the Grafana plugin cannot send it) filled a 600 MiB volume in
+  seconds with `SELECT hex(sipHash128(number)) AS a, a, a FROM
+  numbers(100000000) FORMAT RowBinary`, and held smaller files as long as
+  it read slowly; the server's inserts failed meanwhile (final sweep of
+  review round seven, M2). The profile settings
+  `max_temporary_data_on_disk_size_for_user`/`_for_query` do not bound it,
+  nor does a floored `tmp_policy` (round seven's sweep); the server-level
+  cap does. Measured on 25.8: the request fails with
+  `TOO_MANY_ROWS_OR_BYTES` ("Limit for temporary files size exceeded")
+  after 2 GB, in about 4 s, and the file is removed.
+  - The cap is shared by every user. The server's read queries ask for
+    `wait_end_of_query` too, with results of at most twice
+    `max_response_bytes` (64 MiB by default), and the file is compressed:
+    a 100 MB JSONEachRow result of such a query passed under a 100 MB cap.
+    So 2 GB leaves room for the chart's two and compose's eight at a time.
+    Inserts and merges use no temporary data.
+  - Accepted: a client with Grafana's password can still take the whole
+    cap while its query lasts, and the server's reads that need temporary
+    data fail meanwhile (ingest does not). That is ClickHouse's
+    availability, which Grafana's users are trusted with (README).
+  - Checks: CI's `grafana` job sends that request as compose's `grafana`
+    user and requires the limit's error (before: ENOSPC on a 2.8 GB tmpfs,
+    or about 5 GB written on the runner); the helm job checks the rendered
+    setting and refuses 0 and `2Gi`; `smoke.sh` checks the setting in the
+    running pod (not run here: no kind).
