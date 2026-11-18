@@ -379,3 +379,52 @@ func TestWriteSettings(t *testing.T) {
 		t.Errorf("requests %v", got)
 	}
 }
+
+// Once ClickHouse has sent a progress header (the user's profile may set
+// send_progress_in_http_headers), its status is 200, and an exception after
+// that goes into the body, with X-ClickHouse-Exception-Code among the
+// headers (review, round six). Every request turns progress headers off,
+// and an answer with an exception code is an error whatever its status.
+func TestExceptionWithStatus200IsAnError(t *testing.T) {
+	var got []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		got = append(got, r.URL.Query())
+		w.Header().Set("X-ClickHouse-Exception-Code", "395")
+		if r.URL.Query().Get("default_format") == "JSONEachRow" {
+			_, _ = io.WriteString(w, `{"exception": "Code: 395. DB::Exception: the query fails"}`+"\n")
+			return
+		}
+		_, _ = io.WriteString(w, "Code: 395. DB::Exception: the view fails: while pushing to view d.mv\n")
+	}))
+	defer srv.Close()
+	c, err := New(Config{URL: srv.URL, Database: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	rows := 0
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"insert", func() error { return c.InsertJSON(ctx, "t", [][]byte{[]byte(`{}`)}) }},
+		{"statement", func() error { return c.Exec(ctx, "INSERT INTO hops SELECT 1", nil) }},
+		{"server statement", func() error { return c.ExecServer(ctx, "CREATE DATABASE d") }},
+		{"query", func() error {
+			return c.Query(ctx, "SELECT 1", nil, func(json.RawMessage) error { rows++; return nil })
+		}},
+	} {
+		err := tc.run()
+		var ce *Error
+		if !errors.As(err, &ce) || ce.Code != "395" || !strings.Contains(ce.Text, "DB::Exception") {
+			t.Errorf("%s: %v, want the exception", tc.name, err)
+		}
+		if q := got[len(got)-1]; q.Get("send_progress_in_http_headers") != "0" {
+			t.Errorf("%s: send_progress_in_http_headers %q, want 0", tc.name, q.Get("send_progress_in_http_headers"))
+		}
+	}
+	if rows != 0 {
+		t.Errorf("the exception was passed on as %d rows", rows)
+	}
+}

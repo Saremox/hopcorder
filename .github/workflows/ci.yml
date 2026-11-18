@@ -103,8 +103,9 @@ jobs:
           grep -q -- '--- PASS: TestFullTmpfs ' spool.out
 
   clickhouse:
-    # Server tests against a real ClickHouse: migrations, every query, and
-    # the agent -> server -> ClickHouse path.
+    # Server tests against a real ClickHouse: migrations, every query, the
+    # client's answers to a user with progress headers, and the agent ->
+    # server -> ClickHouse path.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -130,7 +131,7 @@ jobs:
       - name: test against ClickHouse
         env:
           HOPCORDER_CLICKHOUSE_URL: http://127.0.0.1:8123
-        run: go test -tags clickhouse -race -count=1 ./internal/server/... ./cmd/hopcorder/...
+        run: go test -tags clickhouse -race -count=1 ./internal/clickhouse/... ./internal/server/... ./cmd/hopcorder/...
 
   grafana:
     # The docker-compose try-out stack built from this commit, with the real

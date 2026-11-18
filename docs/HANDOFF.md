@@ -4291,3 +4291,51 @@ decisions:
     of a `helm template` render to be refused by `kubectl apply
     --dry-run=server` as immutable (not run here: no cluster in the
     development container).
+- **The server's ClickHouse requests ask for no progress headers, and an
+  exception code is an error whatever the status** (`do`,
+  `internal/clickhouse/client.go`). With `send_progress_in_http_headers =
+  1` in the server user's profile (some operators set it to keep long HTTP
+  queries alive through a load balancer), ClickHouse sends a progress
+  header once a request has run for `http_headers_progress_interval_ms`
+  (100 ms), and with it the status 200; an exception after that goes into
+  the body, with `X-ClickHouse-Exception-Code` among the headers. The
+  client looked only at the status. An insert whose body took more than
+  100 ms to send (a part of about 1 MB over a real link), or a fill that
+  read that long, failed and looked stored: the ingester moved its mark
+  past cycles whose hop and loop rows a failing view had not written, the
+  agent's retry was answered "duplicates", and the rows were lost for
+  good, with nothing logged or counted. A failing query could come back
+  as a row `{"exception": …}` (review, round six; reproduced on 25.8: an
+  insert of 1.2 MB sent at 2 MB/s with a failing view got 200 and
+  exception code 395, the same insert with the setting at 0 in the URL got
+  500). A request that fails fast still got 500, which is all the tests
+  saw. Now:
+  - Every request sets `send_progress_in_http_headers=0`, after the
+    caller's settings: inserts, statements (the ingester's fills, settle,
+    the migrations) and queries (the ingester's lookups and the read API's
+    streamed results). `Ping` sends no query. ClickHouse then sends the
+    status with the first byte of the body: for a statement or an insert
+    at its end, for a query (`wait_end_of_query`) at the end of the query,
+    so a failure is a 500 again.
+  - Any answer with `X-ClickHouse-Exception-Code` is an error, whatever
+    its status; the 200 above carries it.
+  - A profile that makes the setting constant at 1 refuses the client's 0
+    (`SETTING_CONSTRAINT_VIOLATION`, code 452): every request fails,
+    loudly, so the migrations at start fail and the server stays unready
+    (agents keep spooling) and logs why. Constant at 0, the request is
+    allowed (checked).
+  - Tests: `TestExceptionWithStatus200IsAnError` (default run, httptest: a
+    200 with an exception code is an error for an insert, a statement, a
+    statement without a database and a query, whose exception row is not
+    passed on, and every request sends the setting); with the `clickhouse`
+    tag, now run by CI's `clickhouse` job for `internal/clickhouse` too,
+    `TestProgressHeadersHideNoFailure`: a user whose profile sets
+    `send_progress_in_http_headers = 1` and an interval of 0 (the header
+    at once, for every request, where the default interval needs a slow
+    link or a long statement). A failing CHECK, a failing view, a failing
+    `INSERT … SELECT` in and outside the database, and a failing query are
+    errors, and a good insert still writes its view's rows. Before, each
+    failure returned nil, and the query passed its exception on as a row.
+    `TestProgressHeadersConstant`: constant at 1, every request fails with
+    452; at 0, every one works. Without the header check the default-run
+    test fails; without the setting, it and the constant test do.

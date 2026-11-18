@@ -225,6 +225,16 @@ The section for a version is the text of its GitHub release.
   those tools, set `clickhouse.passwordSecret` and
   `clickhouse.deploy.readOnlyUser.passwordSecret`; `helm install` and
   `helm upgrade` work as before.
+- Server: a failed write to ClickHouse no longer looks successful when the
+  server's ClickHouse user has `send_progress_in_http_headers = 1` in its
+  profile. ClickHouse then answers 200 once a request has run for 100 ms
+  and puts a later exception into the body, so an insert of about 1 MB over
+  a network link, whose hop rows a view failed to write, was taken as
+  stored: the agent's retry was answered "duplicates", and those hop and
+  loop rows were lost for good, with no error. Every request now turns
+  progress headers off, and any answer with an exception code is an error.
+  A profile that makes the setting constant at 1 makes every request fail
+  instead, visibly: the server stays unready and says why.
 
 **Security: server ingest**
 
