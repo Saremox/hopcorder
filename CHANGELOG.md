@@ -265,6 +265,17 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round eight)**
+
+- Server: an outage that had ended is no longer taken up again by a stream
+  whose state the server restores. The lookup for the stream's open outage
+  returned its last outage whether it had ended or not, so a stream back
+  after more than 30 days without cycles (an agent off for a month, a
+  target re-added), or one whose restores had failed for a while after a
+  restart, continued that old outage: the read API, the UI and Grafana
+  showed it ongoing since its old start or ending at the new cycle, with a
+  wrong cycle count, and the new outage was not recorded.
+
 **Security: server ingest**
 
 - One agent can no longer crowd the others out of the stream state. An agent

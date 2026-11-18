@@ -944,13 +944,29 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 				break
 			}
 		}
+		// The newest outage that started in that stretch, open or closed.
+		// (Not "end_ts IS NULL" with "NULL AS end_ts" selected, as before:
+		// ClickHouse reads a SELECT alias in WHERE, so that filter was always
+		// true and a closed outage came back as open; review, round eight.)
 		open, err := clickhouseQuery[outageRow](ctx, in.store, `SELECT agent_id, target, protocol, flow_id, start_seq,
-			toString(start_ts) AS start_ts, end_seq, NULL AS end_ts, cycles, last_hop_ttl, last_hop_ip, version
-			FROM outages FINAL WHERE `+where+` AND end_ts IS NULL AND start_seq < {before:UInt64}
+			toString(start_ts) AS start_ts, end_seq, end_ts, cycles, last_hop_ttl, last_hop_ip, version
+			FROM outages FINAL WHERE `+where+` AND start_seq < {before:UInt64}
 			AND start_seq > {after:UInt64} ORDER BY start_seq DESC LIMIT 1`,
 			withParam(params, "after", strconv.FormatUint(after, 10)))
 		if err != nil {
 			return fmt.Errorf("find open outage: %w", err)
+		}
+		// It goes on if it is open, or if it closed at or after first: then
+		// first's part is derived again (after a crash before the mark), and
+		// closes it there again, with the same row. One that closed before
+		// first is over; resumed, its next rows (with higher versions) would
+		// replace its close row.
+		if len(open) == 1 {
+			if open[0].EndTS != nil && open[0].EndSeq < first.Seq {
+				open = nil
+			} else {
+				open[0].EndTS, open[0].EndSeq = nil, 0
+			}
 		}
 		switch {
 		case len(open) == 1:

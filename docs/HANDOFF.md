@@ -4430,7 +4430,10 @@ decisions:
     retried, one that committed after its timeout, a part derived again
     after a crash (the same rows, the same versions). A restore reads the
     newest open row and recounts its cycles from `cycles`, as before; the
-    next part's row carries the count.
+    next part's row carries the count. (That held only for a restore that
+    resumes the outage still open: until review round eight, a restore
+    could resume one that had closed, and its new rows then replaced its
+    close row; see "A restore resumes only an outage still open".)
   - Chosen over counting at read time: one row per down stream per part
     (a `cycles` row per cycle is written anyway), and the read API, the UI
     and Grafana's panel read the table as they did. A count at read time
@@ -4531,3 +4534,51 @@ decisions:
     IPv6 cycle seeded with code 3 at their third hop: "port unreachable"
     and "address unreachable"), which failed before with "unreachable
     (port unreachable)" for the IPv6 one.
+
+### Security and correctness review, round eight
+
+Four reviewers again (agent, ingest, read/UI/Grafana, deploy), on main with
+the ten round-seven mediums fixed (#66 to #75).
+
+- **A restore resumes only an outage still open** (`restore`,
+  `internal/server/ingest.go`; review round eight, ingest H1, HIGH; the
+  code dates from M2). When a stream was down at its last replayed cycle,
+  the restore looked up its open outage with `SELECT ... NULL AS end_ts ...
+  WHERE ... end_ts IS NULL`. ClickHouse reads a SELECT alias in WHERE, so
+  that filter was always true: the newest outage that started after the
+  last replayed cycle that reached came back as open even when it had
+  closed. The stream went on with it, and its next rows (an open row after
+  the part, since the open row is rewritten per part, then a close row)
+  had higher versions than its close row, so `FINAL` showed a finished
+  outage as ongoing since its old start, with a wrong count, or ending at
+  the new cycle; the new outage was never recorded. Triggers:
+  - normal operation: a stream with an outage behind it comes back after
+    more than `max_record_age` (30 days) with no cycles (an agent switched
+    off for a month, a target re-added). Its state was dropped as idle, so
+    its next cycle restores it with nothing to replay, and the lookup, then
+    unbounded, found the outage of a month ago. Reproduced with the real
+    binary: an outage of 10 cycles that had ended became 30 cycles ending
+    30 days later; unreached, it became ongoing with 40 cycles (open row
+    version 90 over close row 61), and Grafana's Outages panel showed a
+    2,583,626 s ongoing outage.
+  - a plausible fault: after a restart, restores fail or run out of their
+    budget (ClickHouse slow) for more than `replayDepth` cycles while a new
+    outage starts; when a restore works again it resumed the previous,
+    closed outage instead of opening the new one at the first trailing
+    unreached cycle replayed (`[51 to 151: 100 cycles]` instead of `[51 to
+    61: 10] [111 to 151: 40]`).
+  - Fix: the lookup reads the real `end_ts` and `end_seq` and filters on
+    the start only; the outage found goes on if it is open, or if it closed
+    at or after the first cycle being derived (that part is derived again
+    after a crash before its mark, and closes it there again with the same
+    row); one that closed before is over. Not the one-line fix (select the
+    real `end_ts` and keep `end_ts IS NULL`): it breaks re-derivation after
+    a crash, which converged only because of this bug, into two
+    overlapping outages (`[51 to 96: 45] [61 to 96: 35]`).
+  - Tests (`clickhouse` tag, `restore_outage_clickhouse_test.go`; the fake
+    store models the intended filter, so only ClickHouse shows it):
+    `TestRestoreAfterAMonthKeepsTheOldOutageClosed` (reached and unreached
+    comebacks) and `TestRestoreAfterFailedRestoresOpensTheNewOutage` failed
+    before with the outages above; `TestRederivedPartClosesItsOutageOnce`
+    (an outage of 20 and of 45 cycles closed in a part derived again)
+    passes before and after and fails with the one-line fix.
