@@ -48,9 +48,15 @@ func lastOf(r *record.Record) lastCycle {
 type events struct {
 	changes []pathChangeRow
 	outages []outageRow
+	opened  int // outages opened (for the metric: open rows are written after the part, see derive)
 }
 
-// observe feeds rec to the stream and returns the events it produces.
+// observe feeds rec to the stream and returns the events it produces. An
+// outage that opens or goes on is left in s.outage, and its open row is
+// written after the part (derive), with the cycles it has then. Its version
+// is the seq of its last cycle so far, the close row's the seq of the cycle
+// that reached again: higher than every open row's, so FINAL reads the
+// close row whatever order the inserts land in.
 func (s *stream) observe(rec *record.Record, ev *events) {
 	prev := s.last
 	if ch, changed := s.tracker.ObserveChange(rec); changed && prev.ok {
@@ -72,9 +78,10 @@ func (s *stream) observe(rec *record.Record, ev *events) {
 	case !rec.Reached && s.outage == nil:
 		o := newOutage(rec, 1)
 		s.outage = &o
-		ev.outages = append(ev.outages, o)
+		ev.opened++
 	case !rec.Reached:
 		s.outage.Cycles++
+		s.outage.Version = rec.Seq
 	case s.outage != nil:
 		o := *s.outage
 		o.EndSeq, o.EndTS, o.Version = rec.Seq, tsPtr(rec.TS), rec.Seq

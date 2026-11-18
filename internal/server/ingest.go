@@ -778,11 +778,15 @@ func (in *Ingester) reportDerive(a *agentState, id string, st *deriveStats) {
 // from storage, which then holds them: it never starts from scratch while
 // ClickHouse has its history. Every record comes here once: in seq order,
 // right after its part is stored (or found stored), when the mark moves
-// past it.
+// past it. A stream that is down after a cycle of recs has its open outage's
+// row written after them, once, with its cycles so far (review round seven:
+// it was written once, at open, and showed 1 cycle until it closed).
 func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Record, now time.Time, rb *restoreBudget,
 	st *deriveStats) events {
 	var ev events
 	tried := map[*stream]bool{}
+	down := map[*stream]bool{}
+	var open []*stream // the streams in down, in order
 	for _, r := range recs {
 		s := in.stream(a, keyOf(r))
 		if s == nil {
@@ -804,6 +808,15 @@ func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Re
 			continue
 		}
 		s.observe(r, &ev)
+		if s.outage != nil && !down[s] {
+			down[s] = true
+			open = append(open, s)
+		}
+	}
+	for _, s := range open {
+		if s.outage != nil { // still down at the end of recs
+			ev.outages = append(ev.outages, *s.outage)
+		}
 	}
 	return ev
 }
@@ -958,14 +971,16 @@ func (in *Ingester) restore(ctx context.Context, deadline time.Time, s *stream, 
 			// Down, but no open outage stored: its start was in cycles that
 			// derived no events (a batch whose restore did not happen in
 			// time, or whose events could not be stored). It starts at the
-			// first of the trailing unreached cycles replayed.
+			// first of the trailing unreached cycles replayed; its row is
+			// written after the part, as any open outage's (derive).
 			i := len(recs)
 			for i > 0 && !recs[i-1].Reached {
 				i--
 			}
 			o := newOutage(recs[i], len(recs)-i)
+			o.Version = recs[len(recs)-1].Seq
 			restored.outage = &o
-			ev.outages = append(ev.outages, o)
+			ev.opened++
 		}
 	}
 	s.tracker, s.last, s.outage, s.loaded = restored.tracker, restored.last, restored.outage, true
@@ -1039,10 +1054,11 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 		}
 		insert(table, rows)
 	}
+	for range ev.opened {
+		in.metrics.outage("open")
+	}
 	for _, o := range ev.outages {
-		if o.EndTS == nil {
-			in.metrics.outage("open")
-		} else {
+		if o.EndTS != nil {
 			in.metrics.outage("close")
 		}
 	}

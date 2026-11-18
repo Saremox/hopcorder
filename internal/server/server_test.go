@@ -323,17 +323,68 @@ func TestEvents(t *testing.T) {
 		t.Errorf("path change %v", c)
 	}
 	out := st.table("outages")
-	if len(out) != 2 {
+	if len(out) != 4 {
 		t.Fatalf("outage rows %v", out)
 	}
-	open, closed := out[0], out[1]
-	if num(open["start_seq"]) != 5 || open["end_ts"] != nil || num(open["cycles"]) != 1 ||
-		open["last_hop_ip"] != "198.18.120.7" || num(open["last_hop_ttl"]) != 2 {
-		t.Errorf("open row %v", open)
+	// The open row is written after each batch the outage opened or went on
+	// in, with its cycles so far and the seq of its last cycle as version.
+	for i, open := range out[:3] {
+		if num(open["start_seq"]) != 5 || open["end_ts"] != nil || num(open["cycles"]) != uint64(i+1) ||
+			num(open["version"]) != uint64(5+i) || open["last_hop_ip"] != "198.18.120.7" || num(open["last_hop_ttl"]) != 2 {
+			t.Errorf("open row %d: %v", i, open)
+		}
 	}
+	closed := out[3]
 	if num(closed["start_seq"]) != 5 || num(closed["end_seq"]) != 8 || closed["end_ts"] == nil ||
-		num(closed["cycles"]) != 3 || num(closed["version"]) <= num(open["version"]) {
+		num(closed["cycles"]) != 3 || num(closed["version"]) <= num(out[2]["version"]) {
 		t.Errorf("close row %v", closed)
+	}
+}
+
+// An ongoing outage reports the cycles it has so far (review round seven:
+// the open row was written once, with 1 cycle, and the count stayed in
+// memory until the outage closed, so the read API, the UI and Grafana said
+// "1 cycles" for as long as it lasted). The review's scenario: 50 cycles
+// that reach the destination, then 100 that do not, in batches, with a
+// restart in between. Every open row's version stays below the close
+// row's, so FINAL reads the close row whatever order the rows were
+// inserted in (a retried or late insert).
+func TestOpenOutageCountsItsCycles(t *testing.T) {
+	st := newFakeStore()
+	reg := prometheus.NewRegistry()
+	in := NewIngester(st, nil, quietLogger(), newServerMetrics(reg))
+	ingest := func(from, to uint64, spec []string) {
+		t.Helper()
+		var recs []*record.Record
+		for seq := from; seq <= to; seq++ {
+			recs = append(recs, mk("lab", seq, spec...))
+		}
+		if _, err := in.Ingest(t.Context(), recs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ingest(1, 50, pathA)
+	for from := uint64(51); from <= 150; from += 10 {
+		if from == 121 {
+			in = NewIngester(st, nil, quietLogger(), nil) // a restart: the open outage is restored
+		}
+		ingest(from, from+9, brokenA)
+		want := fmt.Sprintf("end 0, %d cycles", from+9-50)
+		if got := outagesOf(st.table("outages")); len(got) != 1 || got[51] != want {
+			t.Fatalf("after seq %d: outages %v, want one from 51: %s", from+9, got, want)
+		}
+	}
+	if n := counter(t, reg, "hopcorder_server_outages_total"); n != 1 {
+		t.Errorf("%v outages opened, want 1 (rewriting the open row opens none)", n)
+	}
+	ingest(151, 151, pathA)
+	rows := st.table("outages")
+	if got := outagesOf(rows); len(got) != 1 || got[51] != "end 151, 100 cycles" {
+		t.Errorf("outages %v, want one from 51 to 151 over 100 cycles", got)
+	}
+	slices.Reverse(rows)
+	if got := outagesOf(rows); len(got) != 1 || got[51] != "end 151, 100 cycles" {
+		t.Errorf("with the rows inserted in reverse: outages %v, want the close row", got)
 	}
 }
 
@@ -418,7 +469,8 @@ func TestRestoreAfterRestart(t *testing.T) {
 	}
 	out := st.table("outages")
 	last := out[len(out)-1]
-	if len(out) != 2 || num(last["start_seq"]) != 3 || num(last["end_seq"]) != 5 || num(last["cycles"]) != 2 {
+	if len(out) != 3 || num(out[1]["cycles"]) != 2 || out[1]["end_ts"] != nil ||
+		num(last["start_seq"]) != 3 || num(last["end_seq"]) != 5 || num(last["cycles"]) != 2 {
 		t.Errorf("outage not resumed across restart: %v", out)
 	}
 	// The restored tracker still knows TTL 2, so a new router there is a change.
