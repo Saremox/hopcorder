@@ -3811,3 +3811,18 @@ decisions:
     and no `opentelemetry_span_log`; the helm job checks the rendered XML
     (17 logs, the span log removed). Before, the compose check listed the
     seven tables off the disk.
+- **ClickHouse's own log files do not repeat a query's exception.** Five
+  of its loggers write a failing query's whole exception message
+  (`executeQuery`, `DynamicQueryHandler`, `HTTPHandler`, `TCPHandler`,
+  and `BackupsWorker` a BACKUP's destination): compose's image logs at
+  `trace` to files of up to 1000M × 10 each in the container, on the
+  host's disk and outside the floor, and kept them across restarts; one
+  failing query of Grafana's user wrote about five copies, 300 MB
+  (review, round seven; reproduced: 3 queries of 16 MB messages, 183
+  MiB). The chart logs to the console, which the node's log rotation
+  only catches up with every 10 s. Both now set those loggers to
+  `fatal`; `query_log` keeps the exception. Compose's files are capped at
+  10M × 2 as well. Measured: the same 3 queries, 0 bytes. Check: CI's
+  `grafana` job requires the files to grow by less than 1 MB for a
+  failing query with a 4 MB message (16 MB before); the helm job checks
+  the rendered levels.
