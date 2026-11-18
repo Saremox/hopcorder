@@ -617,7 +617,8 @@ func TestCorruptFileIsQuarantined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Garbage over everything after the two meta pages and the freelist.
+	// Garbage over everything after the two meta pages and page 2 (the
+	// freelist bbolt starts a file with).
 	for i := 3 * 4096; i < len(b); i++ {
 		b[i] = byte(i*31 + 7)
 	}

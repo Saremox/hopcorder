@@ -4,17 +4,21 @@ package spool
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -356,6 +360,134 @@ func spoolFills(t *testing.T, dir string) {
 	}
 	appendNoise(t, s, 1000, 1300)
 	checkNewestKept(t, s, "http", 0)
+}
+
+// After a backlog is delivered, a commit writes the pages it changes and
+// no more (review, round five). The spool wrote bbolt's freelist, the id of
+// every free page, on every commit: after a delivered backlog that was most
+// of the file, so every append and acknowledgement wrote 8 bytes for every
+// 4 KiB of the file, for good: 109 KiB an append here, 1.4 MiB with the
+// chart's 768 MiB. Now bbolt keeps the freelist in memory and finds it
+// again at open.
+func TestCommitsAfterBacklogWriteLittle(t *testing.T) {
+	dir := t.TempDir()
+	const maxBytes = 64 << 20
+	first, next := buildBacklog(t, filepath.Join(dir, fileName), maxBytes*9/10)
+	built := fileSize(t, dir)
+	opts := Options{Dir: dir, MaxAge: 30 * 24 * time.Hour, MaxBytes: maxBytes, Consumers: []string{"http"}}
+	s, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if st := s.Stats(); st.Records != int64(next-first) {
+		t.Fatalf("backlog of %d records, %+v", next-first, st)
+	}
+	for c := first + 499; c < next+499; c += 500 { // delivered as the HTTP output does
+		if err := s.Ack("http", min(c, next-1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	perAppend := func(when string) {
+		t.Helper()
+		w := writtenBytes(t)
+		appendNoise(t, s, 100, 480)
+		n := (writtenBytes(t) - w) / 100
+		t.Logf("%s: %d bytes written an append, file %d bytes", when, n, fileSize(t, dir))
+		if n > 32<<10 {
+			t.Errorf("%s: %d bytes written an append, want at most 32 KiB", when, n)
+		}
+	}
+	perAppend("backlog delivered")
+	if err := s.Close(); err != nil { // the freelist found again
+		t.Fatal(err)
+	}
+	if s, err = Open(opts); err != nil {
+		t.Fatal(err)
+	}
+	perAppend("after a restart")
+	appendNoise(t, s, 5000, 480) // into the free pages
+	if size := fileSize(t, dir); size > built {
+		t.Errorf("file grew from %d to %d bytes", built, size)
+	}
+	checkNewestKept(t, s, "http", 0)
+}
+
+// buildBacklog writes, in a few large transactions, a spool file at path
+// of about size bytes whose records (noise of 480 bytes, as stored records
+// of real cycles are about) consumer "http" has none of: an outage. It
+// returns the first seq and the next.
+func buildBacklog(t *testing.T, path string, size int64) (first, next uint64) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, boltOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+	defer enc.Close()
+	first = clockSeq(time.Now())
+	next = first
+	var stored int64
+	ts := binary.BigEndian.AppendUint64(nil, uint64(time.Now().UnixNano())) //nolint:gosec // now
+	for fileSize(t, filepath.Dir(path)) < size {
+		if err := db.Update(func(tx *bolt.Tx) error {
+			recs, err := tx.CreateBucketIfNotExists(bucketRecords)
+			if err != nil {
+				return err
+			}
+			recs.FillPercent = 0.95
+			for range 10000 {
+				val := enc.EncodeAll(noise(int(next%100000), 480), slices.Clone(ts)) //nolint:gosec // small
+				if err := recs.Put(seqKey(next), val); err != nil {
+					return err
+				}
+				stored += int64(len(val))
+				next++
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		meta, err := tx.CreateBucketIfNotExists(bucketMeta)
+		if err != nil {
+			return err
+		}
+		curs, err := tx.CreateBucketIfNotExists(bucketCursors)
+		if err != nil {
+			return err
+		}
+		return errors.Join(putU64(meta, keyNextSeq, next), putU64(meta, keyBytes, uint64(stored)), //nolint:gosec // positive
+			putU64(meta, keyCount, next-first), putU64(curs, []byte("http"), first-1))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return first, next
+}
+
+// writtenBytes is what this process has written so far (wchar: write
+// calls, not what reached the disk).
+func writtenBytes(t *testing.T) int64 {
+	t.Helper()
+	b, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for l := range strings.Lines(string(b)) {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(l), "wchar: "); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+	}
+	t.Fatal("no wchar in /proc/self/io")
+	return 0
 }
 
 // punchHole deallocates the blocks of the file at path from off to end.

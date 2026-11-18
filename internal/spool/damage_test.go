@@ -42,6 +42,17 @@ func (v pageView) elem(id uint64, i int) []byte {
 	return v.page(id)[pageHeaderSize+i*elementSize:]
 }
 
+// key returns element i's key on page id, within v.b.
+func (v pageView) key(id uint64, i int) []byte {
+	e := v.elem(id, i)
+	pos, ksize := ne.Uint32(e[4:]), ne.Uint32(e[8:])
+	if v.flags(id) == flagBranch {
+		pos, ksize = ne.Uint32(e[0:]), ne.Uint32(e[4:])
+	}
+	off := int(id)*v.ps + pageHeaderSize + i*elementSize + int(pos)
+	return v.b[off : off+int(ksize)]
+}
+
 // leafValue returns the offset in v.b of element i's value on leaf page id.
 func (v pageView) leafValue(id uint64, i int) int {
 	e := v.elem(id, i)
@@ -83,17 +94,45 @@ func (v pageView) bucketRoot(t *testing.T, name string) uint64 {
 	return 0
 }
 
-// freePages returns the pages on the freelist.
+// freePages returns the free pages: those on the freelist or, in a file
+// without one (as the spool writes them), those the tree does not reach.
 func (v pageView) freePages() map[uint64]bool {
-	fl := v.meta().freelist
-	p := v.page(fl)
-	n, off := uint64(ne.Uint16(p[10:])), pageHeaderSize
-	if n == 0xffff {
-		n, off = ne.Uint64(p[16:]), off+8
-	}
+	m := v.meta()
 	free := map[uint64]bool{}
-	for i := range n {
-		free[ne.Uint64(p[off+int(i)*8:])] = true
+	if m.freelist != noFreelist {
+		p := v.page(m.freelist)
+		n, off := uint64(ne.Uint16(p[10:])), pageHeaderSize
+		if n == 0xffff {
+			n, off = ne.Uint64(p[16:]), off+8
+		}
+		for i := range n {
+			free[ne.Uint64(p[off+int(i)*8:])] = true
+		}
+		return free
+	}
+	reached := map[uint64]bool{}
+	var walk func(id uint64, top bool)
+	walk = func(id uint64, top bool) {
+		for p := id; p <= id+uint64(ne.Uint32(v.page(id)[12:])); p++ {
+			reached[p] = true
+		}
+		for i := range v.count(id) {
+			e := v.elem(id, i)
+			switch {
+			case v.flags(id) == flagBranch:
+				walk(ne.Uint64(e[8:]), top)
+			case top && ne.Uint32(e[0:])&flagBucket != 0:
+				if r := ne.Uint64(v.b[v.leafValue(id, i):]); r != 0 {
+					walk(r, false)
+				}
+			}
+		}
+	}
+	walk(m.root, true)
+	for p := uint64(2); p < m.hwm; p++ {
+		if !reached[p] {
+			free[p] = true
+		}
 	}
 	return free
 }
@@ -101,7 +140,7 @@ func (v pageView) freePages() map[uint64]bool {
 // buildSpool writes a spool with consumers a and b the way the review's
 // corruption campaign did (records added, some delivered and deleted, more
 // added: branch pages, overflow-free leaves, free pages) and returns its
-// bytes.
+// bytes. It has no freelist (see boltOptions); withFreelist gives one.
 func buildSpool(t *testing.T) pageView {
 	t.Helper()
 	dir := t.TempDir()
@@ -121,16 +160,46 @@ func buildSpool(t *testing.T) pageView {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The file as bbolt alone grew it (the least power of two from 32 KiB
-	// that holds the high water mark and one page more), without the space
-	// the spool allocates ahead since round six: the corpus damages the
-	// bytes it did before.
+	return bboltGrown(b)
+}
+
+// bboltGrown returns the file b as bbolt alone grew it (the least power of
+// two from 32 KiB that holds the high water mark and one page more),
+// without the space the spool allocates ahead since round six: the corpus
+// damages the bytes it did before.
+func bboltGrown(b []byte) pageView {
 	v := view(b)
 	n := 32 << 10
 	for n < int(v.meta().hwm+1)*v.ps {
 		n *= 2
 	}
 	return view(b[:n])
+}
+
+// withFreelist returns base with a freelist, as bbolt's default options
+// write it (and the spool did until round seven), committed once more.
+func withFreelist(t *testing.T, base pageView) pageView {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), fileName)
+	if err := os.WriteFile(path, base.b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := bolt.Open(path, 0o600, nil) // commits a freelist as it opens
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := bboltGrown(b)
+	if v.meta().freelist == noFreelist {
+		t.Fatal("bbolt wrote no freelist")
+	}
+	return v
 }
 
 // view returns b's pages, with the page size its first meta page states.
@@ -282,18 +351,29 @@ func TestDamagedChild(t *testing.T) {
 }
 
 // Directed damage the round-two checks missed, each of which crashed, hung
-// or panicked the agent, on every start or on the first acknowledgement.
+// or panicked the agent, on every start or on the first acknowledgement,
+// and keys out of order, which bbolt's open of a file without a freelist
+// panics on. Each on the file as the spool writes it, without a freelist,
+// and with one.
 func TestDirectedDamageIsQuarantined(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns processes")
 	}
 	base := buildSpool(t)
+	t.Run("nofreelist", func(t *testing.T) { directedDamage(t, base) })
+	t.Run("freelist", func(t *testing.T) { directedDamage(t, withFreelist(t, base)) })
+}
+
+// directedDamage runs TestDirectedDamageIsQuarantined's cases on base.
+func directedDamage(t *testing.T, base pageView) {
 	records := base.bucketRoot(t, string(bucketRecords))
 	if base.flags(records) != flagBranch || base.count(records) < 3 {
 		t.Fatalf("records bucket root %d: flags %#x, %d elements; want a branch", records, base.flags(records), base.count(records))
 	}
 	firstLeaf := ne.Uint64(base.elem(records, 0)[8:])
-	free := base.freePages()
+	free, synced := base.freePages(), base.meta().freelist != noFreelist
+	// Without a freelist this damage is none: the file is kept, and works.
+	harmless := map[string]bool{"overflow over a free page": !synced}
 	cases := []struct {
 		name   string
 		damage func(v pageView) bool
@@ -314,6 +394,9 @@ func TestDirectedDamageIsQuarantined(t *testing.T) {
 			return true
 		}},
 		{"overflow count of the freelist", func(v pageView) bool {
+			if v.meta().freelist == noFreelist {
+				return false
+			}
 			binary.NativeEndian.PutUint32(v.page(v.meta().freelist)[12:], 0x7fffffff)
 			return true
 		}},
@@ -330,7 +413,7 @@ func TestDirectedDamageIsQuarantined(t *testing.T) {
 		}},
 		// Passed tx.Check (it checks only a span's first page against the
 		// freelist); freeing the leaf later panicked with "page already
-		// freed".
+		// freed". Without a freelist the page is the leaf's now.
 		{"overflow over a free page", func(v pageView) bool {
 			for i := range v.count(records) {
 				leaf := ne.Uint64(v.elem(records, i)[8:])
@@ -340,6 +423,25 @@ func TestDirectedDamageIsQuarantined(t *testing.T) {
 				}
 			}
 			return false
+		}},
+		// Keys out of order (review, round five): bbolt opens a file without
+		// a freelist with a walk for its free pages that panics on them, in
+		// a goroutine of bbolt's own or in the caller's, with that goroutine
+		// still running.
+		{"leaf keys out of order", func(v pageView) bool {
+			k0, k1 := v.key(firstLeaf, 0), v.key(firstLeaf, 1)
+			t0 := append([]byte(nil), k0...)
+			copy(k0, k1)
+			copy(k1, t0)
+			return true
+		}},
+		{"branch key not above the one before", func(v pageView) bool {
+			copy(v.key(records, 1), v.key(records, 0))
+			return true
+		}},
+		{"branch key above its child's keys", func(v pageView) bool {
+			copy(v.key(records, 1), v.key(records, 2))
+			return true
 		}},
 	}
 	for _, c := range cases {
@@ -352,8 +454,15 @@ func TestDirectedDamageIsQuarantined(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%v\n%s", err, out)
 			}
-			if !moved {
-				t.Errorf("damaged file kept\n%s", out)
+			if moved == harmless[c.name] {
+				t.Errorf("damaged file moved aside: %v, want %v\n%s", moved, !moved, out)
+			}
+			// Found by the checks, not by bbolt's walk for the free pages:
+			// that panics, and crashes the agent now and then (a goroutine
+			// of bbolt's own goes on after the panic, on the closed
+			// transaction).
+			if strings.Contains(out, "freepages") {
+				t.Errorf("bbolt's open found the damage\n%s", out)
 			}
 		})
 	}
@@ -375,7 +484,7 @@ func craftedMeta(t *testing.T, branch func(v pageView, root, child uint64)) []by
 		if err := os.WriteFile(filepath.Join(dir, fileName), base.b, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, nil)
+		db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, boltOptions())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -500,7 +609,7 @@ func rleBomb(n int) []byte {
 // replaceRecord stores val as the record seq of the closed spool in dir.
 func replaceRecord(t *testing.T, dir string, seq uint64, val []byte) {
 	t.Helper()
-	db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, nil)
+	db, err := bolt.Open(filepath.Join(dir, fileName), 0o600, boltOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,9 +682,12 @@ func TestDamageInUseIsQuarantined(t *testing.T) {
 // tx.Check on every start, and one panicked on its first acknowledgement.
 // Every case must now be kept or quarantined, and the spool work. The
 // sample is cases 0..63 and six that made tx.Check grow without bound
-// before (overflow fields; on a host with 4 KiB pages the spool built here
-// has the same layout every time). HOPCORDER_SPOOL_CORPUS=3000 runs cases
-// 0..2999 instead.
+// before (overflow fields, in the layout the spool wrote then; on a host
+// with 4 KiB pages the spool built here has the same layout every time).
+// HOPCORDER_SPOOL_CORPUS=3000 runs cases 0..2999 instead. Each runs on the
+// file as the spool writes it, without a freelist (since round seven: bbolt
+// walks the tree for the free pages as it opens it), and with one, as
+// bbolt's default options write it.
 func TestRandomDamageCorpus(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns processes")
@@ -592,6 +704,12 @@ func TestRandomDamageCorpus(t *testing.T) {
 		}
 	}
 	base := buildSpool(t)
+	t.Run("nofreelist", func(t *testing.T) { damageCorpus(t, base, sample) })
+	t.Run("freelist", func(t *testing.T) { damageCorpus(t, withFreelist(t, base), sample) })
+}
+
+// damageCorpus runs the corpus's cases in sample on base.
+func damageCorpus(t *testing.T, base pageView, sample []int) {
 	var (
 		mu       sync.Mutex
 		failures []string
@@ -605,6 +723,9 @@ func TestRandomDamageCorpus(t *testing.T) {
 				b, kind := corrupt(base, i)
 				out, moved, err := runChild(t.Context(), t, b, "use")
 				mu.Lock()
+				if err == nil && strings.Contains(out, "freepages") {
+					err = errors.New("bbolt's open found the damage (see TestDirectedDamageIsQuarantined)")
+				}
 				switch {
 				case err != nil:
 					if len(out) > 400 {

@@ -184,6 +184,15 @@ The section for a version is the text of its GitHub release.
   dropped. There the spool now allocates its little space ahead by writing
   zeros, and checks the free space before its file grows, so a full disk
   drops the oldest records, counted, as with `fallocate`.
+- The agent's spool no longer rewrites the list of its free pages on every
+  write. Once a backlog had filled the spool file and been delivered, every
+  record appended and every delivery acknowledged wrote and synced that
+  list, 1.4 MiB each with the chart's 768MiB `max_bytes`, for as long as the
+  file existed: about 5 MiB/s of writes on a 10-target agent, wearing flash
+  and slowing probing. bbolt now keeps the list in memory and finds the
+  free pages again when the spool opens (which takes a little longer with a
+  large backlog), so a write costs about 17 KiB. Spool files written before
+  are read as they are.
 
 **Security: server ingest**
 
