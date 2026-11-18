@@ -493,15 +493,22 @@ func TestConcurrentAppends(t *testing.T) {
 
 // TestKill9 appends from a child process, SIGKILLs it at an arbitrary moment,
 // and checks that every append the child reported as done survived, intact,
-// and that seq continues after the highest committed one.
+// and that seq continues after the highest committed one. Mode "noalloc"
+// runs the child without fallocate: it writes zeros ahead of its pages.
 func TestKill9(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns processes")
 	}
+	for _, mode := range []string{"alloc", "noalloc"} {
+		t.Run(mode, func(t *testing.T) { kill9(t, mode) })
+	}
+}
+
+func kill9(t *testing.T, mode string) {
 	for round := range 5 {
 		dir := t.TempDir()
 		cmd := exec.Command(os.Args[0], "-test.run=^TestCrashChild$")
-		cmd.Env = append(os.Environ(), "HOPCORDER_SPOOL_CRASH_DIR="+dir)
+		cmd.Env = append(os.Environ(), "HOPCORDER_SPOOL_CRASH_DIR="+dir, "HOPCORDER_SPOOL_CRASH_MODE="+mode)
 		out, err := cmd.StdoutPipe()
 		if err != nil {
 			t.Fatal(err)
@@ -568,6 +575,9 @@ func TestCrashChild(t *testing.T) {
 	dir := os.Getenv("HOPCORDER_SPOOL_CRASH_DIR")
 	if dir == "" {
 		t.Skip("helper process for TestKill9")
+	}
+	if os.Getenv("HOPCORDER_SPOOL_CRASH_MODE") == "noalloc" {
+		allocate = func(string, int64, int64) error { return errors.ErrUnsupported }
 	}
 	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"reader", "acker"}})
 	if err != nil {
