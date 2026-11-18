@@ -176,6 +176,21 @@ jobs:
           dc exec -T clickhouse sh -c 'test -z "$(ls -A /srv)" && test ! -e /var/lib/clickhouse/user_files/probe.db &&
             test -z "$(ls -A /var/lib/clickhouse/format_schemas 2>/dev/null)"' ||
             { echo "a refused query left a file behind"; exit 1; }
+      - name: ClickHouse's logs leave room for the data
+        # One failing query of Grafana's user wrote its exception message,
+        # up to its memory limit, into query_log and text_log: the system
+        # logs are on a disk of their own (compose/clickhouse-config.xml)
+        # that keeps a quarter of the file system free, with a TTL.
+        run: |
+          q() { docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client \
+            --user hopcorder --password hopcorder --query "$1"; }
+          q "SYSTEM FLUSH LOGS"
+          test "$(q "SELECT keep_free_space * 4 >= total_space * 0.99 FROM system.disks WHERE name = 'system_logs'")" = 1 ||
+            { echo "no system_logs disk keeping a quarter free"; exit 1; }
+          bad=$(q "SELECT name FROM system.tables WHERE database = 'system' AND name IN ('query_log', 'text_log',
+            'query_thread_log', 'query_views_log', 'processors_profile_log', 'part_log', 'trace_log', 'metric_log')
+            AND (storage_policy != 'system_logs' OR engine_full NOT LIKE '%TTL%')")
+          test -z "$bad" || { echo "system logs off the system_logs disk or without a TTL: $bad"; exit 1; }
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -435,6 +450,11 @@ jobs:
           grep -qF '<allow_hyperscan>0</allow_hyperscan>' <<<"$ch" || { echo "readonly.xml: hyperscan is allowed"; exit 1; }
           grep -qF '<user_files_path>/srv/</user_files_path>' <<<"$ch" || { echo "hopcorder.xml: user_files_path is writable"; exit 1; }
           grep -qF '<format_schema_path>/srv/</format_schema_path>' <<<"$ch" || { echo "hopcorder.xml: format_schema_path is writable"; exit 1; }
+          # The system logs on a disk keeping a quarter of the volume free.
+          grep -qF '<keep_free_space_ratio>0.25</keep_free_space_ratio>' <<<"$ch" || { echo "hopcorder.xml: no system_logs disk"; exit 1; }
+          if [ "$(grep -c '<storage_policy>system_logs</storage_policy><ttl>' <<<"$ch")" != 11 ]; then
+            echo "hopcorder.xml: a system log off the system_logs disk"; exit 1
+          fi
           # ClickHouse may connect to nothing but DNS (hasColumnInTable()
           # connects out for the read-only user).
           np=$(awk '/^kind: NetworkPolicy/,/^---/' <<<"$ch")

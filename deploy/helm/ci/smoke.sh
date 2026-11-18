@@ -120,6 +120,17 @@ for i in $(seq 90); do
         echo "a schema query left a file behind"
         exit 1
       fi
+      # The system logs are on a disk of their own that keeps a quarter of
+      # the volume free: one failing query of the read-only user wrote its
+      # exception message, up to its memory limit, into them.
+      adm() { kubectl exec statefulset/hopcorder-server-clickhouse -- sh -c \
+        'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "$0"' "$1"; }
+      adm "SYSTEM FLUSH LOGS"
+      if [ "$(adm "SELECT keep_free_space * 4 >= total_space * 0.99 FROM system.disks WHERE name = 'system_logs'")" != 1 ] ||
+        [ "$(adm "SELECT storage_policy FROM system.tables WHERE database = 'system' AND name = 'query_log'")" != system_logs ]; then
+        echo "ClickHouse's system logs are not on the system_logs disk keeping a quarter free"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then

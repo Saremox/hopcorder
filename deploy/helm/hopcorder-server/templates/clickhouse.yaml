@@ -43,7 +43,14 @@ data:
   # a CapnProto or Protobuf output without a schema leaves its generated
   # schema file under format_schemas when generating it fails (review round
   # seven), so the read-only user, refused every time, left an empty file
-  # per query until the volume ran out of inodes.
+  # per query until the volume ran out of inodes. The system logs live on a
+  # disk of their own on the same volume that keeps a quarter of it free:
+  # one failing query of the read-only user wrote its exception message,
+  # up to its memory limit, into query_log and three times into text_log
+  # (about 100 MB), so a few hundred filled the volume before any TTL
+  # (review round seven). Now log writes stop, and are dropped, while less
+  # than 25% of the volume is free; inserts and merges of hopcorder's data
+  # may use the rest.
   hopcorder.xml: |
     <clickhouse>
         <user_files_path>/srv/</user_files_path>
@@ -58,8 +65,19 @@ data:
         <index_mark_cache_size>67108864</index_mark_cache_size>
         <uncompressed_cache_size>134217728</uncompressed_cache_size>
         <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+        <storage_configuration>
+            <disks>
+                <system_logs>
+                    <path>/var/lib/clickhouse/system_logs/</path>
+                    <keep_free_space_ratio>0.25</keep_free_space_ratio>
+                </system_logs>
+            </disks>
+            <policies>
+                <system_logs><volumes><main><disk>system_logs</disk></main></volumes></system_logs>
+            </policies>
+        </storage_configuration>
         {{- range list "query_log" "query_thread_log" "query_views_log" "query_metric_log" "part_log" "trace_log" "metric_log" "asynchronous_metric_log" "error_log" "text_log" "processors_profile_log" }}
-        <{{ . }}><ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl></{{ . }}>
+        <{{ . }}><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl></{{ . }}>
         {{- end }}
     </clickhouse>
   {{- if $d.readOnlyUser.enabled }}
