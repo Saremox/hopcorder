@@ -5021,3 +5021,38 @@ two HIGH findings were found next to them.
   - Check: the helm job requires the logger at `fatal` in the rendered
     config and in compose's file (static: reproducing it needs a client
     that closes at the right moment, which would make a flaky CI step).
+
+### Security and correctness review, round ten
+
+A focused round (the owner's choice) on round nine's two HIGH fixes (#81,
+#82) and the paths around them. Both held: #82 against a new oracle of 600
+runs with every restore query failing in turn and at random, budgets of 1
+and 2 restores, crashes, idle drops, seq jumps (#80) and `holdsAll`
+re-deliveries; #81 at 1Gi with 255 connections held at its maximum (peak
+875 MiB, no OOM), pre-authentication bodies drained rather than buffered,
+compressed bodies not decompressed, and the server's and Grafana's own
+requests within the limits. Two HIGH findings were found next to them.
+
+- **A stream whose outage row could not be stored is restored at its next
+  cycle** (`storeRecords` and `insertEvents`, `internal/server/ingest.go`;
+  review round ten, H2). When ClickHouse went away after a part's cycles
+  were stored, its outages insert failed (three attempts within the
+  batch's 10 s) and the rows were "lost (the cycles are stored)", as round
+  six accepted for events. But a lost close row is not only a missing
+  event: the stream's state had the outage closed and stayed loaded, so
+  nothing wrote the close row again, and the outage stayed "ongoing" in
+  the read API, the UI and Grafana until the stream was restored (a server
+  restart, an idle drop), and for good once the stream had had another
+  outage by then (#82's restore looks at the newest outage only).
+  Reproduced on 25.8 through the ingester: `[51 to ongoing: 10 cycles]`,
+  and after a restart `[51 to ongoing: 10] [91 to 96: 5]`.
+  - Now `insertEvents` returns the streams of the outage rows it could not
+    store, and `storeRecords` marks them not loaded: their next cycle
+    restores them, and #82's `restoreOutage` repairs storage (the open
+    outage closed at the first cycle that reached, with its count). A lost
+    open row needs nothing: open rows are rewritten after every part.
+    Path changes lost with their insert stay lost, as round six accepted.
+  - Test (`clickhouse` tag): `TestLostCloseRowIsRepairedAtTheNextBatch`
+    (the outages insert fails all three times in the batch that closes an
+    outage; at the next batch, and after a second outage and a restart,
+    storage holds it closed), which failed before at both points.

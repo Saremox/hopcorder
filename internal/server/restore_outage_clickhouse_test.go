@@ -33,11 +33,17 @@ import (
 type faultStore struct {
 	*clickhouse.Client
 	failMark, failReplay bool
+	// failOutages: how many outages inserts fail from now on.
+	failOutages int
 }
 
 func (f *faultStore) InsertJSON(ctx context.Context, table string, rows [][]byte) error {
 	if f.failMark && table == "agent_seq" {
 		return errors.New("crashed before the mark")
+	}
+	if table == "outages" && f.failOutages > 0 {
+		f.failOutages--
+		return errors.New("ClickHouse went away after the cycles insert")
 	}
 	return f.Client.InsertJSON(ctx, table, rows)
 }
@@ -379,5 +385,57 @@ func TestRestoreClosesAStaleOutageOnce(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// ClickHouse fails after a part's cycles were stored, and its outages insert
+// with them (all three attempts): the close row of an outage that ended in
+// the part is lost (review, round ten). The stream is restored at its next
+// cycle, and the restore closes the outage storage still holds open; kept
+// loaded, it stayed "ongoing" until the next restart, and for good once the
+// stream had another outage.
+func TestLostCloseRowIsRepairedAtTheNextBatch(t *testing.T) {
+	for _, second := range []bool{false, true} {
+		t.Run(fmt.Sprintf("second=%v", second), func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &faultStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			spec := func(seq uint64) []string {
+				if seq > 50 && seq <= 60 || second && seq > 90 && seq <= 95 {
+					return brokenA
+				}
+				return pathA
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 51; from += 10 { // down from 51
+				ingest(from, from+9)
+			}
+			st.failOutages = 3 // every attempt of the next batch's outages insert
+			ingest(61, 70)     // reached again at 61: its close row is lost
+			ingest(71, 80)
+			if got, want := storedOutages(t, c), "[[51 to 61: 10 cycles]]"; got != want {
+				t.Errorf("at the next batch: %s, want %s", got, want)
+			}
+			for from := uint64(81); from <= 101; from += 10 {
+				ingest(from, from+9)
+			}
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a restart
+			for from := uint64(111); from <= 131; from += 10 {
+				ingest(from, from+9)
+			}
+			want := "[[51 to 61: 10 cycles]]"
+			if second {
+				want = "[[51 to 61: 10 cycles] [91 to 96: 5 cycles]]"
+			}
+			if got := storedOutages(t, c); got != want {
+				t.Errorf("at the end: %s, want %s", got, want)
+			}
+		})
 	}
 }

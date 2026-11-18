@@ -556,7 +556,18 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 			a.unsure = true
 			return stored, err
 		}
-		in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st))
+		// A stream whose outage row could not be stored is restored again
+		// at its next cycle (review, round ten): its state has the outage
+		// as derived, storage as it was, and the restore repairs storage
+		// (an open outage closed by a cycle that reached, a missing one
+		// opened, a count brought up to date; see restoreOutage). Kept
+		// loaded, it would go on from its own state and the close (or open)
+		// row would stay lost for good.
+		for _, k := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
+			if s, ok := a.streams[k]; ok {
+				s.loaded = false
+			}
+		}
 		in.writeMark(wctx, id, last)
 		a.highWater, a.unsure = last, !sure
 		stored = end
@@ -1230,16 +1241,17 @@ func clickhouseQuery[T any](ctx context.Context, st Store, q string, p clickhous
 }
 
 // insertEvents stores events in inserts of at most partBytes of JSON each,
-// encoding an insert's rows only when it is due.
-func (in *Ingester) insertEvents(ctx context.Context, ev events) {
-	insert := func(table string, rows [][]byte) {
+// encoding an insert's rows only when it is due. It returns the streams of
+// the outage rows it could not store, which storeRecords restores again.
+func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamKey) {
+	insert := func(table string, rows [][]byte) bool {
 		if len(rows) == 0 {
-			return
+			return true
 		}
 		var err error
 		for attempt := range 3 {
 			if err = in.store.InsertJSON(ctx, table, rows); err == nil {
-				return
+				return true
 			}
 			in.metrics.insertError(table)
 			if ctx.Err() != nil {
@@ -1249,19 +1261,26 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 		}
 		in.log.Error("cannot store derived events; they are lost (the cycles are stored)", "table", table,
 			"events", len(rows), "err", err)
+		return false
 	}
-	write := func(table string, n int, row func(int) []byte) {
+	// write inserts n rows in parts and calls failed with the index range of
+	// every part that could not be stored.
+	write := func(table string, n int, row func(int) []byte, failed func(from, to int)) {
 		var rows [][]byte
-		size := 0
+		size, from := 0, 0
 		for i := range n {
 			b := row(i)
 			rows, size = append(rows, b), size+len(b)+1
 			if size >= in.partBytes {
-				insert(table, rows)
-				rows, size = nil, 0
+				if !insert(table, rows) {
+					failed(from, i+1)
+				}
+				rows, size, from = nil, 0, i+1
 			}
 		}
-		insert(table, rows)
+		if !insert(table, rows) {
+			failed(from, n)
+		}
 	}
 	for range ev.opened {
 		in.metrics.outage("open")
@@ -1272,6 +1291,13 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) {
 		}
 	}
 	in.metrics.pathChanges(len(ev.changes))
-	write("path_changes", len(ev.changes), func(i int) []byte { b, _ := json.Marshal(ev.changes[i]); return b })
-	write("outages", len(ev.outages), func(i int) []byte { b, _ := json.Marshal(ev.outages[i]); return b })
+	write("path_changes", len(ev.changes), func(i int) []byte { b, _ := json.Marshal(ev.changes[i]); return b },
+		func(int, int) {})
+	write("outages", len(ev.outages), func(i int) []byte { b, _ := json.Marshal(ev.outages[i]); return b },
+		func(from, to int) {
+			for _, o := range ev.outages[from:to] {
+				lost = append(lost, streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID})
+			}
+		})
+	return lost
 }
