@@ -3786,10 +3786,28 @@ decisions:
     free, ClickHouse keeps no more logs (query_log among them) until there
     is room. This also bounds round seven's medium of the read API's log
     growth (about 0.4 KB a request) and round four's accepted log rate.
-  - The other six logs on by default (asynchronous insert, backup, blob
-    storage, crash, Iceberg metadata, OpenTelemetry span) stay on the
-    default disk: only features the read-only user is refused, or cannot
-    switch on, write to them.
-  - Checks: CI's `grafana` job and `smoke.sh` require the `system_logs`
-    disk to keep a quarter free and the logs to be on it with a TTL; the
-    helm job checks the rendered XML.
+  - Every other log the image turns on is there too (asynchronous insert,
+    backup, blob storage, crash, Iceberg metadata and S3Queue logs: 17 in
+    all). The first fix left six on the default disk, taking them for
+    unreachable, and two were not: `readonly = 1` does not refuse
+    `BACKUP`, and a refused one still wrote its whole destination string
+    (up to `max_query_size`, about 0.5 MB with the stack trace) into
+    `backup_log`, twice; and a query carrying a W3C trace context
+    (`traceparent`, or the native protocol's OpenTelemetry field) wrote
+    its exception three times into `opentelemetry_span_log`. Both had no
+    TTL; the confirming sweep filled a 600 MiB volume to 100% with either
+    (review, round seven; reproduced: 20 refused BACKUPs, 40 rows, 7.7 MiB
+    on the default disk before, on `system_logs` now).
+    `opentelemetry_span_log` is switched off (`remove="1"`): the image
+    defines its engine, so it takes no storage policy, and hopcorder does
+    not trace.
+  - On compose the floor is a quarter of the host file system the volume
+    lives on: while that has less than a quarter free, ClickHouse keeps
+    no logs at all. That is meant, for a try-out on someone's machine.
+  - Checks: CI's `grafana` job and `smoke.sh` send a refused BACKUP (and,
+    in compose, a traced query), then require the `system_logs` disk to
+    keep a quarter free, every `system` table with a MergeTree engine to
+    be on it with a TTL (so a log a later ClickHouse turns on is caught),
+    and no `opentelemetry_span_log`; the helm job checks the rendered XML
+    (17 logs, the span log removed). Before, the compose check listed the
+    seven tables off the disk.

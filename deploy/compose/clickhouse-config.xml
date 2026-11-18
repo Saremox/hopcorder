@@ -19,7 +19,11 @@ failing query of Grafana's read-only user wrote its exception message, up
 to the user's memory limit, into query_log and three times into text_log
 (about 200 MB here), with no TTL, so a few dozen filled the disk (review
 round seven). Log writes now stop, and are dropped, while less than 25% of
-the file system is free; hopcorder's data may use the rest.
+the file system is free; hopcorder's data may use the rest. Every log the
+image turns on is there: a refused BACKUP still wrote its whole destination
+into backup_log (review round seven, again). opentelemetry_span_log, which
+kept a traced query's exception three times and cannot take a storage
+policy (the image gives it an engine), is off; hopcorder does not trace.
 -->
 <clickhouse>
     <user_files_path>/srv/</user_files_path>
@@ -46,4 +50,11 @@ the file system is free; hopcorder's data may use the rest.
     <error_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></error_log>
     <text_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></text_log>
     <processors_profile_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></processors_profile_log>
+    <backup_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></backup_log>
+    <asynchronous_insert_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></asynchronous_insert_log>
+    <blob_storage_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></blob_storage_log>
+    <crash_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></crash_log>
+    <iceberg_metadata_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></iceberg_metadata_log>
+    <s3queue_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></s3queue_log>
+    <opentelemetry_span_log remove="1"/>
 </clickhouse>
