@@ -102,6 +102,11 @@ data:
                      the name, about 1 MB per query (review round nine). -->
                 <logger><name>ServerErrorHandler</name><level>fatal</level></logger>
                 <logger><name>HedgedConnectionsFactory</name><level>fatal</level></logger>
+                <!-- A client that sends wrong credentials and closes before it reads
+                     the whole 403: ClickHouse logged a stack trace (about 1.3 KB) per
+                     request through a logger named after this function, about 7 MB/s
+                     of console log without credentials (review round nine). -->
+                <logger><name>bool DB::WriteBufferFromHTTPServerResponse::cancelWithException(HTTPServerRequest &amp;, int, const std::string &amp;, WriteBuffer *)</name><level>fatal</level></logger>
             </levels>
         </logger>
         <!-- No MySQL, PostgreSQL or interserver listener: the server uses
