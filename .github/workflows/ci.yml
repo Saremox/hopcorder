@@ -556,11 +556,17 @@ jobs:
           for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker DNSResolver Cluster; do
             grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
           done
-          # All temporary data together is capped (wait_end_of_query).
-          grep -qF '<max_temporary_data_on_disk_size>2000000000</max_temporary_data_on_disk_size>' <<<"$ch" ||
-            { echo "hopcorder.xml: temporary data is not capped"; exit 1; }
+          # All temporary data together is capped (wait_end_of_query), by
+          # default at a tenth of the volume: 1Gi here, 20Gi by default.
+          grep -qF '<max_temporary_data_on_disk_size>107374182</max_temporary_data_on_disk_size>' <<<"$ch" ||
+            { echo "hopcorder.xml: temporary data is not capped at a tenth of the 1Gi volume"; exit 1; }
+          helm template a deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --show-only templates/clickhouse.yaml |
+            grep -qF '<max_temporary_data_on_disk_size>2147483648</max_temporary_data_on_disk_size>' ||
+            { echo "hopcorder.xml: temporary data is not capped at a tenth of the default 20Gi volume"; exit 1; }
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=0
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=2Gi
+          refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=5000000000
+          refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.persistence.size=lots
           for l in mysql_port postgresql_port interserver_http_port tcp_port; do
             grep -qF "<$l remove=\"1\"/>" <<<"$ch" || { echo "hopcorder.xml: $l is open"; exit 1; }
           done

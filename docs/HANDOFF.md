@@ -4617,3 +4617,24 @@ the ten round-seven mediums fixed (#66 to #75).
     `tcp_port` removed, the loopback listener, and no `<host>` beyond
     loopback; `smoke.sh` checks the pod's listeners (not run here: no
     kind).
+- **The chart's temporary-data cap follows the volume** (`clickhouse.deploy.maxTemporaryDataOnDisk`;
+  review round eight, deploy M2). Round seven's cap was a fixed 2 GB
+  whatever `persistence.size`: on a volume under about 8 GiB that is more
+  than the quarter the system logs leave free, and the logs' floor does not
+  apply to `tmp/`. With the chart's own CI values (a 1Gi volume) a query as
+  the read-only user with `wait_end_of_query=1` filled the volume ("No
+  space left on device") and held it at 97% while the client read slowly.
+  Now the value is empty by default and the cap is a tenth of
+  `persistence.size` (2147483648 for 20Gi, 107374182 for 1Gi); a value set
+  must be a byte count from 1 to a fifth of the volume (0, which
+  ClickHouse reads as no limit, and `2Gi` are refused). `persistence.size`
+  is parsed like the memory limit (bytes, or a k, M, G, T, Ki, Mi, Gi or Ti
+  suffix, fractions allowed); anything else is refused. Compose keeps its
+  2 GB (the host's disk, of unknown size).
+  - Measured on 25.8 with the CI values' render on a 1 GiB volume: the same
+    request fails with "Limit for temporary files size exceeded (would
+    consume 107555868 / 107374182 bytes)" and the volume stays at 1%.
+  - Checks: the helm job requires the cap at a tenth of the CI values' 1Gi
+    and of the default 20Gi, and refuses 0, `2Gi`, a value above a fifth of
+    the volume and an unparsable `persistence.size` (failed on the old
+    chart); `smoke.sh` expects 107374182 in the running pod.
