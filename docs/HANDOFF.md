@@ -4627,7 +4627,10 @@ the ten round-seven mediums fixed (#66 to #75).
     way. `ServerErrorHandler` stays as it is: it reports real errors.
   - Measured on 25.8: a native login from outside the container is refused
     (before: answered, after reading the declared name); `127.0.0.2:9000`
-    is refused, and the self-connect writes 0 bytes to the console.
+    is refused, and the self-connect writes 0 bytes to the console. (Not
+    the self-connect through `0.0.0.0:9000`, which reaches the loopback
+    listener: round nine; see "A login ClickHouse makes to itself logs no
+    user name".)
   - Checks: CI's `grafana` job requires a native listener on
     `127.0.0.1:9000` and none beyond loopback (failed with the old config,
     on a user-defined network as in compose); the helm job requires
@@ -4981,3 +4984,24 @@ two HIGH findings were found next to them.
       before; and round eight's chaos harness (kills, view failures, late
       commits, paused ClickHouse; no restore failed there): outages and
       path changes identical to the clean run.
+- **A login ClickHouse makes to itself logs no user name**
+  (`ServerErrorHandler` and `HedgedConnectionsFactory` at `fatal` in
+  compose and the chart; review round nine, M1). #77's loopback-only native
+  listener stopped `127.0.0.2:9000`, but a query's `hasColumnInTable(
+  '0.0.0.0:9000', <1 MB user name>, ...)` still made ClickHouse log in to
+  itself: Linux connects a socket aimed at `0.0.0.0` to the loopback
+  listener, and ClickHouse does not count `0.0.0.0` (nor `0:9000`) as
+  local. The failed login logged the name through `ServerErrorHandler`,
+  or with Grafana's own password and a 1 MB database or table name through
+  `HedgedConnectionsFactory`: about 1 MB of console log per query, 100 MB/s
+  from Grafana's read-only user. #77's entry measured only `127.0.0.2`.
+  - Measured with the chart's rendered config: 20 such queries wrote
+    20,003,936 bytes to the console before, 0 after (the query still fails
+    at the login, as before).
+  - Accepted: `ServerErrorHandler`'s other errors (a client that drops its
+    connection mid-request) are no longer logged either; `query_log` keeps
+    the queries' exceptions.
+  - Checks: the helm job requires both loggers at `fatal`; CI's `grafana`
+    job requires no line of theirs with a 100 KB name in compose's log
+    files; `smoke.sh` bounds the console's growth for a 1 MB name (not run
+    here: no kind).

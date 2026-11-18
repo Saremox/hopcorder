@@ -96,6 +96,12 @@ data:
                      by Cluster, about 15 MB per query (review round seven). -->
                 <logger><name>DNSResolver</name><level>fatal</level></logger>
                 <logger><name>Cluster</name><level>fatal</level></logger>
+                <!-- A query's hasColumnInTable('0.0.0.0:9000', <1 MB user name>, ...)
+                     makes ClickHouse log in to itself (0.0.0.0 reaches the loopback
+                     listener and is not "local" to it), and the failed login logged
+                     the name, about 1 MB per query (review round nine). -->
+                <logger><name>ServerErrorHandler</name><level>fatal</level></logger>
+                <logger><name>HedgedConnectionsFactory</name><level>fatal</level></logger>
             </levels>
         </logger>
         <!-- No MySQL, PostgreSQL or interserver listener: the server uses
