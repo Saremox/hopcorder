@@ -3619,7 +3619,8 @@ decisions:
     Without `fallocate` (another OS, or a file system that refuses it) the
     first failed commit marks the disk full at the high water mark; the
     drops then use the pages the last commits freed, and a minute later the
-    file may try to grow again.
+    file may try to grow again. (Since round seven the spool writes zeros
+    ahead there instead; see there.)
   - Any operation that still finds no room (`errNoRoom`, `ErrMaxSizeReached`,
     ENOSPC, EDQUOT or EFBIG, also in bbolt's "file resize error" text, which
     it formats with `%s`) drops the oldest records and runs again, 16 times
@@ -3674,7 +3675,8 @@ decisions:
   - Accepted: on a copy-on-write file system (btrfs, ZFS) allocated space
     does not guarantee an overwrite, so a completely full one may still fail
     every commit. Without `fallocate`, a completely full disk and no free
-    pages in the file would do the same (not seen in the tests). Drops come
+    pages in the file would do the same (not seen in the tests; round seven
+    found it, and the spool now writes zeros ahead there). Drops come
     in chunks, up to half a reserve (512 KiB) of records more than one for
     one. A quarantined file (`spool.db.corrupt-*`) stays on the volume: the
     new spool keeps to what is left, as on any full disk, until it is
@@ -3985,3 +3987,61 @@ decisions:
     before. A target whose `af` changes starts without an address.
     `--once` opens no spool and resolves every name. A spool file that is
     quarantined takes its addresses with it.
+- **Without `fallocate` the spool writes zeros ahead of its pages**
+  (`fillFile`, `internal/spool/room.go`; round six allocated nothing ahead
+  there). On a file system without `fallocate` mode 0 (NFS before 4.2,
+  many FUSE file systems, some CIFS and ZFS versions) nothing was
+  allocated beyond the high water mark, and bbolt grows the file with
+  ftruncate, which allocates nothing either. With `max_bytes` above the
+  free space and an output down, the file grew until the volume was full
+  with no free pages left in it; then every Append failed with ENOSPC, and
+  so did the drop it tried (a drop rewrites pages too: a leaf, branches,
+  the bucket and meta leaves, the freelist), the newest records were lost,
+  none counted, and a restart came back to the same state. A minute after
+  a full disk the spool also let the file grow again unchecked, into the
+  same state (review, round seven: 2 of 4 runs stuck; reproduced in 4 of
+  4). Now:
+  - When `fallocate` reports EOPNOTSUPP or ENOSYS (and on other OSes) the
+    spool allocates the reserve as glibc's `posix_fallocate` does there:
+    zeros written from the high water mark (or the end of what it
+    allocated before, if further) to the same end as with `fallocate`, then
+    an fsync (NFS reports a full disk only at writeback). Nothing below the
+    high water mark is written: bbolt wrote every page there once, so it is
+    allocated already. The rest is as with `fallocate`: zeros that do not
+    fit mean a full disk, the file keeps to what is allocated, the reserve
+    allocated while there was room carries the drops, and every minute the
+    spool tries to allocate again instead of letting the file grow.
+  - Before the file grows, its file system must have room for the growth
+    and one reserve more (statfs; not checked where it reports no size, as
+    some FUSE file systems do). A copy-on-write file system with
+    compression (ZFS) stores zeros as holes, so they reserve nothing, and
+    every overwrite needs new space: the check stops the spool's own growth
+    with a reserve of the volume free. Elsewhere it leaves up to two
+    reserves (2 MiB) of a volume smaller than `max_bytes` unused.
+  - Cost: per reserve of growth, a reserve of zeros (1 MiB with 1 GiB) and
+    an fsync; at every open, two reserves from the high water mark.
+  - Not done: the review's other suggestion, retrying a failed drop with a
+    single record. That drop rewrites about the pages the failed one did
+    (leaf, branch path, bucket and meta leaves, freelist), so it would not
+    reliably fit where the other did not; the reserve does.
+  - Tests: `TestFullTmpfs` (root, CI's `rawsock` job) has cases "itself":
+    `max_bytes` 64 MiB on a 4 MiB tmpfs with nothing else on it, an outage
+    of 10,000 appends with the spool checking for room every minute, a
+    restart and as many again, then the backlog delivered 500 records at a
+    time with appends in between. Before, without `fallocate`, append 543
+    after the restart failed with "no space left on device (and making
+    room: … no space left on device)", on every run; now every append
+    succeeds, with the newest records kept and every other one counted, with
+    `fallocate`, without it, and in mode "holes", where the zeros are
+    punched out again (a file system that stores them as holes).
+    `TestNoFallocateAllocatesAhead` (default run): without `fallocate`, a
+    reserve is allocated beyond the high water mark after every 100
+    appends, and every record reads back intact, after a restart too;
+    before, the file was allocated up to its high water mark only (245,760
+    bytes at a high water mark of 241,664). `TestKill9` also runs without
+    `fallocate`.
+  - Accepted: a copy-on-write file system that others fill still fails
+    every commit (round six), with or without `fallocate`. What the statfs
+    check adds on one rests on reasoning: tmpfs overwrites in place, and
+    "holes" also passes without the check. A FUSE file system that reports
+    a size but no free space stops the spool at its first reserve.

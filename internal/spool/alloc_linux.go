@@ -5,6 +5,7 @@ package spool
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"syscall"
 )
@@ -41,4 +42,22 @@ func allocateFile(path string, off, end int64) error {
 		return fmt.Errorf("fallocate %s: %w (%w)", path, errors.ErrUnsupported, errno)
 	}
 	return &os.PathError{Op: "fallocate", Path: path, Err: errno}
+}
+
+// freeSpace returns the bytes the file system of path has free for an
+// unprivileged process, or an error if it does not say (statfs fails, or it
+// reports no size, as some FUSE file systems do).
+func freeSpace(path string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, &os.PathError{Op: "statfs", Path: path, Err: err}
+	}
+	bs := uint64(st.Frsize) //nolint:gosec // a block size
+	if bs == 0 {
+		bs = uint64(st.Bsize) //nolint:gosec // a block size
+	}
+	if st.Blocks == 0 || bs == 0 {
+		return 0, fmt.Errorf("statfs %s: no size: %w", path, errors.ErrUnsupported)
+	}
+	return int64(min(st.Bavail, math.MaxInt64/bs) * bs), nil //nolint:gosec // at most MaxInt64
 }

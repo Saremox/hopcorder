@@ -622,7 +622,8 @@ groups:
 - **Spool disk use** is bounded by `max_bytes`: the spool file, records and
   database overhead together, grows to it and no further (the records take
   half to two thirds, depending on their size), allocating a little ahead of
-  its pages (up to 2 MiB); it
+  its pages (up to 2 MiB; on a file system without `fallocate`, such as NFS
+  before 4.2, by writing zeros, and leaving up to 2 MiB of the disk free); it
   reuses free space but does not shrink. At the bound the oldest records are
   dropped and counted. On a disk that fills before that (shared with other
   files, or `max_bytes` larger than the disk), the spool keeps to the file it

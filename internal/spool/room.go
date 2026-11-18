@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -34,7 +35,8 @@ import (
 //     own, so every transaction, those that delete included, finds the
 //     pages it needs among the free ones or the room left.
 //   - The reserve's worth of disk is allocated ahead of the high water mark
-//     (fallocate). When the file system cannot give it, the spool keeps to
+//     (fallocate, or where the file system cannot, zeros written there: see
+//     fillFile). When the file system cannot give it, the spool keeps to
 //     the file it has: what is allocated becomes the bound, the reserve,
 //     allocated while there was room, carries the transactions that drop
 //     records, and every minute the spool checks whether there is room
@@ -67,8 +69,11 @@ const MinMaxBytes = 1 << 20
 // oldest records are dropped first.
 var errNoRoom = errors.New("spool at its size bound")
 
-// allocate is allocateFile; tests replace it.
-var allocate = allocateFile
+// allocate is allocateFile and fill is fillFile; tests replace them.
+var (
+	allocate = allocateFile
+	fill     = fillFile
+)
 
 // room is what the spool knows of the space for its file. Guarded by
 // roomMu; reset when a file is opened.
@@ -80,7 +85,8 @@ type room struct {
 	reserved int64     // the file is allocated on disk up to here
 	diskFull bool      // the file system has no room for more: the file keeps to reserved
 	since    time.Time // when diskFull was set or last checked
-	noAlloc  bool      // the file system cannot allocate ahead (no fallocate)
+	zeros    bool      // the file system cannot fallocate: the spool allocates by writing zeros (fill)
+	noAlloc  bool      // nothing allocates ahead (writing zeros failed too): a full disk is noticed when a write fails
 }
 
 func newRoom(ps int, maxBytes int64) room {
@@ -152,7 +158,7 @@ func (s *Spool) prepare(tx *bolt.Tx) {
 	if end <= r.reserved {
 		return
 	}
-	switch err := allocate(tx.DB().Path(), r.reserved, end); {
+	switch err := s.allocLocked(tx.DB().Path(), end); {
 	case err == nil:
 		r.reserved = end
 		if r.diskFull {
@@ -163,13 +169,65 @@ func (s *Spool) prepare(tx *bolt.Tx) {
 		// Still full.
 	case diskRefused(err):
 		s.fullLocked(err)
-	case errors.Is(err, errors.ErrUnsupported):
-		r.noAlloc = true
-		s.opts.Logger.Info("spool: the file system cannot allocate space ahead; a full disk is noticed when a write fails", "err", err)
 	default:
 		r.noAlloc = true
-		s.opts.Logger.Warn("spool: cannot allocate space ahead", "err", err)
+		s.opts.Logger.Warn("spool: cannot allocate space ahead; a full disk is noticed when a write fails", "err", err)
 	}
+}
+
+// allocLocked allocates the file's blocks up to end: with fallocate or,
+// once the file system has refused that as unsupported, by writing zeros
+// from where they are allocated or the high water mark, whichever is
+// further. The caller holds roomMu.
+func (s *Spool) allocLocked(path string, end int64) error {
+	r := &s.room
+	if !r.zeros {
+		err := allocate(path, r.reserved, end)
+		if !errors.Is(err, errors.ErrUnsupported) {
+			return err
+		}
+		r.zeros = true
+		s.opts.Logger.Info("spool: the file system cannot allocate space ahead (fallocate); writing zeros ahead instead", "err", err)
+	}
+	return fill(path, max(r.reserved, r.hwm), end, r.reserve)
+}
+
+// zeroBlock is what fillFile writes.
+var zeroBlock [64 << 10]byte
+
+// fillFile allocates the blocks of the file at path from off to end on a
+// file system without fallocate, as glibc's posix_fallocate does there: it
+// writes zeros, then syncs the file, since some file systems (NFS) report a
+// full disk only then. Nothing from off on may be in use: the caller passes
+// the high water mark or more. A copy-on-write file system (ZFS) may store
+// zeros without allocating anything, and needs room for every overwrite, so
+// before the file grows the file system must have room for the growth and
+// margin more (statfs, where it says); else the error wraps ENOSPC.
+func fillFile(path string, off, end, margin int64) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if grow := end - max(off, fi.Size()); grow > 0 {
+		if free, err := freeSpace(path); err == nil && free < grow+margin {
+			return fmt.Errorf("%s: %d bytes free on its file system, %d to grow by and %d to keep: %w", path, free, grow, margin, syscall.ENOSPC)
+		}
+	}
+	for ; off < end; off += int64(len(zeroBlock)) {
+		if _, err := f.WriteAt(zeroBlock[:min(end-off, int64(len(zeroBlock)))], off); err != nil {
+			return err
+		}
+	}
+	return f.Sync()
 }
 
 // fullLocked records that the file system has no room for the file to

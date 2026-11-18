@@ -176,6 +176,14 @@ The section for a version is the text of its GitHub release.
   across restarts: if a name cannot be resolved at start, its target is
   probed at the address it had, with a warning. In the chart a config
   change restarts the pods, so this covers it too.
+- The agent's spool no longer loses every new record on a file system
+  without `fallocate` (NFS before 4.2, many FUSE file systems, some CIFS
+  and ZFS versions). With `max_bytes` larger than the free space and an
+  output down, its file grew until the volume was full, and from then on
+  every record was lost, after a restart too, with nothing counted as
+  dropped. There the spool now allocates its little space ahead by writing
+  zeros, and checks the free space before its file grows, so a full disk
+  drops the oldest records, counted, as with `fallocate`.
 
 **Security: server ingest**
 
