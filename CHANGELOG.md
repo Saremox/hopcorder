@@ -140,7 +140,10 @@ The section for a version is the text of its GitHub release.
   `query_log` and `text_log`: about 100 MB a query, so a few hundred
   stopped ingest. The logs now live on a disk of their own that leaves a
   quarter of the volume to the data (log writes stop and are dropped
-  below that), and compose keeps them for 7 days like the chart.
+  below that), and compose keeps them for 7 days like the chart. That
+  covers every log ClickHouse keeps: a refused `BACKUP` still wrote its
+  whole destination into `backup_log`, and a traced query its exception
+  into `opentelemetry_span_log`, which is now switched off.
 
 **Security: server ingest**
 

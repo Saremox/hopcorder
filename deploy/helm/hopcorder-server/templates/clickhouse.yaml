@@ -50,7 +50,11 @@ data:
   # (about 100 MB), so a few hundred filled the volume before any TTL
   # (review round seven). Now log writes stop, and are dropped, while less
   # than 25% of the volume is free; inserts and merges of hopcorder's data
-  # may use the rest.
+  # may use the rest. Every log the image turns on is there (a refused
+  # BACKUP still wrote its whole destination into backup_log), but for
+  # opentelemetry_span_log, which kept a traced query's exception three
+  # times and cannot take a storage policy (the image gives it an engine):
+  # it is off, hopcorder does not trace.
   hopcorder.xml: |
     <clickhouse>
         <user_files_path>/srv/</user_files_path>
@@ -76,9 +80,10 @@ data:
                 <system_logs><volumes><main><disk>system_logs</disk></main></volumes></system_logs>
             </policies>
         </storage_configuration>
-        {{- range list "query_log" "query_thread_log" "query_views_log" "query_metric_log" "part_log" "trace_log" "metric_log" "asynchronous_metric_log" "error_log" "text_log" "processors_profile_log" }}
+        {{- range list "query_log" "query_thread_log" "query_views_log" "query_metric_log" "part_log" "trace_log" "metric_log" "asynchronous_metric_log" "error_log" "text_log" "processors_profile_log" "backup_log" "asynchronous_insert_log" "blob_storage_log" "crash_log" "iceberg_metadata_log" "s3queue_log" }}
         <{{ . }}><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl></{{ . }}>
         {{- end }}
+        <opentelemetry_span_log remove="1"/>
     </clickhouse>
   {{- if $d.readOnlyUser.enabled }}
   # The read-only user (for Grafana): SELECT on the hopcorder database only,

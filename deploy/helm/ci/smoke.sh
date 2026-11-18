@@ -125,10 +125,14 @@ for i in $(seq 90); do
       # exception message, up to its memory limit, into them.
       adm() { kubectl exec statefulset/hopcorder-server-clickhouse -- sh -c \
         'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --query "$0"' "$1"; }
+      # A refused BACKUP still logs its destination in backup_log.
+      chq "BACKUP TABLE hopcorder.cycles TO Disk('default', 'probe')" >/dev/null 2>&1 && exit 1
       adm "SYSTEM FLUSH LOGS"
       if [ "$(adm "SELECT keep_free_space * 4 >= total_space * 0.99 FROM system.disks WHERE name = 'system_logs'")" != 1 ] ||
-        [ "$(adm "SELECT storage_policy FROM system.tables WHERE database = 'system' AND name = 'query_log'")" != system_logs ]; then
-        echo "ClickHouse's system logs are not on the system_logs disk keeping a quarter free"
+        [ -n "$(adm "SELECT name FROM system.tables WHERE database = 'system' AND engine LIKE '%MergeTree'
+          AND (storage_policy != 'system_logs' OR engine_full NOT LIKE '%TTL%')")" ] ||
+        [ "$(adm "EXISTS system.opentelemetry_span_log")" != 0 ]; then
+        echo "ClickHouse's system logs are not all on the system_logs disk keeping a quarter free (or span log on)"
         exit 1
       fi
       # The image's passwordless default user is gone.
