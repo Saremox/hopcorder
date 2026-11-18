@@ -267,6 +267,10 @@ The section for a version is the text of its GitHub release.
 
 **Fixed (review round nine)**
 
+- ClickHouse (compose and the chart's bundled ClickHouse) no longer logs
+  the user name of a login a query makes it attempt to itself
+  (`hasColumnInTable('0.0.0.0:9000', ...)`): up to 1 MB per query of
+  Grafana's read-only user, about 100 MB/s of the chart's console log.
 - ClickHouse (compose and the chart's bundled ClickHouse) bounds what a
   client may send before it logs in: at most 256 connections, 32 HTTP
   header fields of at most 8 KiB, and 64 KiB of URI. With ClickHouse's

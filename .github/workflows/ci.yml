@@ -237,6 +237,16 @@ jobs:
             'grep -a -E "(DNSResolver|Cluster): .*dnsprobe" /var/log/clickhouse-server/*' | grep -q .; then
             echo "ClickHouse's DNSResolver or Cluster logger repeats a query's host name"; exit 1
           fi
+          # Nor the user name of a login hasColumnInTable() makes to ClickHouse
+          # itself: 0.0.0.0 reaches the loopback listener and is not "local".
+          docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client --user grafana --password grafana \
+            --query "SELECT hasColumnInTable('0.0.0.0:9000', concat('selfprobe', repeat('a', 100000)), 'x', 'a', 'b', 'c')" \
+            >/dev/null 2>&1 && exit 1
+          sleep 1
+          if docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c \
+            'grep -a -E "(ServerErrorHandler|HedgedConnectionsFactory): .*selfprobe" /var/log/clickhouse-server/*' | grep -q .; then
+            echo "ClickHouse logs the user name of a login a query made it attempt"; exit 1
+          fi
           # No MySQL (9004), PostgreSQL (9005) or interserver (9009)
           # listener: the PostgreSQL handlers also log a failing query's
           # whole message. (Docker's DNS listens in the container too.)
@@ -568,7 +578,8 @@ jobs:
           grep -qF '<keep_free_space_ratio>0.25</keep_free_space_ratio>' <<<"$ch" || { echo "hopcorder.xml: no system_logs disk"; exit 1; }
           grep -qF '<opentelemetry_span_log remove="1"/>' <<<"$ch" || { echo "hopcorder.xml: opentelemetry_span_log is on"; exit 1; }
           # The loggers that repeat a failing query's message are off.
-          for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker DNSResolver Cluster; do
+          for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker DNSResolver Cluster \
+            ServerErrorHandler HedgedConnectionsFactory; do
             grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
           done
           # All temporary data together is capped (wait_end_of_query), by

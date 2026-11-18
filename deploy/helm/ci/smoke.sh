@@ -203,6 +203,16 @@ for i in $(seq 90); do
         echo "ClickHouse's connection or HTTP header limits are not set"
         exit 1
       fi
+      # Nor the 1 MB user name of a login hasColumnInTable() makes to
+      # ClickHouse itself (0.0.0.0 reaches the loopback listener).
+      before=$(kubectl logs statefulset/hopcorder-server-clickhouse | wc -c)
+      chq "SELECT hasColumnInTable('0.0.0.0:9000', concat('selfprobe', repeat('a', 1000000)), 'x', 'a', 'b', 'c')" >/dev/null 2>&1 && exit 1
+      sleep 2
+      grew=$(( $(kubectl logs statefulset/hopcorder-server-clickhouse | wc -c) - before ))
+      if [ "$grew" -ge 100000 ]; then
+        echo "ClickHouse's console grew $grew bytes for one self-connect"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then
