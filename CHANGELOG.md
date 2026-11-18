@@ -162,6 +162,11 @@ The section for a version is the text of its GitHub release.
   ended. 29434 is below the ephemeral and NodePort ranges. Every target
   without its own `flow_id` is a new stream (records carry the new
   `flow_id`); the UDP destination port's default stays 33434.
+- Compose: Grafana's read-only ClickHouse user may no longer take away
+  grants. `GRANT CURRENT GRANTS ON *.* TO <user> WITH REPLACE OPTION` ran
+  as that user (a ClickHouse 25.8 bug) and removed every privilege of the
+  grantee, Grafana's or the server's, for good. The user is created with
+  `GRANTEES NONE`.
 
 **Security: server ingest**
 

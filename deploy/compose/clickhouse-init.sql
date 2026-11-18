@@ -21,7 +21,15 @@
 -- user and its profile up to date: a user's own settings win over its
 -- profile's, and the user of older versions had readonly = 2. The password
 -- is the one in docker-compose.yml.
-CREATE USER OR REPLACE grafana IDENTIFIED WITH sha256_password BY 'grafana';
+--
+-- GRANTEES NONE: the user may grant nothing to anyone. Without it,
+-- `GRANT CURRENT GRANTS ON *.* TO <user or role> WITH REPLACE OPTION` ran
+-- as this user, readonly = 1 and no grant option notwithstanding
+-- (ClickHouse 25.8), and took every privilege from the grantee, itself or
+-- any other SQL user (the server's included), for good: one anonymous
+-- viewer broke every dashboard, or ingest (review round seven). The
+-- chart's users are in XML, which no GRANT can change.
+CREATE USER OR REPLACE grafana IDENTIFIED WITH sha256_password BY 'grafana' GRANTEES NONE;
 GRANT SELECT ON hopcorder.* TO grafana;
 
 -- What its queries may do and cost. readonly = 1: a query may change no
