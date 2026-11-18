@@ -159,17 +159,18 @@ func TestUnprivilegedChild(t *testing.T) {
 				_ = syscall.Close(fd)
 			}
 			fmt.Printf("%s %d: %v\n", f[0], id, err)
-		case "forge": // forge <src> <dst> <port> <udp checksum> <ttl>
+		case "forge": // forge <src> <dst> <source port> <destination port> <udp checksum> <ttl>
 			src, dst := netip.MustParseAddr(f[1]), netip.MustParseAddr(f[2])
 			port, _ := strconv.Atoi(f[3])
-			sum, _ := strconv.Atoi(f[4])
-			ttl, _ := strconv.Atoi(f[5])
+			dport, _ := strconv.Atoi(f[4])
+			sum, _ := strconv.Atoi(f[5])
+			ttl, _ := strconv.Atoi(f[6])
 			var err error
 			if udp < 0 {
 				// The agent's source port: nothing stops a user from binding it.
 				if udp, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0); err == nil {
 					if err = syscall.Bind(udp, &syscall.SockaddrInet4{Port: port}); err == nil {
-						err = syscall.Connect(udp, &syscall.SockaddrInet4{Port: port, Addr: dst.As4()})
+						err = syscall.Connect(udp, &syscall.SockaddrInet4{Port: dport, Addr: dst.As4()})
 					}
 				}
 			}
@@ -179,7 +180,7 @@ func TestUnprivilegedChild(t *testing.T) {
 			// A payload whose UDP checksum is the probe id; corked, so the
 			// kernel computes the checksum in software. (It cannot know
 			// the probe's nonce either.)
-			payload := buildUDP(src, dst, uint16(port), uint16(port), uint16(sum), 0)[8:]
+			payload := buildUDP(src, dst, uint16(port), uint16(dport), uint16(sum), 0)[8:]
 			for range 5 { // an ICMP error queued on the socket fails one write
 				if err != nil && !errors.Is(err, syscall.ECONNREFUSED) {
 					break
@@ -408,7 +409,7 @@ func TestInnerForgeRefused(t *testing.T) {
 	r.eng.io = tapIO{netIO: r, onSend: func(p *outPacket) {
 		if p.ttl == 2 {
 			id := binary.BigEndian.Uint16(p.l4[6:8])
-			answers = append(answers, u.do("forge %s %s %d %d %d", src, dst, DefaultFlowID, id, forgeTTL))
+			answers = append(answers, u.do("forge %s %s %d %d %d %d", src, dst, DefaultFlowID, DefaultUDPPort, id, forgeTTL))
 		}
 	}}
 	for _, ttl := range []int{1, 64} {

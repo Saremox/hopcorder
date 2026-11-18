@@ -627,7 +627,7 @@ func TestReloadRefusesTargetsSharingAStream(t *testing.T) {
 		}
 		return m
 	}
-	waitFor(t, 5*time.Second, func() bool { f := flows(); return f[33434] && f[33435] }, "records of both flows")
+	waitFor(t, 5*time.Second, func() bool { f := flows(); return f[config.DefaultFlowID] && f[33435] }, "records of both flows")
 	running(t, done)
 	cancel()
 	select {
@@ -876,7 +876,7 @@ func TestDaemonHoldsFlows(t *testing.T) {
 	stop := startDaemon(t, cfg, f)
 	waitFor(t, 3*time.Second, func() bool { return len(f.Held()) == 3 }, "held flows")
 	stop()
-	want := []probe.Flow{{Protocol: probe.ICMP, ID: 33434}, {Protocol: probe.TCP, ID: 999},
+	want := []probe.Flow{{Protocol: probe.ICMP, ID: config.DefaultFlowID}, {Protocol: probe.TCP, ID: 999},
 		{Protocol: probe.TCP, ID: 900, Ports: 12}}
 	if got := f.Held(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("held %v, want %v", got, want)
@@ -918,7 +918,7 @@ func TestFailedReloadKeepsTheFlowsHeld(t *testing.T) {
 	bad.Targets[0].FlowID = 40000
 	next := daemonConfigJSONL(t, dir+"/spool", dir+"/out.jsonl", "")
 	next.Targets[0].FlowID = 40001
-	old := probe.Flow{Protocol: probe.ICMP, ID: 33434}
+	old := probe.Flow{Protocol: probe.ICMP, ID: config.DefaultFlowID}
 	tried, moved := probe.Flow{Protocol: probe.ICMP, ID: 40000}, probe.Flow{Protocol: probe.ICMP, ID: 40001}
 
 	f := &holdLog{Fake: fakeNetwork()}
@@ -993,9 +993,9 @@ func TestDaemonFlowInUseStopsOnlyItsTargets(t *testing.T) {
 		others  []target // probed meanwhile
 		err     string
 	}{
-		{probe.Flow{Protocol: probe.ICMP, ID: 33434}, target{"192.0.2.1", probe.ICMP},
+		{probe.Flow{Protocol: probe.ICMP, ID: config.DefaultFlowID}, target{"192.0.2.1", probe.ICMP},
 			[]target{{"192.0.2.2", probe.TCP}, {"192.0.2.3", probe.UDP}},
-			"icmp flow_id 33434: ICMP echo identifier 33434 is %w"},
+			"icmp flow_id 29434: ICMP echo identifier 29434 is %w"},
 		{probe.Flow{Protocol: probe.TCP, ID: 999}, target{"192.0.2.2", probe.TCP},
 			[]target{{"192.0.2.1", probe.ICMP}, {"192.0.2.3", probe.UDP}},
 			"tcp flow_id 999: IPv4 TCP port 999 is %w"},

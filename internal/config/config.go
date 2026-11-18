@@ -29,7 +29,7 @@ const (
 	DefaultProtocol     = "icmp"
 	DefaultPort         = 33434 // UDP destination port
 	DefaultTCPPort      = 443
-	DefaultFlowID       = 33434
+	DefaultFlowID       = 29434
 	DefaultDNSTTL       = 5 * time.Minute
 	DefaultSpoolMaxAge  = 7 * 24 * time.Hour
 	DefaultSpoolMaxSize = ByteSize(1 << 30)

@@ -31,7 +31,7 @@ const (
 // does not configure one. Every probe of a target uses the same flow ID, so
 // in paris mode ECMP routers keep the whole cycle (and every later cycle) on
 // one path.
-const DefaultFlowID = 33434
+const DefaultFlowID = 29434
 
 // DefaultUDPPort is the UDP destination port when none is configured.
 const DefaultUDPPort = 33434
