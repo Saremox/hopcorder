@@ -150,6 +150,11 @@ The section for a version is the text of its GitHub release.
   it about five times, 300 MB, into compose's log files on the host's
   disk. The loggers that did are set to `fatal` (`query_log` keeps the
   exception), and compose caps its files at 10M × 2.
+- Route changes: an outage that the router before the destination answered
+  with an ICMP unreachable (an ARP failure on its LAN, a REJECT rule)
+  counted as two route changes on an unchanged route, at its start and its
+  end. Unreachable hops are no longer compared with the addresses seen at
+  their TTL.
 
 **Security: server ingest**
 
