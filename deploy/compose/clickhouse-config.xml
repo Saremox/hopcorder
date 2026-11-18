@@ -44,6 +44,9 @@ policy (the image gives it an engine), is off; hopcorder does not trace.
     </logger>
     <user_files_path>/srv/</user_files_path>
     <format_schema_path>/srv/</format_schema_path>
+    <!-- remote() and the like resolve their host before the grant check;
+         with this they resolve nothing (review round seven). -->
+    <remote_url_allow_hosts><host>localhost</host></remote_url_allow_hosts>
     <storage_configuration>
         <disks>
             <system_logs>

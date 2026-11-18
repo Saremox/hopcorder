@@ -132,8 +132,9 @@ The section for a version is the text of its GitHub release.
   connect out. `hasColumnInTable('host:port', ...)`, which no grant
   covers, let Grafana's read-only user make ClickHouse connect to any host
   and port and resolve any name. The chart's NetworkPolicy now allows
-  ClickHouse egress to DNS only, and compose keeps ClickHouse on an
-  internal network.
+  ClickHouse no egress at all, DNS included, compose keeps ClickHouse on an
+  internal network, and `remote()` no longer looks up the host it is then
+  refused for.
 - ClickHouse's own logs (compose and the chart's bundled ClickHouse) can no
   longer fill its volume. One failing query of Grafana's read-only user
   wrote its whole exception message, up to the user's memory limit, into
