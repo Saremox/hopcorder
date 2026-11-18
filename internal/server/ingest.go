@@ -556,14 +556,22 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 			a.unsure = true
 			return stored, err
 		}
-		// A stream whose outage close row could not be stored is restored
-		// again at its next cycle (review, round ten): its state has the
-		// outage closed, storage has it open, and the restore closes it at
-		// the cycle that reached (restoreOutage). Kept loaded, it would go
-		// on from its own state and the close row would stay lost for good.
-		for _, k := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
-			if s, ok := a.streams[k]; ok {
-				s.loaded = false
+		// An outage close row that could not be stored is kept on its
+		// stream and written again with the stream's next part (derive;
+		// review, round twelve). Until round twelve the stream was restored
+		// from storage instead (round ten), which closed an outage storage
+		// held open but rebuilt the stream's next outage, whose open row was
+		// lost in the same insert, from storage, which never had it: with a
+		// later start, or not at all if that restore failed or did not fit.
+		// Only past maxPending is the stream restored, as then.
+		for _, o := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
+			s, ok := a.streams[streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID}]
+			switch {
+			case !ok || !s.loaded:
+			case len(s.pending) < maxPending:
+				s.pending = append(s.pending, o)
+			default:
+				s.loaded, s.pending = false, nil
 			}
 		}
 		in.writeMark(wctx, id, last)
@@ -853,6 +861,11 @@ func (in *Ingester) derive(ctx context.Context, a *agentState, recs []*record.Re
 		if !s.loaded {
 			st.skipped++
 			continue
+		}
+		if len(s.pending) > 0 {
+			ev.outages = append(ev.outages, s.pending...)
+			ev.resent += len(s.pending)
+			s.pending = nil
 		}
 		s.observe(r, &ev)
 		if s.outage != nil && !down[s] {
@@ -1238,11 +1251,15 @@ func clickhouseQuery[T any](ctx context.Context, st Store, q string, p clickhous
 	return out, err
 }
 
+// maxPending is how many outage close rows that could not be stored a
+// stream keeps to write again with its next part; past it, the stream is
+// restored from storage at its next cycle instead (storeRecords).
+const maxPending = 8
+
 // insertEvents stores events in inserts of at most partBytes of JSON each,
-// encoding an insert's rows only when it is due. It returns the streams of
-// the outage close rows it could not store, which storeRecords restores
-// again.
-func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamKey) {
+// encoding an insert's rows only when it is due. It returns the outage
+// close rows it could not store, which storeRecords keeps on their streams.
+func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []outageRow) {
 	insert := func(table string, rows [][]byte) bool {
 		if len(rows) == 0 {
 			return true
@@ -1284,10 +1301,14 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamK
 	for range ev.opened {
 		in.metrics.outage("open")
 	}
+	closes := -ev.resent // written again: counted when first derived
 	for _, o := range ev.outages {
 		if o.EndTS != nil {
-			in.metrics.outage("close")
+			closes++
 		}
+	}
+	for range closes {
+		in.metrics.outage("close")
 	}
 	in.metrics.pathChanges(len(ev.changes))
 	write("path_changes", len(ev.changes), func(i int) []byte { b, _ := json.Marshal(ev.changes[i]); return b },
@@ -1296,14 +1317,12 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamK
 		func(from, to int) {
 			for _, o := range ev.outages[from:to] {
 				// Only a lost close row: a lost open row is written again,
-				// from the stream's state, after its next part. Restored
-				// instead, the stream would rebuild the outage from storage,
-				// which never had it, and record it with a later start or
-				// not at all (review, round eleven).
+				// from the stream's state, after its next part (review,
+				// round eleven).
 				if o.EndTS == nil {
 					continue
 				}
-				lost = append(lost, streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID})
+				lost = append(lost, o)
 			}
 		})
 	return lost

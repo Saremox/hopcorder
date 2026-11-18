@@ -5054,7 +5054,10 @@ requests within the limits. Two HIGH findings were found next to them.
     outage closed at the first cycle that reached, with its count). A lost
     open row needs nothing: open rows are rewritten after every part. (As
     first merged, #85 unloaded for lost open rows too, against this; round
-    eleven: see "Only a lost close row restores a stream".)
+    eleven: see "Only a lost close row restores a stream". Round twelve: a
+    lost close row is now kept on its stream and written again with its
+    next part; see "A lost close row is written again with its stream's
+    next part".)
     Path changes lost with their insert stay lost, as round six accepted.
   - Test (`clickhouse` tag): `TestLostCloseRowIsRepairedAtTheNextBatch`
     (the outages insert fails all three times in the batch that closes an
@@ -5142,7 +5145,10 @@ found next to them.
   - Now only lost close rows unload their stream. With that the reviewer's
     differential and every restore test pass; the one case left (two lost
     batches in a row, then a crash and restart) is round two's documented
-    restart case.
+    restart case. (Round twelve: not when the same insert held the open row
+    of the stream's next outage; a lost close row no longer unloads its
+    stream. See "A lost close row is written again with its stream's next
+    part".)
   - Tests (`clickhouse` tag): `TestLostOpenRowInACatchUpBatchKeepsItsStart`
     (`[71 to 111: 40 cycles]` before, `[61 to 111: 50 cycles]` after) and
     `TestLostOpenRowThenSkippedRestoreIsRecorded` (a failed restore and a
@@ -5189,3 +5195,81 @@ found next to them.
     connect check, readiness to be the env-only `SELECT 1`, no `httpGet` and
     no `--password` in the ClickHouse StatefulSet (failed on the old chart);
     the kind smoke test's `helm install --wait` needs them to pass.
+
+### Security and correctness review, round twelve
+
+A focused round (the owner's choice) on round eleven's fixes (#88, #89).
+#89 holds: under round eleven's `slowfill` the two probes started together
+passed 40 of 40, and after a restart during the attack readiness answered
+5 s after the attack stopped, with ClickHouse never restarted. #88 fixes the
+case it names (round eleven's oracle: 199 of 200 seeds, the one failure the
+oracle modelling #85), but #85's unload survived next to it: one HIGH, one
+MEDIUM.
+
+- **A lost close row is written again with its stream's next part**
+  (`storeRecords`, `derive` and `insertEvents`, `internal/server/ingest.go`;
+  `stream.pending`, `internal/server/streams.go`; review round twelve, H1,
+  HIGH, #85's regression, not removed by #88, and M1). When a part's outages
+  insert failed after its cycles were stored, a lost close row still had
+  its stream restored from storage (#85). If the same insert held the open
+  row of the stream's next outage (an outage that opened and closed in the
+  part, then a longer one starting: every lost reply of a lossy
+  destination is a one-cycle outage, and a flap a chain of them), the
+  restore rebuilt that next outage from storage, which never had it:
+  - in a catch-up batch it was recorded with a later start, for good
+    (`[121 to 161: 40 cycles]` instead of `[70 to 161: 91 cycles]`);
+  - when the stream's next restore failed or did not fit the request's
+    budget and the outage ended in the skipped cycles, it was not recorded
+    at all;
+  - when the insert counted as failed was committed after all (the client
+    gave up while ClickHouse went on), its open row stayed "ongoing" for
+    good next to the restore's later copy;
+  - and (M1) the batch after a lost close row derived nothing if that
+    restore failed or did not fit: its route changes were lost though their
+    own insert would have worked.
+  Measured by the reviewer with round eleven's differential and short
+  outages (100 seeds each): 2 runs wrong with 200-record batches and 1 with
+  500, each with a single lost batch; the pre-#85 code left outages
+  "ongoing" (round ten's H2) in 6.
+  - Now `insertEvents` returns the close rows it could not store, and
+    `storeRecords` keeps them on their stream (`pending`, at most
+    `maxPending` = 8); `derive` adds them to the stream's next part's
+    events, so the stream stays loaded and goes on from its own state, as it
+    does for a lost open row. Only a stream with more than 8 lost close rows
+    in a row (8 failed parts that each closed one of its outages) is
+    restored from storage, as #85 did: storage then holds at most one of
+    those outages open (the one open when the failures began; the later
+    ones' rows were all in failed inserts), and the restore closes it.
+  - Outages whose rows were all in failed inserts are now recorded too, as
+    long as the stream comes again within the bound: a close row carries
+    the whole outage. They are still lost if the server restarts, or the
+    stream is dropped (idle for `stream_idle_timeout`, or trimmed), before its
+    next part: then the restore repairs what storage holds open, as before.
+  - A close row written again is not counted again in
+    `hopcorder_server_outages_total` (`events.resent`); round eleven's L1
+    (a lost row's event counted twice through the restore's repair row)
+    remains only past the bound.
+  - Tests (`clickhouse` tag), each failing on 192d757:
+    `TestLostCloseRowKeepsTheNextOutagesStart` (`[[121 to 161: 40 cycles]]`
+    before, `[[60 to 61: 1 cycles] [70 to 161: 91 cycles]]` after),
+    `TestLostCloseRowThenSkippedRestoreKeepsTheNextOutage` (a failed restore
+    and a used-up budget: `[]` before), `TestLostCloseRowKeepsTheNextBatchsRouteChange`
+    (`[]` before, `[{65 64 router}]` after) and
+    `TestLateCommitOfALostCloseRowLeavesNothingOpen` (`[70 to ongoing: 81
+    cycles]` next to `[121 to 161: 40 cycles]` before). Default run:
+    `TestLostCloseRowsAreWrittenAgain` (three failed parts: every outage
+    recorded, no restore, each counted once; past the bound: restored). The
+    earlier lost-row tests (#85, #88) still pass.
+- **Not fixed (lows):** the readiness probe's `clickhouse-client` reads
+  `~/.clickhouse-client/config.xml` (on the data volume) and the image's
+  world-writable `/etc/clickhouse-client/config.xml`, which only uid 101 or
+  exec in the pod can write; a frozen ClickHouse passes the connect check
+  until its accept queue fills (about 4,093 connects, 3.8 h at kubelet's
+  rate; the trade-off round eleven accepted); CI does not check the probes'
+  thresholds or the ClickHouse pod's `restartCount`; a restore forgets
+  addresses seen before its 30-cycle replay (a route change's detail can
+  list a TTL fewer); `settle`'s `KILL QUERY` matches the agent's query_id
+  prefix in every database of the ClickHouse server, so two hopcorder
+  servers sharing one ClickHouse and agent_ids can cancel each other's
+  writes (retried; nothing lost).
+
