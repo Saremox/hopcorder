@@ -12,8 +12,38 @@ leaves it there: the same, about 1,000 files a second (review round seven;
 the read-only user's profile also turns that generation off). No hopcorder
 query uses either directory. CLICKHOUSE_DO_NOT_CHOWN (docker-compose.yml)
 keeps the image's entrypoint from handing /srv to the clickhouse user.
+
+ClickHouse's own logs are kept 7 days (as in the chart) on a disk of their
+own on the data volume that keeps a quarter of the file system free: one
+failing query of Grafana's read-only user wrote its exception message, up
+to the user's memory limit, into query_log and three times into text_log
+(about 200 MB here), with no TTL, so a few dozen filled the disk (review
+round seven). Log writes now stop, and are dropped, while less than 25% of
+the file system is free; hopcorder's data may use the rest.
 -->
 <clickhouse>
     <user_files_path>/srv/</user_files_path>
     <format_schema_path>/srv/</format_schema_path>
+    <storage_configuration>
+        <disks>
+            <system_logs>
+                <path>/var/lib/clickhouse/system_logs/</path>
+                <keep_free_space_ratio>0.25</keep_free_space_ratio>
+            </system_logs>
+        </disks>
+        <policies>
+            <system_logs><volumes><main><disk>system_logs</disk></main></volumes></system_logs>
+        </policies>
+    </storage_configuration>
+    <query_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_log>
+    <query_thread_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_thread_log>
+    <query_views_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_views_log>
+    <query_metric_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></query_metric_log>
+    <part_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></part_log>
+    <trace_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></trace_log>
+    <metric_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></metric_log>
+    <asynchronous_metric_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></asynchronous_metric_log>
+    <error_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></error_log>
+    <text_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></text_log>
+    <processors_profile_log><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL 7 DAY DELETE</ttl></processors_profile_log>
 </clickhouse>

@@ -3758,3 +3758,38 @@ decisions:
     has a route there, so before it the attempt went out); the helm job
     checks the rendered NetworkPolicy. kind's enforcement of
     NetworkPolicy is not relied on.
+- **ClickHouse's own logs cannot take the data's last quarter of the
+  volume.** One failing query of Grafana's read-only user (`SELECT 1 WHERE
+  throwIf(1, <a message as long as its memory limit allows>)`) stored the
+  whole message in `system.query_log.exception` and three times in
+  `system.text_log`: about 100 MB a query in the chart, 200 MB in compose,
+  random bytes so that compression does not help (review, round seven;
+  reproduced: a 4 MB message, one query_log row and three text_log rows).
+  A few hundred such queries filled the chart's 20 GiB volume, long before
+  the 7-day TTL, and compose's logs had no TTL at all; then ingest stopped.
+  No setting caps an exception's length (`log_queries_cut_to_length` is
+  the query text's), quotas did not bound it, and the memory limit is the
+  dashboards'. Now:
+  - The eleven system logs a query can write to (query, thread, views,
+    query metric, part, trace, metric, asynchronous metric, error, text
+    and processors-profile logs) are on a disk of their own,
+    `system_logs` (`/var/lib/clickhouse/system_logs/`, the same volume),
+    with `keep_free_space_ratio` 0.25: ClickHouse writes a log part there
+    only while the file system keeps a quarter free, and drops what it
+    cannot flush (logged: "Failed to flush system log"). The data, on the
+    default disk, may use the rest. Measured on 600 MiB: log growth
+    stopped with a quarter free, a 300,000-row insert still succeeded, and
+    memory stayed flat over 16 queries of 32 MB messages (refused batches
+    are dropped, not kept).
+  - Compose's logs get the chart's 7-day TTL.
+  - Cost: once the data alone leaves less than a quarter of the volume
+    free, ClickHouse keeps no more logs (query_log among them) until there
+    is room. This also bounds round seven's medium of the read API's log
+    growth (about 0.4 KB a request) and round four's accepted log rate.
+  - The other six logs on by default (asynchronous insert, backup, blob
+    storage, crash, Iceberg metadata, OpenTelemetry span) stay on the
+    default disk: only features the read-only user is refused, or cannot
+    switch on, write to them.
+  - Checks: CI's `grafana` job and `smoke.sh` require the `system_logs`
+    disk to keep a quarter free and the logs to be on it with a TTL; the
+    helm job checks the rendered XML.

@@ -134,6 +134,13 @@ The section for a version is the text of its GitHub release.
   and port and resolve any name. The chart's NetworkPolicy now allows
   ClickHouse egress to DNS only, and compose keeps ClickHouse on an
   internal network.
+- ClickHouse's own logs (compose and the chart's bundled ClickHouse) can no
+  longer fill its volume. One failing query of Grafana's read-only user
+  wrote its whole exception message, up to the user's memory limit, into
+  `query_log` and `text_log`: about 100 MB a query, so a few hundred
+  stopped ingest. The logs now live on a disk of their own that leaves a
+  quarter of the volume to the data (log writes stop and are dropped
+  below that), and compose keeps them for 7 days like the chart.
 
 **Security: server ingest**
 
