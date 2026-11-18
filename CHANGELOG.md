@@ -267,6 +267,10 @@ The section for a version is the text of its GitHub release.
 
 **Fixed (review round ten)**
 
+- ClickHouse (compose and the chart's bundled ClickHouse) no longer logs a
+  stack trace for an unauthenticated request whose body it cannot read
+  after refusing it (a bad chunk header suffices): about 8 MB/s of the
+  chart's console log.
 - Server chart: the bundled ClickHouse's probes query over its native port
   on loopback instead of HTTP `/ping`. A client that held ClickHouse's HTTP
   connections open would have made the probes fail and Kubernetes restart

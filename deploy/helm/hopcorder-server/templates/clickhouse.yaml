@@ -107,6 +107,10 @@ data:
                      request through a logger named after this function, about 7 MB/s
                      of console log without credentials (review round nine). -->
                 <logger><name>bool DB::WriteBufferFromHTTPServerResponse::cancelWithException(HTTPServerRequest &amp;, int, const std::string &amp;, WriteBuffer *)</name><level>fatal</level></logger>
+                <!-- And for an unauthenticated request whose body ClickHouse cannot
+                     drain after its 401 (a bad chunk header suffices): a stack trace
+                     each, about 8 MB/s (review round ten). -->
+                <logger><name>sendExceptionToHTTPClient</name><level>fatal</level></logger>
             </levels>
         </logger>
         <!-- No MySQL, PostgreSQL or interserver listener: the server uses

@@ -5087,3 +5087,28 @@ requests within the limits. Two HIGH findings were found next to them.
     chart); the kind smoke test's `helm install --wait` needs them to pass
     (not run here: no kind; the command was run in a chart-config
     container).
+- **No stack trace for an unauthenticated request ClickHouse cannot
+  drain** (`sendExceptionToHTTPClient` at `fatal` in compose and the chart;
+  review round ten, M1, a sibling #84 missed). After its 401 or 403,
+  ClickHouse reads what is left of the request's body; when it cannot (a
+  bad chunk header, `zzzz`, or a chunked or `Content-Length` body cut
+  short) it logged "Cannot read remaining request body during exception
+  handling" with a stack trace, about 1.75 KB a request, at Error: 40.8 MB
+  in 5 s from 4 threads with the chart's render, one request each, no
+  early close needed. No attacker input is in the line; nothing operational
+  depends on it.
+  - Measured with compose's config: 5 such requests wrote 10 lines before
+    (both log files), 0 after.
+  - Checks: CI's `grafana` job sends 5 such requests from inside the
+    container and requires no such line in compose's log files (failed with
+    the old config); the helm job requires the logger at `fatal`.
+- **Accepted by the owner (round ten): a client that holds ClickHouse's
+  HTTP connections keeps new HTTP clients out while it goes on.** Without a
+  CNI that enforces the chart's NetworkPolicy, any pod can hold all 256
+  connections within #81's limits, one header byte at a time, and
+  ClickHouse 25.8 has no deadline for a request's header. #86 keeps the
+  probes off HTTP, so ClickHouse is not restarted, and the server keeps the
+  connections it holds; new ones wait. The boundary is an enforcing
+  NetworkPolicy, which README requires for the bundled ClickHouse. A proxy
+  with header deadlines in front of 8123 would close it, at the cost of a
+  new component, which the owner declined.
