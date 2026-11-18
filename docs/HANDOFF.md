@@ -5052,7 +5052,9 @@ requests within the limits. Two HIGH findings were found next to them.
     store, and `storeRecords` marks them not loaded: their next cycle
     restores them, and #82's `restoreOutage` repairs storage (the open
     outage closed at the first cycle that reached, with its count). A lost
-    open row needs nothing: open rows are rewritten after every part.
+    open row needs nothing: open rows are rewritten after every part. (As
+    first merged, #85 unloaded for lost open rows too, against this; round
+    eleven: see "Only a lost close row restores a stream".)
     Path changes lost with their insert stay lost, as round six accepted.
   - Test (`clickhouse` tag): `TestLostCloseRowIsRepairedAtTheNextBatch`
     (the outages insert fails all three times in the batch that closes an
@@ -5112,3 +5114,35 @@ requests within the limits. Two HIGH findings were found next to them.
   NetworkPolicy, which README requires for the bundled ClickHouse. A proxy
   with header deadlines in front of 8123 would close it, at the cost of a
   new component, which the owner declined.
+
+### Security and correctness review, round eleven
+
+A focused round (the owner's choice) on round ten's two HIGH fixes (#85,
+#86). #85 fixes round ten's H2 (400 oracle runs with outage inserts failing
+at random: none ongoing, merged or overlapping; 75 of 100 before), and #86
+keeps a lone probe working under the slowloris; two HIGH findings were
+found next to them.
+
+- **Only a lost close row restores a stream** (`insertEvents`,
+  `internal/server/ingest.go`; review round eleven, H1, a regression of
+  #85). #85 unloaded a stream for every outage row it could not store,
+  open rows included, although its own entry says a lost open row needs
+  nothing. Restored, the stream rebuilt the outage from storage, which
+  never had it: when the part held more than `replayDepth` down cycles of
+  the stream (a catch-up batch after any interruption) the outage was
+  recorded with a later start, for good; when the stream's next restore
+  failed or did not fit the request's budget and the outage ended in the
+  skipped cycles, it was not recorded at all. Before #85 a lost open row
+  was written again from the stream's state after its next part. Measured
+  by the reviewer: of the outages whose first open row was lost, 35 of 171
+  lost or truncated after #85, 3 of 183 before; 4 of 100 differential runs
+  with 200-record batches wrong after #85 only.
+  - Now only lost close rows unload their stream. With that the reviewer's
+    differential and every restore test pass; the one case left (two lost
+    batches in a row, then a crash and restart) is round two's documented
+    restart case.
+  - Tests (`clickhouse` tag): `TestLostOpenRowInACatchUpBatchKeepsItsStart`
+    (`[71 to 111: 40 cycles]` before, `[61 to 111: 50 cycles]` after) and
+    `TestLostOpenRowThenSkippedRestoreIsRecorded` (a failed restore and a
+    used-up budget: `[]` before, `[56 to 63: 7 cycles]` after); #85's
+    `TestLostCloseRowIsRepairedAtTheNextBatch` still passes.

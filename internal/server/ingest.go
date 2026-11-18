@@ -556,13 +556,11 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 			a.unsure = true
 			return stored, err
 		}
-		// A stream whose outage row could not be stored is restored again
-		// at its next cycle (review, round ten): its state has the outage
-		// as derived, storage as it was, and the restore repairs storage
-		// (an open outage closed by a cycle that reached, a missing one
-		// opened, a count brought up to date; see restoreOutage). Kept
-		// loaded, it would go on from its own state and the close (or open)
-		// row would stay lost for good.
+		// A stream whose outage close row could not be stored is restored
+		// again at its next cycle (review, round ten): its state has the
+		// outage closed, storage has it open, and the restore closes it at
+		// the cycle that reached (restoreOutage). Kept loaded, it would go
+		// on from its own state and the close row would stay lost for good.
 		for _, k := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
 			if s, ok := a.streams[k]; ok {
 				s.loaded = false
@@ -1242,7 +1240,8 @@ func clickhouseQuery[T any](ctx context.Context, st Store, q string, p clickhous
 
 // insertEvents stores events in inserts of at most partBytes of JSON each,
 // encoding an insert's rows only when it is due. It returns the streams of
-// the outage rows it could not store, which storeRecords restores again.
+// the outage close rows it could not store, which storeRecords restores
+// again.
 func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamKey) {
 	insert := func(table string, rows [][]byte) bool {
 		if len(rows) == 0 {
@@ -1296,6 +1295,14 @@ func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []streamK
 	write("outages", len(ev.outages), func(i int) []byte { b, _ := json.Marshal(ev.outages[i]); return b },
 		func(from, to int) {
 			for _, o := range ev.outages[from:to] {
+				// Only a lost close row: a lost open row is written again,
+				// from the stream's state, after its next part. Restored
+				// instead, the stream would rebuild the outage from storage,
+				// which never had it, and record it with a later start or
+				// not at all (review, round eleven).
+				if o.EndTS == nil {
+					continue
+				}
 				lost = append(lost, streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID})
 			}
 		})

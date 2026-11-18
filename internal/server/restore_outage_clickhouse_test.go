@@ -439,3 +439,82 @@ func TestLostCloseRowIsRepairedAtTheNextBatch(t *testing.T) {
 		})
 	}
 }
+
+// A lost open row needs no restore: the stream writes it again, from its
+// state, after its next part (review, round eleven). Restored instead, it
+// rebuilt the outage from storage, which never had it: a catch-up batch
+// with more down cycles than the replay recorded it with a later start.
+func TestLostOpenRowInACatchUpBatchKeepsItsStart(t *testing.T) {
+	c := testClickHouse(t)
+	st := &faultStore{Client: c}
+	in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+	spec := func(seq uint64) []string {
+		if seq > 60 && seq <= 110 {
+			return brokenA
+		}
+		return pathA
+	}
+	ingest := func(from, to uint64) {
+		t.Helper()
+		if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for from := uint64(1); from <= 41; from += 10 {
+		ingest(from, from+9)
+	}
+	st.failOutages = 3
+	ingest(51, 100) // down from 61, 40 cycles: its open row is lost
+	ingest(101, 110)
+	if got, want := storedOutages(t, c), "[[61 to ongoing: 50 cycles]]"; got != want {
+		t.Errorf("while down: %s, want %s", got, want)
+	}
+	ingest(111, 120)
+	if got, want := storedOutages(t, c), "[[61 to 111: 50 cycles]]"; got != want {
+		t.Errorf("after: %s, want %s", got, want)
+	}
+}
+
+// And with the stream's next restore failed or skipped (the request's
+// budget used up) while the outage ends: restored, it was not recorded at
+// all.
+func TestLostOpenRowThenSkippedRestoreIsRecorded(t *testing.T) {
+	for _, why := range []string{"failed", "budget"} {
+		t.Run(why, func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &faultStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			spec := func(seq uint64) []string {
+				if seq > 55 && seq <= 62 {
+					return brokenA
+				}
+				return pathA
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			st.failOutages = 3
+			ingest(51, 60) // down from 56: the open row is lost
+			if why == "failed" {
+				st.failReplay = true
+			} else {
+				in.maxRestores = 0
+			}
+			ingest(61, 70) // reached again at 63
+			st.failReplay, in.maxRestores = false, maxRestores
+			ingest(71, 80)
+			ingest(81, 90)
+			if got, want := storedOutages(t, c), "[[56 to 63: 7 cycles]]"; got != want {
+				t.Errorf("at the end: %s, want %s", got, want)
+			}
+		})
+	}
+}

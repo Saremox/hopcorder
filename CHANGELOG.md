@@ -265,6 +265,13 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round eleven)**
+
+- Server: an outage whose open row could not be stored is recorded with its
+  real start again. Since #85 its stream was rebuilt from storage, which
+  never had the row: a catch-up batch recorded the outage with a later
+  start, and a skipped restore not at all.
+
 **Fixed (review round ten)**
 
 - ClickHouse (compose and the chart's bundled ClickHouse) no longer logs a
