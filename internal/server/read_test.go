@@ -293,13 +293,62 @@ func TestPathChangesReadOnlyWhatFits(t *testing.T) {
 	if code := getJSON(t, ts.URL+"/api/v1/query/path-changes?agent=lab&limit=10000", &body); code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
-	// 1 MiB holds 10 rows of 100 KB; the eleventh is the first past it.
-	if len(phases) != 2 || phases[0] != "sizes" || st.params[1]["limit"] != "11" ||
+	// 1 MiB holds 10 rows of 100 KB; the eleventh is the first past it (and
+	// the second query reads one row more than it may send, see runQuery).
+	if len(phases) != 2 || phases[0] != "sizes" || st.params[0]["limit"] != "10001" || st.params[1]["limit"] != "12" ||
 		st.params[1]["oldest"] != "2026-11-16 23:49:00.000" {
 		t.Errorf("queries %v, params of the second %v", phases, st.params[len(st.params)-1])
 	}
 	if !body.Truncated || len(body.Rows) != 10 || body.Rows[0].Seq != n {
 		t.Errorf("truncated %v, %d rows", body.Truncated, len(body.Rows))
+	}
+}
+
+// A list cut at its limit says so: each list endpoint reads one row more
+// than limit, sends limit rows and sets truncated if there was one more
+// (review round five: 24,000 loops gave 10,000 rows with truncated false,
+// and the UI showed "Loops 10000").
+func TestListLimitSaysTruncated(t *testing.T) {
+	stored := 0
+	st := &paramStore{fakeStore: newFakeStore()}
+	st.rows = func(_ string, p clickhouse.Params) []string { // the newest stored rows, at most {limit}, like ClickHouse
+		limit, _ := strconv.Atoi(p["limit"])
+		var out []string
+		for i := range min(stored, limit) {
+			out = append(out, fmt.Sprintf(`{"ts":"2026-11-16T23:%02d:00.000Z","bytes":10,"seq":%d}`, 59-i, stored-i))
+		}
+		return out
+	}
+	ts := readServer(t, st, Options{})
+	for _, path := range []string{"targets", "loops", "outages", "path-changes",
+		"cycles?agent=lab&target=dc1.example&protocol=icmp", "cycles?agent=lab&target=dc1.example"} {
+		for _, tc := range []struct {
+			stored, rows int
+			truncated    bool
+		}{{3, 2, true}, {2, 2, false}, {1, 1, false}} {
+			stored = tc.stored
+			st.params = nil
+			var body struct {
+				Rows []struct {
+					Seq int `json:"seq"`
+				} `json:"rows"`
+				Truncated bool `json:"truncated"`
+			}
+			sep := "?"
+			if strings.Contains(path, "?") {
+				sep = "&"
+			}
+			if code := getJSON(t, ts.URL+"/api/v1/query/"+path+sep+"limit=2", &body); code != http.StatusOK {
+				t.Fatalf("%s: status %d", path, code)
+			}
+			if len(body.Rows) != tc.rows || body.Truncated != tc.truncated || body.Rows[0].Seq != tc.stored {
+				t.Errorf("%s with %d rows stored: %v, truncated %v; want %d, truncated %v", path, tc.stored,
+					body.Rows, body.Truncated, tc.rows, tc.truncated)
+			}
+			if p := st.params[0]; p["limit"] != "3" {
+				t.Errorf("%s: asked for %s rows, want 3", path, p["limit"])
+			}
+		}
 	}
 }
 

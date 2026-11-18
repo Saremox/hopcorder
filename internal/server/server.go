@@ -700,12 +700,25 @@ const streamFilter = `({agent:String} = '' OR agent_id = {agent:String})
 	AND ({flow:Int32} < 0 OR flow_id = {flow:Int32})`
 
 // runQuery streams the rows of q as {"rows": [...], "truncated": false},
-// row by row, within MaxResponseBytes ("truncated": true when rows were
-// left out).
-func (s *Server) runQuery(w http.ResponseWriter, r *http.Request, q string, qp queryParams, reshape func(json.RawMessage) (any, error)) {
+// row by row, within MaxResponseBytes and qp.limit rows ("truncated": true
+// when rows were left out, by either, or when more says a first query left
+// some out). q reads {limit:UInt32} rows, which runQuery sets to one more
+// than qp.limit: that row is not sent, it tells that the limit cut the
+// list (review round five: a list cut at its limit said "truncated":
+// false).
+func (s *Server) runQuery(w http.ResponseWriter, r *http.Request, q string, qp queryParams, more bool,
+	reshape func(json.RawMessage) (any, error)) {
 	js := newJSONStream(w, s.opts.MaxResponseBytes, streamFlushBytes)
+	js.truncated = more
 	js.beginArray("rows")
+	qp.params["limit"] = strconv.Itoa(qp.limit + 1)
+	n := 0
 	err := s.opts.Store.Query(r.Context(), q, qp.params, func(m json.RawMessage) error {
+		if n == qp.limit {
+			js.truncated = true
+			return errPartFull
+		}
+		n++
 		b := []byte(m)
 		if reshape != nil {
 			v, err := reshape(m)
@@ -718,7 +731,7 @@ func (s *Server) runQuery(w http.ResponseWriter, r *http.Request, q string, qp q
 		}
 		return js.row(b)
 	})
-	if err != nil && !errors.Is(err, errResponseFull) {
+	if err != nil && !errors.Is(err, errResponseFull) && !errors.Is(err, errPartFull) {
 		s.queryFailed(r, js, "", err)
 		return
 	}
@@ -762,7 +775,7 @@ func (s *Server) handleTargets(w http.ResponseWriter, r *http.Request) {
 		FROM cycles WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND `+streamFilter+`
 		GROUP BY agent_id, target, protocol, flow_id ORDER BY agent_id, target, protocol, flow_id
 		LIMIT {limit:UInt32}
-		SETTINGS max_rows_to_group_by = `+strconv.Itoa(groups)+`, group_by_overflow_mode = 'any'`, qp, nil)
+		SETTINGS max_rows_to_group_by = `+strconv.Itoa(groups)+`, group_by_overflow_mode = 'any'`, qp, false, nil)
 }
 
 // apiHop is a hop as the read API returns it: the wire hop plus enrichment.
@@ -847,15 +860,15 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 	if qp.params["flow"] != "-1" {
 		window += ` AND flow_id = {flow:Int32}`
 	}
-	stream, cut := ` AND protocol = {protocol:String}`, ""
+	stream, cut, more := ` AND protocol = {protocol:String}`, "", false
 	if qp.params["protocol"] == "" {
-		n, last, err := s.rowsThatFit(r.Context(), `SELECT ts, 0 AS bytes `+window+`
-			ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp.params)
+		n, last, left, err := s.rowsThatFit(r.Context(), `SELECT ts, 0 AS bytes `+window+`
+			ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp.params, qp.limit)
 		if err != nil {
 			s.queryFailed(r, newJSONStream(w, 0, 0), "", err)
 			return
 		}
-		qp.params["limit"], qp.params["last"] = strconv.Itoa(n), last
+		qp.limit, qp.params["last"], more = n, last, left
 		stream, cut = "", ` AND ts >= {last:DateTime64(3, 'UTC')}`
 		if order == "ASC" {
 			cut = ` AND ts <= {last:DateTime64(3, 'UTC')}`
@@ -865,7 +878,7 @@ func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
 		path_hash, loops.ip, loops.ttls, hops.ttl, hops.status, hops.ip, hops.rtt_us, hops.code, hops.asn,
 		hops.as_name, hops.name, hops.mpls
 		`+window+stream+cut+`
-		ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp, func(m json.RawMessage) (any, error) {
+		ORDER BY ts `+order+` LIMIT {limit:UInt32}`, qp, more, func(m json.RawMessage) (any, error) {
 		var c row
 		if err := json.Unmarshal(m, &c); err != nil {
 			return nil, err
@@ -912,31 +925,37 @@ func (s *Server) handlePathChanges(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	const from = `FROM path_changes FINAL WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND ` + streamFilter
-	n, oldest, err := s.rowsThatFit(r.Context(), `SELECT ts, `+pathChangeBytes+` AS bytes `+from+`
+	n, oldest, more, err := s.rowsThatFit(r.Context(), `SELECT ts, `+pathChangeBytes+` AS bytes `+from+`
 		ORDER BY ts DESC LIMIT {limit:UInt32}
-		SETTINGS query_plan_execute_functions_after_sorting = 0`, qp.params)
+		SETTINGS query_plan_execute_functions_after_sorting = 0`, qp.params, qp.limit)
 	if err != nil {
 		s.queryFailed(r, newJSONStream(w, 0, 0), "", err)
 		return
 	}
-	qp.params["limit"], qp.params["oldest"] = strconv.Itoa(n), oldest
+	qp.limit, qp.params["oldest"] = n, oldest
 	s.runQuery(w, r, `SELECT ts, agent_id, target, protocol, flow_id, seq, reason, ttls, from_ips, to_ips,
 		prev_seq, prev_path_hash, path_hash, prev_path_len, path_len
 		`+from+` AND ts >= {oldest:DateTime64(3, 'UTC')}
-		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, nil)
+		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, more, nil)
 }
 
 // rowsThatFit runs q, which returns the ts and a lower bound of the JSON
 // size (bytes) of the rows a query would return, in its order, and returns
 // how many of those rows to read and the ts of the last: the rows up to
 // and including the first one past the response budget (which cuts the
-// response there at the latest, since it counts at least as many bytes).
-// The query that then reads them whole sorts only the rows from that ts on.
-// Without rows, last is the start of the window.
-func (s *Server) rowsThatFit(ctx context.Context, q string, params clickhouse.Params) (n int, last string, err error) {
+// response there at the latest, since it counts at least as many bytes),
+// and at most limit. more reports rows beyond limit: q reads
+// {limit:UInt32} rows, which rowsThatFit sets to limit+1. The query that
+// then reads them whole sorts only the rows from that ts on. Without rows,
+// last is the start of the window.
+func (s *Server) rowsThatFit(ctx context.Context, q string, params clickhouse.Params, limit int) (n int, last string, more bool, err error) {
 	var total int64
 	var ts time.Time
-	err = s.opts.Store.Query(ctx, q, params, func(m json.RawMessage) error {
+	err = s.opts.Store.Query(ctx, q, withParam(params, "limit", strconv.Itoa(limit+1)), func(m json.RawMessage) error {
+		if n == limit {
+			more = true
+			return errPartFull
+		}
 		var row struct {
 			TS    time.Time `json:"ts"`
 			Bytes int64     `json:"bytes"`
@@ -950,13 +969,13 @@ func (s *Server) rowsThatFit(ctx context.Context, q string, params clickhouse.Pa
 		}
 		return nil
 	})
-	if err != nil && !errors.Is(err, errResponseFull) {
-		return 0, "", err
+	if err != nil && !errors.Is(err, errResponseFull) && !errors.Is(err, errPartFull) {
+		return 0, "", false, err
 	}
 	if n == 0 {
-		return 0, params["from"], nil
+		return 0, params["from"], more, nil
 	}
-	return n, clickhouse.Time(ts), nil
+	return n, clickhouse.Time(ts), more, nil
 }
 
 func (s *Server) handleLoops(w http.ResponseWriter, r *http.Request) {
@@ -967,7 +986,7 @@ func (s *Server) handleLoops(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runQuery(w, r, `SELECT ts, agent_id, target, protocol, flow_id, seq, loop_ip, ttls
 		FROM loop_events WHERE ts >= {from:DateTime64(3, 'UTC')} AND ts < {to:DateTime64(3, 'UTC')} AND `+streamFilter+`
-		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, nil)
+		ORDER BY ts DESC LIMIT {limit:UInt32}`, qp, false, nil)
 }
 
 // handleOutages returns reachability-loss windows overlapping [from, to);
@@ -983,5 +1002,5 @@ func (s *Server) handleOutages(w http.ResponseWriter, r *http.Request) {
 		cycles, last_hop_ttl, last_hop_ip
 		FROM outages FINAL WHERE start_ts < {to:DateTime64(3, 'UTC')}
 		AND (end_ts IS NULL OR end_ts >= {from:DateTime64(3, 'UTC')}) AND `+streamFilter+`
-		ORDER BY start_ts DESC LIMIT {limit:UInt32}`, qp, nil)
+		ORDER BY start_ts DESC LIMIT {limit:UInt32}`, qp, false, nil)
 }

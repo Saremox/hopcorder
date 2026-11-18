@@ -166,6 +166,19 @@ export interface TimeRange {
   to: number
 }
 
+/** How many rows of a list the UI asks for: the read API's largest limit. */
+export const LIST_LIMIT = 10000
+
+/**
+ * A list as the read API returns it, newest first (streams by name).
+ * truncated: the server left the rest out, at the limit or at its response
+ * budget, so rows are not all the range has.
+ */
+export interface List<T> {
+  rows: T[]
+  truncated: boolean
+}
+
 export class APIError extends Error {
   constructor(
     message: string,
@@ -218,30 +231,35 @@ export class Client {
     return (await this.get<{ rows: T[] }>(endpoint, params, signal)).rows
   }
 
+  private async list<T>(endpoint: string, params: Record<string, string | number | undefined>, signal?: AbortSignal): Promise<List<T>> {
+    const body = await this.get<{ rows: T[]; truncated?: boolean }>(endpoint, { ...params, limit: LIST_LIMIT }, signal)
+    return { rows: body.rows, truncated: body.truncated === true }
+  }
+
   private static stream(s: StreamKey, r: TimeRange) {
     return { agent: s.agent, target: s.target, protocol: s.protocol, flow_id: s.flow, from: Math.floor(r.from), to: Math.ceil(r.to) }
   }
 
   /** The streams with cycles in the range; with match, those it matches (empty fields match any). */
-  targets(r: TimeRange, signal?: AbortSignal, match?: StreamKey): Promise<Stream[]> {
+  targets(r: TimeRange, signal?: AbortSignal, match?: StreamKey): Promise<List<Stream>> {
     const m = match ? Client.stream(match, r) : { from: Math.floor(r.from), to: Math.ceil(r.to) }
-    return this.rows('targets', { ...m, limit: 10000 }, signal)
+    return this.list('targets', m, signal)
   }
 
   topology(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<Topology> {
     return this.get('topology', Client.stream(s, r), signal)
   }
 
-  pathChanges(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<PathChange[]> {
-    return this.rows('path-changes', { ...Client.stream(s, r), limit: 10000 }, signal)
+  pathChanges(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<List<PathChange>> {
+    return this.list('path-changes', Client.stream(s, r), signal)
   }
 
-  outages(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<Outage[]> {
-    return this.rows('outages', { ...Client.stream(s, r), limit: 10000 }, signal)
+  outages(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<List<Outage>> {
+    return this.list('outages', Client.stream(s, r), signal)
   }
 
-  loops(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<LoopEvent[]> {
-    return this.rows('loops', { ...Client.stream(s, r), limit: 10000 }, signal)
+  loops(s: StreamKey, r: TimeRange, signal?: AbortSignal): Promise<List<LoopEvent>> {
+    return this.list('loops', Client.stream(s, r), signal)
   }
 
   /** The last cycle at or before `at` within the range, else the first after it. */

@@ -187,6 +187,35 @@ test('a failed load shows no other stream or range', async ({ page }) => {
   await notLoaded(TARGET)
 })
 
+// A list the server cut (at the limit, 10,000 rows) says so: its count has
+// a "+", and a note says only the newest are listed and counted. Before,
+// 24,000 loops showed as "Loops 10000" with no note (review round five).
+// Seeding past the limit takes long, so the server's answers are marked cut
+// here, as the server marks them.
+test('a cut list says so', async ({ page }) => {
+  await page.route(/\/api\/v1\/query\/(loops|targets)\?/, async (route) => {
+    const resp = await route.fetch()
+    await route.fulfill({ response: resp, json: { ...(await resp.json()), truncated: true } })
+  })
+  await page.goto(`./ui/${streamHash}`)
+  const stats = page.locator('.stats')
+  await expect(stats).toContainText('Loops6+')
+  await expect(stats).toContainText('Route changes3Outages2')
+  await expect(page.locator('.list-note')).toHaveText(
+    'Only the newest 6 loops of this range are listed and counted; there are more. Pick a shorter range for all of them.',
+  )
+  const tab = page.getByRole('tab', { name: /Loops/ })
+  await expect(tab).toContainText('6+')
+  await tab.click()
+  await expect(page.locator('.events .list-end')).toHaveText('The newest 6 only; the range has more.')
+  await page.getByRole('tab', { name: /Route changes/ }).click()
+  await expect(page.locator('.events .list-end')).toHaveCount(0)
+
+  await page.goto('./')
+  await expect(page.locator('.streams .panel-head')).toContainText(/\d+ of \d+\+/)
+  await expect(page.locator('.streams .list-note')).toContainText('more streams than the list holds')
+})
+
 // Links from before flows were part of a stream have no flow_id.
 test('a link without flow_id opens its only stream', async ({ page }) => {
   await page.goto(`./ui/#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&range=6h`)

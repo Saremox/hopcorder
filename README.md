@@ -741,8 +741,8 @@ reachability per time bucket (`timeline`, at most 400 buckets); nodes and
 edges are capped (and so are the distinct ones ClickHouse aggregates, 20,000
 of each: beyond, they are the busiest of those it came across first). Every
 response is bounded by `query.max_response_bytes`
-(32 MiB, streamed as the rows arrive): rows beyond it are left out, and
-`truncated: true` says so (`false` otherwise); `topology` fills its
+(32 MiB, streamed as the rows arrive): rows beyond it, or beyond `limit`,
+are left out, and `truncated: true` says so (`false` otherwise); `topology` fills its
 `timeline` first. `targets` aggregates at most `ingest.max_streams` streams
 (or `limit`, if more). Responses carry `Cache-Control: no-store` and
 `X-Content-Type-Options: nosniff`.
