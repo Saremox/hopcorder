@@ -629,7 +629,10 @@ groups:
   files, or `max_bytes` larger than the disk), the spool keeps to the file it
   has, again dropping the oldest records first, and grows again once there is
   room. A file larger than `max_bytes` (from an earlier version, or a lower
-  setting) keeps its size, with at most `max_bytes` of it in use.
+  setting) keeps its size, with at most `max_bytes` of it in use. However
+  much of the file is free (after a backlog was delivered), a write costs
+  only the pages it changes: the spool keeps no list of its free pages on
+  disk, and finds them again when it opens.
 - **A corrupt spool file** (its page structure or consistency check fails at
   start, or bbolt faults or panics on it while the agent runs) is renamed to
   `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from

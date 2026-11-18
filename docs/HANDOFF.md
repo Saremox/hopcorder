@@ -529,7 +529,10 @@ added in the commit that introduced it.
   high-water mark of the pages in use. Since round six of the review
   `max_bytes` bounds the file, B+tree included (see there); before, it
   bounded the stored compressed bytes, and the file grew to about 1.5 times
-  that, which a volume as large as `max_bytes` did not hold.
+  that, which a volume as large as `max_bytes` did not hold. Since round
+  seven bbolt writes no freelist (`NoFreelistSync`): it finds the free pages
+  as it opens the file, and a commit writes only the pages it changed (see
+  there).
 - **Spool consumers**: every shipping output (`jsonl`, `http`) is a spool
   consumer with its own cursor and drain loop, so `jsonl` is crash-safe too
   (it may repeat lines after a crash; dedup on `(agent_id, seq)`). Metrics are
@@ -3686,7 +3689,7 @@ decisions:
     `bolt.Open` rebuilds the freelist with a walk whose errors panic in a
     goroutine of bbolt's own (fatal, never quarantined) unless `checkPages`
     first checked everything that walk does (branch key order among it).
-    Left for the owner.
+    Left for the owner. (Done in round seven; see there.)
 
 
 ### Security and correctness review, round seven
@@ -4045,3 +4048,82 @@ decisions:
     check adds on one rests on reasoning: tmpfs overwrites in place, and
     "holes" also passes without the check. A FUSE file system that reports
     a size but no free space stops the spool at its first reserve.
+- **bbolt writes no freelist** (`boltOptions`, `internal/spool/spool.go`;
+  round five's medium, left open in rounds six and seven until now). The
+  spool opened bbolt with its defaults, so every commit wrote and synced the
+  freelist, the id of every free page. Once a backlog had filled the file
+  and been delivered, nearly every page was free, and every Append and
+  every Ack wrote 8 bytes per page of the file, for good, restarts
+  included. Measured with the chart's `max_bytes` (768 MiB: a 712 MiB file,
+  1,240,000 records delivered 500 an Ack): 1,412.7 KiB written and 4.29 ms
+  an append, 2,808 KiB and 8.9 ms an append with its Ack, 723 KiB an Ack
+  while delivering (review, round five: 2,067 KiB an append at about 1
+  GiB). Now:
+  - `NoFreelistSync`: bbolt keeps the freelist in memory only, and as it
+    opens a file takes every page its tree does not reach for free. The same
+    measurement: 16.7 KiB and 0.89 ms an append, 16.0 KiB and 1.8 ms an
+    append with its Ack, also after a restart, and 24 KiB an Ack while
+    delivering (2.9 s for the backlog instead of 6.7 s).
+  - The freelist stays bbolt's array (`FreelistArrayType`): it hands out the
+    lowest free pages first, and the same operations give the same file, so
+    a case of the damage corpus is the same damage on every run. Its cost
+    per commit grows with the free pages (it merges their ids, as it did
+    before): the map freelist took 0.29 instead of 0.89 ms an append in the
+    same measurement, with a layout that differs from run to run (it picks
+    among free spans in map order). Not done either: the review's other
+    option, compacting the file when most of it is free (a second file of up
+    to `max_bytes`, and a rename to keep crash-safe).
+  - Why it was left open: bbolt's walk for the free pages (`freepages`)
+    runs in a goroutine of its own and reports what its consistency check
+    would, keys out of order among it, by a panic in the opening goroutine.
+    `guard` recovers that, but the walk goes on, on the transaction the
+    panic rolled back, and now and then dereferences nil there: fatal. So
+    `checkPages` now checks everything that walk relies on before bbolt
+    opens the file: pages and elements as before, no key longer than bbolt's
+    `MaxKeySize`, and every bucket's keys in the order bbolt's
+    `recursivelyCheckPageKeyOrderInternal` wants (`keyOrder`; nil and empty
+    keys as there). That costs a read of every tree page's first page
+    instead of its element array: opening the 712 MiB file with its backlog
+    took 0.90 s instead of 0.54 s; after delivery 36 ms, as before.
+  - A file with a freelist (bbolt's default options) is still read and
+    checked as before; its first commit drops the freelist.
+  - The room logic (round six) is unchanged: bbolt counts the free and
+    pending pages after each write transaction as before, and at open the
+    free ones are those its walk found. A commit needs no pages for a
+    freelist any more, so the reserve has more than it needs. An empty
+    commit still rolls back: it would write and sync a meta page.
+  - Tests: `TestCommitsAfterBacklogWriteLittle` (default run): a backlog of
+    about 60 MiB, built in bulk, delivered 500 records an Ack, then 100
+    appends, before and after a restart: 16.9 KiB written an append, at
+    most 32 KiB allowed; before, 123 KiB. `TestDirectedDamageIsQuarantined`
+    has three cases of keys out of order (two keys of a leaf swapped, a
+    branch key equal to the one before, one above its child's keys) and
+    requires every case to be found by the checks, not by bbolt's walk.
+    Without `keyOrder`, bbolt's walk found them, and 75 of 900 concurrent
+    opens crashed ("invalid memory address or nil pointer dereference"),
+    12 of them before the file was moved aside; with it, none. The directed
+    cases and the damage corpus run on the file as the spool writes it and
+    with a freelist, and the corpus requires the same of every case. A
+    leaf's overflow over a free page is no damage without a freelist (the
+    page becomes the leaf's): kept, and the spool works.
+    `HOPCORDER_SPOOL_CORPUS=3000`: every case in both formats kept or
+    quarantined, but case 1025 when its flipped bit raises a cursor (below).
+    Crash safety: `TestKill9`, and the review's 60 rounds of kill -9 at the
+    bound, with and without `fallocate`: no quarantine, no gap, the newest
+    records kept.
+  - Accepted: damage that makes a page in use unreachable, or points a
+    branch at a stale free page with a valid header, is no longer seen: the
+    freelist was a second account of the pages that showed it. The spool
+    then reuses a page with records on it (lost) or serves stale records
+    again (the server deduplicates them). Pages carry no checksums, and
+    damage to values went unseen before as well.
+  - Found, not fixed (the owner's call; also before this change): damage
+    that raises a cursor, or the last record's key, past `next_seq` stalls
+    that output for good. A flipped bit in cursor "a" (corpus case 1025 of
+    3,000 on this layout, when bit 28 of the clock is clear; on the
+    previous layout, case 473 raised cursor "b", which the child does not
+    read back) or the newest key raised by a damaged word (the review's
+    at-bound corpus, case 834 of 1,000, before and after this change): the
+    output delivers that seq, acknowledges it, and every later record lies
+    below its cursor. Refusing a cursor or key above `next_seq - 1` at
+    open would end it.

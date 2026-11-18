@@ -15,10 +15,10 @@ import (
 
 // The size bound and a full file system (review, round six).
 //
-// Options.MaxBytes bounds the database file, every page of it: the records,
-// the B+tree around them and bbolt's freelist. Counting only the stored
-// record bytes, as the spool did before, let the file grow to about 1.5
-// times the bound; on a volume as large as the bound the file system filled
+// Options.MaxBytes bounds the database file, every page of it: the records
+// and the B+tree around them. Counting only the stored record bytes, as
+// the spool did before, let the file grow to about 1.5 times the bound; on
+// a volume as large as the bound the file system filled
 // first, and from then on every Append failed: the newest records were
 // lost, the oldest kept, the reverse of §5.2, and none counted as dropped.
 // An Ack deleting many records failed too, since bbolt writes every change,
@@ -51,8 +51,7 @@ const (
 	maxReserve      = 1 << 20
 	minReservePages = 16
 	// txDeletes bounds the records one transaction deletes, so that the
-	// pages it needs (rewritten branches, a larger freelist) stay within the
-	// reserve.
+	// pages it needs (rewritten branches) stay within the reserve.
 	txDeletes = 1024
 	// roomRounds bounds how often an operation that found no room drops
 	// records and runs again.
@@ -314,7 +313,7 @@ func (s *Spool) change(run func(txFunc) error, fn txFunc) error {
 }
 
 // errNothing rolls back a transaction that has nothing to do: even an
-// empty commit writes a new freelist page.
+// empty commit writes and syncs a meta page.
 var errNothing = errors.New("nothing to do")
 
 // dropOldest deletes the oldest records in a transaction of its own (by

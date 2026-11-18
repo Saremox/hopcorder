@@ -53,8 +53,8 @@ var (
 type Options struct {
 	Dir    string
 	MaxAge time.Duration
-	// MaxBytes bounds the database file, every page of it (the records, the
-	// B+tree around them, bbolt's freelist), not only the stored records.
+	// MaxBytes bounds the database file, every page of it (the records and
+	// the B+tree around them), not only the stored records.
 	// At least MinMaxBytes. A file already larger keeps its size, and the
 	// spool keeps no more than MaxBytes of it in use.
 	MaxBytes int64
@@ -242,6 +242,19 @@ func guard(fn func() error) (err error) {
 	return fn()
 }
 
+// boltOptions are the options the spool opens its file with. bbolt writes
+// no freelist (review, round five): with one, every commit wrote the id of
+// every free page, which after a delivered backlog was up to 2 MiB a
+// commit, and forever. Instead bbolt finds the free pages as the pages its
+// tree does not reach when it opens the file, with a walk that checkPages
+// has checked everything of first: that walk runs in a goroutine of
+// bbolt's own and panics on what it finds, which nothing can recover. The
+// freelist is bbolt's array: it hands out the lowest free pages first, and
+// the same operations give the same file.
+func boltOptions() *bolt.Options {
+	return &bolt.Options{Timeout: time.Second, NoFreelistSync: true, FreelistType: bolt.FreelistArrayType}
+}
+
 // openDB opens the spool file and checks it: first its page structure
 // (checkPages, under a shared lock), then every key and value and bbolt's
 // own consistency check (checkDB). An error wraps errCorrupt if the file is
@@ -255,7 +268,7 @@ func openDB(path string) (*bolt.DB, error) {
 			}
 		}
 		var err error
-		db, err = bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+		db, err = bolt.Open(path, 0o600, boltOptions())
 		if err := openError(err); err != nil {
 			return err
 		}
@@ -275,8 +288,9 @@ func openDB(path string) (*bolt.DB, error) {
 
 // checkFile checks the page structure of an existing spool file while a
 // read-only bbolt holds a shared lock on it: that open reads only the meta
-// pages (a writable one would load the freelist), and it waits for, then
-// gives up on, a process that has the file open for writing.
+// pages (a writable one would load the freelist, or walk the tree for it),
+// and it waits for, then gives up on, a process that has the file open for
+// writing.
 func checkFile(path string) error {
 	ro, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true, Timeout: time.Second})
 	if err := openError(err); err != nil {
@@ -303,7 +317,7 @@ func openError(err error) error {
 }
 
 // checkDB reads every key and value, then runs bbolt's consistency check
-// (page structure and freelist).
+// (page structure, key order and freelist).
 //
 // checkPages has made sure before that no element points outside its page,
 // no overflow count beyond the file, and that the pages form a tree without

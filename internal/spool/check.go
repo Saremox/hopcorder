@@ -1,12 +1,15 @@
 package spool
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"os"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // bbolt's on-disk format (version 2, unchanged since boltdb), as far as the
@@ -45,22 +48,28 @@ type boltMeta struct {
 // pages carry no checksums, and bbolt trusts them. A damaged page can then
 // make bbolt fault on the mapping (a fatal error in a goroutine that has not
 // asked for panics), loop about 2^32 times (an overflow count), recurse
-// without end (a page that is its own child) or free a page twice. The
-// check returns an error for any of these and costs one read of each page's
-// header and element array:
+// without end (a page that is its own child) or free a page twice. And a
+// file without a freelist, as the spool writes them (see boltOptions),
+// makes bbolt walk the tree as it opens the file, in a goroutine of its own
+// that panics on anything its consistency check would report, keys out of
+// order among it. The check returns an error for any of these and costs one
+// read of the first page of every page in the tree:
 //
 //   - the meta page bbolt uses, chosen as bbolt chooses it (see meta): the
 //     page size ps, the high water mark within the file, root and freelist
-//     below it;
+//     (if any) below it;
 //   - every page reachable from the root, and the freelist page: its id,
 //     type and overflow within the high water mark, and no page reached
 //     twice (which also rules out cycles), counted, or freed;
-//   - every element within its page's span, branch pages not empty, the
-//     tree at most maxTreeDepth deep;
+//   - every element within its page's span, keys no longer than bbolt
+//     allows, branch pages not empty, the tree at most maxTreeDepth deep;
+//   - the keys of every bucket in order, as bbolt's consistency check has
+//     them (see keyOrder);
 //   - the root bucket holds only buckets, and those hold none (the spool
 //     has no nested buckets), inline ones included;
-//   - the freelist: ids within the file, none twice, none reachable, and
-//     every page below the high water mark reachable or free.
+//   - the freelist, if the file has one: ids within the file, none twice,
+//     none reachable, and every page below the high water mark reachable or
+//     free. Without one, bbolt takes every page it does not reach for free.
 //
 // The caller holds a lock on the file, so nobody writes it meanwhile.
 func checkPages(path string, ps int) error {
@@ -112,14 +121,16 @@ func (c *pageCheck) run() error {
 	c.free = make([]uint64, (c.hwm+63)/64)
 	setBit(c.seen, 0)
 	setBit(c.seen, 1)
-	if m.freelist == noFreelist {
-		return errors.New("no freelist (the spool always writes one)")
+	if m.freelist != noFreelist {
+		if err := c.freelist(m.freelist); err != nil {
+			return fmt.Errorf("freelist page %d: %w", m.freelist, err)
+		}
 	}
-	if err := c.freelist(m.freelist); err != nil {
-		return fmt.Errorf("freelist page %d: %w", m.freelist, err)
-	}
-	if err := c.tree(m.root); err != nil {
+	if _, err := c.tree(visit{id: m.root, depth: 1, top: true}, nil, nil); err != nil {
 		return err
+	}
+	if m.freelist == noFreelist {
+		return nil
 	}
 	for id := range c.hwm {
 		if !bit(c.seen, id) && !bit(c.free, id) {
@@ -256,82 +267,137 @@ func (c *pageCheck) freelist(id uint64) error {
 	return nil
 }
 
-// tree checks every page reachable from the root bucket's root page.
-func (c *pageCheck) tree(root uint64) error {
-	type visit struct {
-		id, depth uint64
-		top       bool // a page of the root bucket, whose values are buckets
+// visit is a page of the tree to check.
+type visit struct {
+	id, depth uint64
+	top       bool // a page of the root bucket, whose values are buckets
+}
+
+// tree checks page v.id and every page below it, the trees of the root
+// bucket's buckets included, and returns the largest key below the page
+// (nil if there is none). The keys of each bucket must be in the order
+// bbolt's consistency check (recursivelyCheckPageKeyOrderInternal) wants,
+// which is also what bbolt's walk for the free pages panics on: those below
+// a branch element from its key (lo) to, not including, the next element's
+// (hi; nil: no bound), a branch element's key above the largest key below
+// the element before it, a leaf's keys increasing. A bucket's tree has keys
+// of its own.
+func (c *pageCheck) tree(v visit, lo, hi []byte) ([]byte, error) {
+	if v.depth > maxTreeDepth {
+		return nil, fmt.Errorf("page %d: tree deeper than %d", v.id, maxTreeDepth)
 	}
-	stack := []visit{{id: root, depth: 1, top: true}}
-	for len(stack) > 0 {
-		v := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		if v.depth > maxTreeDepth {
-			return fmt.Errorf("page %d: tree deeper than %d", v.id, maxTreeDepth)
+	flags, count, size, err := c.span(v.id)
+	if err != nil {
+		return nil, err
+	}
+	if bit(c.free, v.id) {
+		return nil, fmt.Errorf("page %d reachable and free", v.id)
+	}
+	for p := v.id + 1; p < v.id+size/c.ps; p++ {
+		if bit(c.free, p) {
+			return nil, fmt.Errorf("page %d (overflow of page %d) reachable and free", p, v.id)
 		}
-		flags, count, bytes, err := c.span(v.id)
+	}
+	if flags != flagBranch && flags != flagLeaf {
+		return nil, fmt.Errorf("page %d: type %#x, not a branch or leaf", v.id, flags)
+	}
+	kind, branch := "leaf", flags == flagBranch
+	if branch {
+		kind = "branch"
+	}
+	if branch && count == 0 {
+		return nil, fmt.Errorf("page %d: empty branch", v.id)
+	}
+	elems := pageHeaderSize + uint64(count)*elementSize
+	if elems > size {
+		return nil, fmt.Errorf("page %d: %d elements do not fit its %d bytes", v.id, count, size)
+	}
+	// The header and the elements, and with them, as a rule, the keys.
+	page, err := c.read(v.id*c.ps, min(size, max(elems, c.ps)))
+	if err != nil {
+		return nil, err
+	}
+	keys := make([][]byte, count)
+	for i := range uint64(count) {
+		e := page[pageHeaderSize+i*elementSize:]
+		at := pageHeaderSize + i*elementSize // the element's offset; pos counts from there
+		var pos, ksize, vsize uint64
+		if branch {
+			pos, ksize = uint64(ne.Uint32(e[0:])), uint64(ne.Uint32(e[4:]))
+		} else {
+			pos, ksize, vsize = uint64(ne.Uint32(e[4:])), uint64(ne.Uint32(e[8:])), uint64(ne.Uint32(e[12:]))
+		}
+		switch k := at + pos; {
+		case k < elems || k+ksize+vsize > size:
+			return nil, fmt.Errorf("page %d: %s element %d outside the page", v.id, kind, i)
+		case ksize > bolt.MaxKeySize:
+			return nil, fmt.Errorf("page %d: %s element %d has a %d-byte key", v.id, kind, i, ksize)
+		case k+ksize <= uint64(len(page)):
+			keys[i] = page[k : k+ksize]
+		default:
+			if keys[i], err = c.read(v.id*c.ps+k, ksize); err != nil {
+				return nil, err
+			}
+		}
+	}
+	prev, largest := lo, []byte(nil)
+	for i := range uint64(count) {
+		if err := keyOrder(i, keys[i], prev, hi); err != nil {
+			return nil, fmt.Errorf("page %d: %s element %d: %w", v.id, kind, i, err)
+		}
+		e := page[pageHeaderSize+i*elementSize:]
+		if branch {
+			next := hi
+			if i+1 < uint64(count) {
+				next = keys[i+1]
+			}
+			if largest, err = c.tree(visit{id: ne.Uint64(e[8:]), depth: v.depth + 1, top: v.top}, keys[i], next); err != nil {
+				return nil, err
+			}
+			prev = largest
+			continue
+		}
+		prev, largest = keys[i], keys[i]
+		eflags := ne.Uint32(e[0:])
+		switch {
+		case !v.top && eflags&flagBucket != 0:
+			return nil, fmt.Errorf("page %d: element %d is a nested bucket", v.id, i)
+		case v.top && eflags&flagBucket == 0:
+			return nil, fmt.Errorf("page %d: element %d of the root bucket is not a bucket", v.id, i)
+		case !v.top:
+			continue
+		}
+		at := pageHeaderSize + i*elementSize
+		pos, ksize, vsize := uint64(ne.Uint32(e[4:])), uint64(ne.Uint32(e[8:])), uint64(ne.Uint32(e[12:]))
+		if vsize < bucketValueSize {
+			return nil, fmt.Errorf("page %d: bucket %d has a %d-byte header", v.id, i, vsize)
+		}
+		val, err := c.read(v.id*c.ps+at+pos+ksize, vsize)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if bit(c.free, v.id) {
-			return fmt.Errorf("page %d reachable and free", v.id)
-		}
-		for p := v.id + 1; p < v.id+bytes/c.ps; p++ {
-			if bit(c.free, p) {
-				return fmt.Errorf("page %d (overflow of page %d) reachable and free", p, v.id)
+		if r := ne.Uint64(val); r != 0 {
+			if _, err := c.tree(visit{id: r, depth: v.depth + 1}, nil, nil); err != nil {
+				return nil, err
 			}
+		} else if err := checkInline(val[bucketValueSize:]); err != nil {
+			return nil, fmt.Errorf("page %d: inline bucket %d: %w", v.id, i, err)
 		}
-		if flags != flagBranch && flags != flagLeaf {
-			return fmt.Errorf("page %d: type %#x, not a branch or leaf", v.id, flags)
-		}
-		if flags == flagBranch && count == 0 {
-			return fmt.Errorf("page %d: empty branch", v.id)
-		}
-		elems := pageHeaderSize + uint64(count)*elementSize
-		if elems > bytes {
-			return fmt.Errorf("page %d: %d elements do not fit its %d bytes", v.id, count, bytes)
-		}
-		page, err := c.read(v.id*c.ps, elems)
-		if err != nil {
-			return err
-		}
-		for i := range uint64(count) {
-			e := page[pageHeaderSize+i*elementSize:]
-			at := pageHeaderSize + i*elementSize // the element's offset; pos counts from there
-			if flags == flagBranch {
-				pos, ksize := uint64(ne.Uint32(e[0:])), uint64(ne.Uint32(e[4:]))
-				if at+pos < elems || at+pos+ksize > bytes {
-					return fmt.Errorf("page %d: branch element %d outside the page", v.id, i)
-				}
-				stack = append(stack, visit{id: ne.Uint64(e[8:]), depth: v.depth + 1, top: v.top})
-				continue
-			}
-			eflags := ne.Uint32(e[0:])
-			pos, ksize, vsize := uint64(ne.Uint32(e[4:])), uint64(ne.Uint32(e[8:])), uint64(ne.Uint32(e[12:]))
-			if at+pos < elems || at+pos+ksize+vsize > bytes {
-				return fmt.Errorf("page %d: leaf element %d outside the page", v.id, i)
-			}
-			switch {
-			case !v.top && eflags&flagBucket != 0:
-				return fmt.Errorf("page %d: element %d is a nested bucket", v.id, i)
-			case v.top && eflags&flagBucket == 0:
-				return fmt.Errorf("page %d: element %d of the root bucket is not a bucket", v.id, i)
-			case !v.top:
-				continue
-			}
-			if vsize < bucketValueSize {
-				return fmt.Errorf("page %d: bucket %d has a %d-byte header", v.id, i, vsize)
-			}
-			val, err := c.read(v.id*c.ps+at+pos+ksize, vsize)
-			if err != nil {
-				return err
-			}
-			if r := ne.Uint64(val); r != 0 {
-				stack = append(stack, visit{id: r, depth: v.depth + 1})
-			} else if err := checkInline(val[bucketValueSize:]); err != nil {
-				return fmt.Errorf("page %d: inline bucket %d: %w", v.id, i, err)
-			}
-		}
+	}
+	return largest, nil
+}
+
+// keyOrder is bbolt's verifyKeyOrder: an error unless key, element i of
+// its page, is below hi (nil: no bound) and, if it is the first, at least
+// prev (nil: no bound), else above prev.
+func keyOrder(i uint64, key, prev, hi []byte) error {
+	switch {
+	case i == 0 && prev != nil && bytes.Compare(prev, key) > 0:
+		return errors.New("key below its branch element's")
+	case i > 0 && bytes.Compare(prev, key) >= 0:
+		return errors.New("key not above the one before")
+	case hi != nil && bytes.Compare(key, hi) >= 0:
+		return errors.New("key not below the next branch element's")
 	}
 	return nil
 }
