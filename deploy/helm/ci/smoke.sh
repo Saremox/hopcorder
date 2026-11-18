@@ -135,6 +135,18 @@ for i in $(seq 90); do
         echo "ClickHouse's system logs are not all on the system_logs disk keeping a quarter free (or span log on)"
         exit 1
       fi
+      # The console (the node's container log) does not repeat a host name
+      # the read-only user passes to hasColumnInTable(): DNSResolver logged
+      # it four times, and again on each retry of the DNS cache, and
+      # Cluster once more, about 15 MB for a 1 MB name.
+      before=$(kubectl logs statefulset/hopcorder-server-clickhouse | wc -c)
+      chq "SELECT hasColumnInTable(concat('dnsprobe', repeat('a', 1000000), '.invalid:9000'), 'a', 'b', 'c')" >/dev/null 2>&1 && exit 1
+      sleep 2
+      grew=$(( $(kubectl logs statefulset/hopcorder-server-clickhouse | wc -c) - before ))
+      if [ "$grew" -ge 100000 ]; then
+        echo "ClickHouse's console grew $grew bytes for one hasColumnInTable() host name"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then

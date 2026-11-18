@@ -223,6 +223,22 @@ jobs:
           sleep 1
           grew=$(( $(logs) - before ))
           [ "$grew" -lt 1000000 ] || { echo "ClickHouse's log files grew $grew bytes for one failing query"; exit 1; }
+          # Nor a host name passed to hasColumnInTable(), up to 1 MB, which
+          # DNSResolver logged four times (and on each retry of the DNS
+          # cache) and Cluster once more.
+          docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client --user grafana --password grafana \
+            --query "SELECT hasColumnInTable(concat('dnsprobe', repeat('a', 100000), '.invalid:9000'), 'a', 'b', 'c')" \
+            >/dev/null 2>&1 && exit 1
+          sleep 1
+          if docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c \
+            'grep -a -E "(DNSResolver|Cluster): .*dnsprobe" /var/log/clickhouse-server/*' | grep -q .; then
+            echo "ClickHouse's DNSResolver or Cluster logger repeats a query's host name"; exit 1
+          fi
+          # Listeners: HTTP and the native protocol only (the PostgreSQL
+          # handlers also log a failing query's whole message).
+          ports=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c \
+            'awk "\$4 == \"0A\" { split(\$2, a, \":\"); print a[2] }" /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u | tr "\n" " "')
+          [ "$ports" = "1FBB 2328 " ] || { echo "ClickHouse listens on (hex) $ports, not 8123 and 9000 only"; exit 1; }
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -486,8 +502,11 @@ jobs:
           grep -qF '<keep_free_space_ratio>0.25</keep_free_space_ratio>' <<<"$ch" || { echo "hopcorder.xml: no system_logs disk"; exit 1; }
           grep -qF '<opentelemetry_span_log remove="1"/>' <<<"$ch" || { echo "hopcorder.xml: opentelemetry_span_log is on"; exit 1; }
           # The loggers that repeat a failing query's message are off.
-          for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker; do
+          for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker DNSResolver Cluster; do
             grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
+          done
+          for l in mysql_port postgresql_port interserver_http_port; do
+            grep -qF "<$l remove=\"1\"/>" <<<"$ch" || { echo "hopcorder.xml: $l is open"; exit 1; }
           done
           if [ "$(grep -c '<storage_policy>system_logs</storage_policy><ttl>' <<<"$ch")" != 17 ]; then
             echo "hopcorder.xml: a system log off the system_logs disk"; exit 1

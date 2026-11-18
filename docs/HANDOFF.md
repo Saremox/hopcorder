@@ -4127,3 +4127,33 @@ decisions:
     output delivers that seq, acknowledges it, and every later record lies
     below its cursor. Refusing a cursor or key above `next_seq - 1` at
     open would end it.
+- **ClickHouse's `DNSResolver` and `Cluster` loggers are off, and so are
+  its MySQL, PostgreSQL and interserver listeners** (compose and the
+  chart's `hopcorder.xml`). The five loggers set to `fatal` above did not
+  cover a host name a query passes to `hasColumnInTable()`: a constant of
+  up to about 1 MB, which fails to resolve at once. `DNSResolver` logged
+  it four times (Warning), and again each time the DNS cache retried the
+  failed name (every 15 s, up to `dns_max_consecutive_failures`, 10), and
+  `Cluster` once more (Error, with a stack trace). Both are at or above
+  the chart's console level (`warning`): about 15 MB on the node's
+  container log per query of Grafana's read-only user, which kubelet
+  rotates only every 10 s (final sweep of review round seven, M1).
+  Measured with the rendered chart config, three queries with 1 MB
+  names: 15.0 MB on the console at once and 24.0 MB after 47 s before,
+  0 bytes after. Both loggers are now `fatal`; no hopcorder setup has a
+  cluster. The image's MySQL (9004), PostgreSQL (9005) and interserver
+  (9009) listeners are removed: hopcorder uses HTTP (and
+  `clickhouse-client` the native port), nothing reached them (neither the
+  chart's Service nor its NetworkPolicy has the ports), and the
+  PostgreSQL handlers also logged a failing query's whole message (16 MB
+  for a 4 MB query).
+  - Accepted (compose only, as before: low): compose's files log at
+    `trace`, where `Connection (<host>:<port>)`, a logger named after the
+    host, and `HedgedConnectionsFactory` (Information) still write the
+    name, about 1 MB a query, within the files' 10M × 2 cap.
+  - Checks: CI's `grafana` job requires that compose's log files hold no
+    `DNSResolver` or `Cluster` line with a 100 KB host name passed to
+    `hasColumnInTable()`, and that ClickHouse listens on 8123 and 9000
+    only (both failed before); the helm job checks the rendered levels and
+    the removed ports; `deploy/helm/ci/smoke.sh` requires the console to
+    grow by less than 100 KB for a 1 MB name (not run here: no kind).

@@ -73,8 +73,20 @@ data:
                 <logger><name>HTTPHandler</name><level>fatal</level></logger>
                 <logger><name>TCPHandler</name><level>fatal</level></logger>
                 <logger><name>BackupsWorker</name><level>fatal</level></logger>
+                <!-- A host name a query passes to hasColumnInTable() (up
+                     to 1 MB): logged four times when it fails to resolve,
+                     again each time the DNS cache retries it, and once more
+                     by Cluster, about 15 MB per query (review round seven). -->
+                <logger><name>DNSResolver</name><level>fatal</level></logger>
+                <logger><name>Cluster</name><level>fatal</level></logger>
             </levels>
         </logger>
+        <!-- No MySQL, PostgreSQL or interserver listener: the server uses
+             HTTP, and the PostgreSQL handlers also log a failing query's
+             whole message. -->
+        <mysql_port remove="1"/>
+        <postgresql_port remove="1"/>
+        <interserver_http_port remove="1"/>
         <mark_cache_size>268435456</mark_cache_size>
         <index_mark_cache_size>67108864</index_mark_cache_size>
         <uncompressed_cache_size>134217728</uncompressed_cache_size>

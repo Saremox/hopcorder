@@ -193,6 +193,12 @@ The section for a version is the text of its GitHub release.
   free pages again when the spool opens (which takes a little longer with a
   large backlog), so a write costs about 17 KiB. Spool files written before
   are read as they are.
+- ClickHouse (compose and the chart's bundled ClickHouse) no longer writes
+  a host name a query passes to `hasColumnInTable()` to its log: up to
+  1 MB, about 15 MB of the chart's console log per query of Grafana's
+  read-only user, from the `DNSResolver` and `Cluster` loggers, which are
+  now set to `fatal`. Its unused MySQL, PostgreSQL and interserver
+  listeners are removed.
 
 **Security: server ingest**
 
