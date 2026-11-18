@@ -50,7 +50,19 @@ policy (the image gives it an engine), is off; hopcorder does not trace.
     </logger>
     <!-- No MySQL, PostgreSQL or interserver listener: hopcorder uses HTTP
          (and clickhouse-client the native port), and the PostgreSQL
-         handlers also log a failing query's whole message. -->
+         handlers also log a failing query's whole message. The native
+         port listens on loopback only (for clickhouse-client in the
+         container and the image's init scripts): before its password
+         check ClickHouse reserves memory for the user name a login
+         declares, up to 1 GiB, so two connections from anywhere
+         OOM-killed it, and a query's hasColumnInTable() could make it log
+         in to itself with a 1 MB name (review round eight). [::1] is
+         skipped, with a warning, where there is no IPv6. -->
+    <tcp_port remove="1"/>
+    <protocols>
+        <native_ipv4><type>tcp</type><host>127.0.0.1</host><port>9000</port></native_ipv4>
+        <native_ipv6><type>tcp</type><host>::1</host><port>9000</port></native_ipv6>
+    </protocols>
     <mysql_port remove="1"/>
     <postgresql_port remove="1"/>
     <interserver_http_port remove="1"/>

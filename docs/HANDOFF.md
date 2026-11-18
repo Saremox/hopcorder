@@ -4582,3 +4582,38 @@ the ten round-seven mediums fixed (#66 to #75).
     before with the outages above; `TestRederivedPartClosesItsOutageOnce`
     (an outage of 20 and of 45 cycles closed in a part derived again)
     passes before and after and fails with the one-line fix.
+- **ClickHouse's native port listens on loopback only** (compose's
+  `clickhouse-config.xml` and the chart's `hopcorder.xml`: `<tcp_port
+  remove="1"/>` and a `native` protocol on `127.0.0.1:9000` and
+  `[::1]:9000`; review round eight, deploy F1, HIGH, and the read and deploy
+  reviewers' M1). Nothing of hopcorder uses the native protocol (the server
+  and Grafana use HTTP), but it listened on every address. Before its
+  password check, ClickHouse 25.8 reserves memory for the user name a
+  login packet declares, up to 1 GiB: with the chart's rendered config and
+  its 2Gi limit, one held connection added 1.2 GiB and two OOM-killed
+  ClickHouse (exit 137); at the CI values' 1Gi one sufficed, from about
+  1 KB sent, with no credentials. With a CNI that enforces the chart's
+  NetworkPolicy only the pod's own node reaches the port; without one (the
+  defaults of several distributions), any pod in the cluster, which could
+  then hold ClickHouse in restarts: ingest, the UI and Grafana down while it
+  lasts, the agents spooling. Also, Grafana's read-only user could make
+  ClickHouse log in to itself through a loopback address it does not count
+  as local (`hasColumnInTable('127.0.0.2:9000', <1 MB user name>, ...)`),
+  and the failed login logged the name at Error through
+  `ServerErrorHandler`: about 1 MB of console log per query, which no
+  NetworkPolicy covers.
+  - Now the native port takes connections from the container itself only
+    (`clickhouse-client` there, smoke.sh's queries, compose's healthcheck
+    and the image's init scripts, which connect to `127.0.0.1`). `[::1]` is
+    skipped with a warning where there is no IPv6 (checked: the server
+    starts and listens on `127.0.0.1:9000`), so `localhost` works either
+    way. `ServerErrorHandler` stays as it is: it reports real errors.
+  - Measured on 25.8: a native login from outside the container is refused
+    (before: answered, after reading the declared name); `127.0.0.2:9000`
+    is refused, and the self-connect writes 0 bytes to the console.
+  - Checks: CI's `grafana` job requires a native listener on
+    `127.0.0.1:9000` and none beyond loopback (failed with the old config,
+    on a user-defined network as in compose); the helm job requires
+    `tcp_port` removed, the loopback listener, and no `<host>` beyond
+    loopback; `smoke.sh` checks the pod's listeners (not run here: no
+    kind).
