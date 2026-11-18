@@ -57,7 +57,10 @@ config:
 
 clickhouse:
   # The ClickHouse password from an existing Secret: for an external
-  # ClickHouse, or to choose the password of the one deployed below.
+  # ClickHouse, or to choose the password of the one deployed below (with a
+  # renderer that cannot read the cluster, you must: see deploy). The
+  # server, and the deployed ClickHouse, read it only at start: after
+  # changing it, restart them.
   passwordSecret:
     name: ""
     key: password
@@ -70,7 +73,13 @@ clickhouse:
   # config.clickhouse.url and user at it, and the server reads the password
   # from clickhouse.passwordSecret or, without one, from a Secret the chart
   # generates once (<release>-hopcorder-server-clickhouse, key password) and
-  # keeps across upgrades. For high availability use an operator or a
+  # keeps across upgrades by reading it back. A renderer that cannot read
+  # the cluster (Argo CD, Kustomize's helmCharts, helm template | kubectl
+  # apply) generates a new password on every render instead; the generated
+  # Secrets are immutable, so applying such a render fails rather than
+  # change a password ClickHouse and the server read only at start. With
+  # those, create the Secrets yourself and set passwordSecret (and
+  # readOnlyUser.passwordSecret). For high availability use an operator or a
   # managed ClickHouse instead and leave this off.
   deploy:
     enabled: false
@@ -117,7 +126,8 @@ clickhouse:
     # (a table of about 5 MiB per time zone it names) and OOM-kill it, so
     # give only trusted users access to the data source (README, Dashboards).
     # Its password comes from passwordSecret or a generated Secret
-    # (<release>-hopcorder-server-clickhouse-readonly, key password).
+    # (<release>-hopcorder-server-clickhouse-readonly, key password; kept
+    # and immutable like the server's, see above).
     readOnlyUser:
       enabled: false
       name: grafana

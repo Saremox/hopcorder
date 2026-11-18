@@ -64,6 +64,10 @@ app.kubernetes.io/component: hopcorder-clickhouse
 {{/*
 A generated password: the existing Secret's value if there is one (so an
 upgrade keeps it), else a new random one. Takes (list $ secretName).
+lookup finds nothing without the cluster (helm template, Argo CD), so there
+every render has a new one; the Secrets are immutable for that (see
+clickhouse.yaml). No checksum of them on the pods: under those renderers it
+would restart ClickHouse and the server on every sync.
 */}}
 {{- define "hopcorder-server.generatedPassword" -}}
 {{- $root := index . 0 }}

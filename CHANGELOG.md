@@ -214,6 +214,17 @@ The section for a version is the text of its GitHub release.
   duplicates) and lost its records, and their streams were merged. In
   daemonset mode there was no way to tell them apart. Give each cluster
   its own prefix; the chart refuses one that cannot make a valid agent ID.
+- Server chart: the bundled ClickHouse's generated passwords (without
+  `clickhouse.passwordSecret`, and the read-only user's) are now in
+  immutable Secrets. Argo CD, Kustomize's `helmCharts` and `helm template`
+  cannot read them back and rendered new passwords every time, which the
+  next sync applied; ClickHouse and the server read them only at start, so
+  the next restart of either (a config change restarts the server) broke
+  authentication until the other restarted too, and Grafana's data source
+  with it. Now applying such a render fails and the passwords stay. With
+  those tools, set `clickhouse.passwordSecret` and
+  `clickhouse.deploy.readOnlyUser.passwordSecret`; `helm install` and
+  `helm upgrade` work as before.
 
 **Security: server ingest**
 

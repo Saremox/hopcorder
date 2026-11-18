@@ -557,6 +557,22 @@ jobs:
           if [ "$(grep -c '<storage_policy>system_logs</storage_policy><ttl>' <<<"$ch")" != 17 ]; then
             echo "hopcorder.xml: a system log off the system_logs disk"; exit 1
           fi
+          # The generated passwords' Secrets are immutable (review, round
+          # seven): lookup finds nothing for helm template or Argo CD, so
+          # each such render has new passwords, and applying one must fail
+          # rather than change what ClickHouse and the server read at start
+          # (smoke.sh tries). No checksum of them on the pods: it would
+          # restart both on every render, so two renders differ in their
+          # passwords only.
+          sec=$(awk '/^kind: Secret$/,/^---/' <<<"$ch")
+          if [ "$(grep -c '^kind: Secret$' <<<"$sec")" != 2 ] || [ "$(grep -c '^immutable: true$' <<<"$sec")" != 2 ]; then
+            echo "clickhouse.yaml: the generated Secrets are not both immutable"; exit 1
+          fi
+          r1=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml)
+          r2=$(helm template a deploy/helm/hopcorder-server -f deploy/helm/ci/server-values.yaml)
+          test "$(grep -c '^  password: ' <<<"$r1")" = 2
+          test "$(grep -v '^  password: ' <<<"$r1")" = "$(grep -v '^  password: ' <<<"$r2")"
+          test "$(grep '^  password: ' <<<"$r1")" != "$(grep '^  password: ' <<<"$r2")"
           # ClickHouse may connect to nothing (hasColumnInTable() connects
           # out for the read-only user), and remote() resolves no host.
           np=$(awk '/^kind: NetworkPolicy/,/^---/' <<<"$ch")

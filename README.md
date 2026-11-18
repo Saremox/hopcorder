@@ -206,6 +206,12 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   (SELECT on the hopcorder database, bounded queries), with its password in a
   generated Secret. Whoever can query Grafana's data source can still crash
   ClickHouse (see [Dashboards](#dashboards)): give only trusted users access to it.
+  Argo CD, Kustomize's `helmCharts` and `helm template | kubectl apply`
+  cannot read a generated password back and render a new one every time:
+  with them, create the Secrets yourself and set `clickhouse.passwordSecret`
+  and `clickhouse.deploy.readOnlyUser.passwordSecret`. The generated Secrets
+  are immutable, so such a render fails to apply rather than change a
+  password that ClickHouse and the server read only at start.
 - **Agent**: `mode: statefulset` (default) runs `replicas` agents named
   after their pods, each with its own spool volume (`persistence.size`, 1Gi;
   `config.spool.max_bytes` is 75% of it unless set, at most 1GiB, and the

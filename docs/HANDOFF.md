@@ -900,7 +900,11 @@ added in the commit that introduced it.
     from `clickhouse.passwordSecret` or a Secret the chart generates on
     install and reads back (`lookup`) on upgrades; users defined in config
     files follow the Secret on every start, so a reinstall with a new
-    password works with the old volume.
+    password works with the old volume. Since round seven the generated
+    Secrets (and the read-only user's) are immutable: renderers without
+    the cluster (Argo CD, `helm template`) render a new password every
+    time, and applying one fails instead of changing it under the pods;
+    with those, `clickhouse.passwordSecret` is needed (see there).
   - `config.d/hopcorder.xml`: console logging only (no log files in the
     container), caches sized for about 2 GiB (`mark_cache_size` 256 MiB,
     `uncompressed_cache_size` 128 MiB, `index_mark_cache_size` 64 MiB),
@@ -4230,3 +4234,60 @@ decisions:
     `agentIdPrefix: ds-` and requires each node's agent to arrive as
     `ds-<node>`, which checks the kubelet's expansion (not run here: no
     kind in the development container).
+- **The generated ClickHouse passwords stay what the pods started with.**
+  With `clickhouse.deploy.enabled` and no `passwordSecret`, the server
+  chart generates the passwords (the server's and the read-only user's):
+  the existing Secret's value by `lookup`, else `randAlphaNum`. Argo CD,
+  Kustomize's `helmCharts` and `helm template` cannot look up, so every
+  render had new passwords: the Secrets were always out of sync, and every
+  sync rewrote them. ClickHouse (from its environment) and the server
+  (`password_file`, read once) take them only at start, so the next
+  restart of one pod (a config change rolls the server; an eviction, OOM
+  or drain) left the two with different passwords and the server unready
+  until the other restarted too, and Grafana's data source the same
+  (review, round seven; from the code, not run under Argo CD). The
+  options:
+  - A checksum of the Secrets on both pod templates (the reviewer's
+    option): under those renderers the value changes with every render,
+    so both pods would restart on every sync; under Helm it adds nothing.
+    Rejected. The helm job now requires two renders to differ in the
+    passwords only, which such a checksum fails (tried).
+  - Docs and notes alone: they leave the outage to whoever misses them.
+  - Failing the render when `lookup` finds nothing: a first `helm install`
+    looks the same from the template (nothing exists yet; with
+    `--create-namespace` not even the namespace), and `helm lint`,
+    `helm template` and `--dry-run` would fail too.
+  - A password derived from the release, the same on every render:
+    predictable. Re-reading the password after an authentication failure
+    (server) and from a file (ClickHouse): code, and Grafana's data source
+    would still break on every sync.
+  - Chosen: both generated Secrets are `immutable: true`, with docs and
+    notes. Under Helm nothing changes: the install creates them, and an
+    upgrade renders the value `lookup` read back, so the data never
+    changes (labels may); a rollback renders the stored value, the same
+    unless the Secret was deleted in between, when the rollback now fails
+    instead of changing the password. Under a renderer, the first apply
+    creates them and the API server refuses every later one (`data:
+    Forbidden: field is immutable when immutable is set`), so the pods
+    keep their password through any restart, the mistake shows at apply
+    time rather than at the next restart, and nothing restarts. That is
+    Kubernetes' documented behaviour for immutable Secrets (GA in 1.21);
+    Argo CD then reports the Secret out of sync and the sync failed.
+  - NOTES.txt names the generated Secrets and the values a renderer
+    without the cluster needs (`clickhouse.passwordSecret.name`,
+    `clickhouse.deploy.readOnlyUser.passwordSecret.name`); values.yaml,
+    README and a comment on the rendered Secret say the same. values.yaml
+    also says that a changed `passwordSecret` needs both pods restarted.
+  - Cost: changing a generated password means deleting its Secret,
+    upgrading and restarting ClickHouse and the server (the restarts were
+    needed before as well). A renderer's sync keeps failing on the Secret
+    until `passwordSecret` is set, and deleting and recreating it
+    (`kubectl replace --force`, Argo CD's `Force=true,Replace=true`) still
+    changes the password.
+  - Checks: the helm job requires both generated Secrets to be immutable
+    (failed before) and two renders to differ in the passwords only.
+    `smoke.sh` requires them immutable after the install, `helm upgrade`
+    to keep both passwords with notes naming the values, and the Secrets
+    of a `helm template` render to be refused by `kubectl apply
+    --dry-run=server` as immutable (not run here: no cluster in the
+    development container).
