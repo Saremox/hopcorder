@@ -98,10 +98,11 @@ clickhouse:
     # queries together: results it holds until the query ends
     # (wait_end_of_query: the server's reads ask for it, and so may any HTTP
     # client with a password; one with the read-only user's filled the
-    # volume) and the server's spills. About a tenth of persistence.size:
-    # the server's reads need far less (two at a time, each result at most
-    # twice config.query.max_response_bytes before compression).
-    maxTemporaryDataOnDisk: 2000000000
+    # volume) and the server's spills. Empty: a tenth of persistence.size
+    # (2147483648 for 20Gi); at most a fifth of it. The server's reads need
+    # far less (two at a time, each result at most twice
+    # config.query.max_response_bytes before compression).
+    maxTemporaryDataOnDisk: ""
     # Caches are sized for a small instance, and the server may use 80% of
     # the memory limit. The read API's queries get a third of that, two at a
     # time: config.query.max_concurrent 2 and max_memory_bytes 80% x limit /

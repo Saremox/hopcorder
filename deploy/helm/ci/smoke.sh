@@ -181,9 +181,10 @@ for i in $(seq 90); do
         exit 1
       fi
       # Temporary data is capped for all queries together: a result buffered
-      # for wait_end_of_query (a URL parameter) filled the volume.
-      if [ "$(adm "SELECT value FROM system.server_settings WHERE name = 'max_temporary_data_on_disk_size'")" != 2000000000 ]; then
-        echo "ClickHouse's temporary data is not capped at 2000000000 bytes"
+      # for wait_end_of_query (a URL parameter) filled the volume. A tenth of
+      # server-values.yaml's 1Gi volume.
+      if [ "$(adm "SELECT value FROM system.server_settings WHERE name = 'max_temporary_data_on_disk_size'")" != 107374182 ]; then
+        echo "ClickHouse's temporary data is not capped at 107374182 bytes"
         exit 1
       fi
       # The native port listens on loopback only: before its password check

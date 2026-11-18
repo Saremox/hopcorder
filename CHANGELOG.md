@@ -283,6 +283,11 @@ The section for a version is the text of its GitHub release.
   pod (without a CNI that enforces the chart's NetworkPolicy) OOM-killed
   it. It also let Grafana's read-only user make ClickHouse log in to
   itself and write about 1 MB of console log per query.
+- Server chart: the bundled ClickHouse's temporary-data cap is now a tenth
+  of `clickhouse.deploy.persistence.size` unless
+  `clickhouse.deploy.maxTemporaryDataOnDisk` sets it (at most a fifth of
+  the volume). The fixed 2 GB filled volumes under about 8 GiB, such as
+  the chart's own 1Gi test volume.
 
 **Security: server ingest**
 

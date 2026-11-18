@@ -160,6 +160,25 @@ in MiB, 0 without one.
 {{- end }}
 {{- end }}
 
+{{/*
+The bundled ClickHouse's volume (clickhouse.deploy.persistence.size) in bytes:
+a byte count, or a number with a k, M, G, T, Ki, Mi, Gi or Ti suffix.
+*/}}
+{{- define "hopcorder-server.clickhouseVolumeBytes" -}}
+{{- $v := .Values.clickhouse.deploy.persistence.size }}
+{{- if or (kindIs "int" $v) (kindIs "int64" $v) (kindIs "float64" $v) }}
+{{- $v | int64 }}
+{{- else }}
+{{- $s := trim (toString $v) }}
+{{- $num := "^[0-9]+(\\.[0-9]+)?" }}
+{{- if not (regexMatch (printf "%s(k|M|G|T|Ki|Mi|Gi|Ti)?$" $num) $s) }}
+{{- fail (printf "clickhouse.deploy.persistence.size %q: write it in bytes or with a k, M, G, T, Ki, Mi, Gi or Ti suffix (the chart sizes ClickHouse's temporary data from it)" $s) }}
+{{- end }}
+{{- $unit := get (dict "" 1.0 "k" 1e3 "M" 1e6 "G" 1e9 "T" 1e12 "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0) (regexReplaceAll $num $s "") }}
+{{- mulf (regexFind $num $s | float64) $unit | floor | int64 }}
+{{- end }}
+{{- end }}
+
 {{/* The configuration file: the user's config plus what the chart owns. */}}
 {{- define "hopcorder-server.config" -}}
 {{- if (default dict .Values.config.clickhouse).password }}
