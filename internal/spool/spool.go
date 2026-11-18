@@ -495,10 +495,18 @@ func (s *Spool) initDB(db *bolt.DB) error {
 				return err
 			}
 		}
-		meta, curs := tx.Bucket(bucketMeta), tx.Bucket(bucketCursors)
+		meta, curs, recs := tx.Bucket(bucketMeta), tx.Bucket(bucketCursors), tx.Bucket(bucketRecords)
 		next := getU64(meta, keyNextSeq)
 		if next == 0 {
 			next = s.firstSeq
+			if err := putU64(meta, keyNextSeq, next); err != nil {
+				return err
+			}
+		}
+		if n, err := s.renumber(recs, next); err != nil {
+			return err
+		} else if n != next {
+			next = n
 			if err := putU64(meta, keyNextSeq, next); err != nil {
 				return err
 			}
@@ -528,7 +536,19 @@ func (s *Spool) initDB(db *bolt.DB) error {
 				cursors[c] = next - 1
 				continue
 			}
-			cursors[c] = binary.BigEndian.Uint64(v)
+			cur := binary.BigEndian.Uint64(v)
+			if cur >= next {
+				// Only damage puts a cursor above the last seq: the output
+				// would deliver nothing appended from now on.
+				r := rewound(recs, next)
+				s.opts.Logger.Error("spool: delivery cursor above the last seq; delivering every stored record again",
+					"output", c, "cursor", cur, "last_seq", next-1, "from_seq", r+1)
+				if err := putU64(curs, []byte(c), r); err != nil {
+					return err
+				}
+				cur = r
+			}
+			cursors[c] = cur
 		}
 		var err error
 		more, err = s.trimLocked(tx, st)
@@ -541,6 +561,62 @@ func (s *Spool) initDB(db *bolt.DB) error {
 	s.cursors = cursors
 	s.mu.Unlock()
 	return s.settle(run, more)
+}
+
+// renumber gives every record stored at or above next the next seq, in
+// order, and returns next_seq after them. Only damage puts a record there
+// (Append stores it under next_seq and counts that up in the same
+// transaction), and kept there it is delivered and acknowledged, and the
+// cursor then lies above every record appended after it (review, round
+// seven). The record keeps its own seq, in its data, which is what the
+// server deduplicates on. If damage lowered next_seq instead, the records
+// keep their order, and next_seq comes back above them.
+func (s *Spool) renumber(recs *bolt.Bucket, next uint64) (uint64, error) {
+	type move struct {
+		from []byte
+		to   uint64
+	}
+	var moves []move
+	c := recs.Cursor()
+	for k, _ := c.Seek(seqKey(next)); k != nil; k, _ = c.Next() {
+		if len(k) != 8 {
+			continue // not a record key; never read or acknowledged
+		}
+		if binary.BigEndian.Uint64(k) != next {
+			moves = append(moves, move{slices.Clone(k), next})
+		}
+		next++
+	}
+	// In key order, each to a seq below its key and above those before:
+	// nothing is stored there, or it was moved already.
+	for _, m := range moves {
+		v := slices.Clone(recs.Get(m.from))
+		if err := recs.Delete(m.from); err != nil {
+			return 0, err
+		}
+		if err := recs.Put(seqKey(m.to), v); err != nil {
+			return 0, err
+		}
+	}
+	if len(moves) > 0 {
+		s.opts.Logger.Error("spool: records stored above the next seq; given the next seqs",
+			"records", len(moves), "first_key", binary.BigEndian.Uint64(moves[0].from), "first_seq", moves[0].to)
+	}
+	return next, nil
+}
+
+// rewound is where a cursor above the last seq goes back to: before the
+// oldest record stored, so that the output delivers every record it may
+// not have (and those it has again, which the server and readers of a
+// jsonl file deduplicate by seq), or to the last seq if none is stored.
+func rewound(recs *bolt.Bucket, next uint64) uint64 {
+	c := recs.Cursor()
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		if len(k) == 8 {
+			return min(next, max(binary.BigEndian.Uint64(k), 1)) - 1
+		}
+	}
+	return next - 1
 }
 
 // trimLocked deletes, in tx, records every consumer has delivered and those
