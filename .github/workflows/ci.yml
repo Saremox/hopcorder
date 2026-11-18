@@ -200,6 +200,16 @@ jobs:
             AND (storage_policy != 'system_logs' OR engine_full NOT LIKE '%TTL%')")
           test -z "$bad" || { echo "system tables off the system_logs disk or without a TTL: $bad"; exit 1; }
           test "$(q "EXISTS system.opentelemetry_span_log")" = 0 || { echo "opentelemetry_span_log is on"; exit 1; }
+          # ClickHouse's own log files (on the host's disk) do not repeat a
+          # failing query's message: 4 MB, written about five times before.
+          logs() { docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c 'du -cb /var/log/clickhouse-server/* | tail -1 | cut -f1'; }
+          before=$(logs)
+          docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client --user grafana --password grafana \
+            --query "SELECT 1 WHERE throwIf(1, concat('probe-', arrayStringConcat(arrayMap(x -> reinterpretAsString(sipHash128(x)), range(250000)))))" \
+            >/dev/null 2>&1 && exit 1
+          sleep 1
+          grew=$(( $(logs) - before ))
+          [ "$grew" -lt 1000000 ] || { echo "ClickHouse's log files grew $grew bytes for one failing query"; exit 1; }
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -462,6 +472,10 @@ jobs:
           # The system logs on a disk keeping a quarter of the volume free.
           grep -qF '<keep_free_space_ratio>0.25</keep_free_space_ratio>' <<<"$ch" || { echo "hopcorder.xml: no system_logs disk"; exit 1; }
           grep -qF '<opentelemetry_span_log remove="1"/>' <<<"$ch" || { echo "hopcorder.xml: opentelemetry_span_log is on"; exit 1; }
+          # The loggers that repeat a failing query's message are off.
+          for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker; do
+            grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
+          done
           if [ "$(grep -c '<storage_policy>system_logs</storage_policy><ttl>' <<<"$ch")" != 17 ]; then
             echo "hopcorder.xml: a system log off the system_logs disk"; exit 1
           fi

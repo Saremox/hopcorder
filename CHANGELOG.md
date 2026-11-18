@@ -144,6 +144,11 @@ The section for a version is the text of its GitHub release.
   covers every log ClickHouse keeps: a refused `BACKUP` still wrote its
   whole destination into `backup_log`, and a traced query its exception
   into `opentelemetry_span_log`, which is now switched off.
+- ClickHouse's own log files and console log no longer repeat a failing
+  query's exception message: one query of Grafana's read-only user wrote
+  it about five times, 300 MB, into compose's log files on the host's
+  disk. The loggers that did are set to `fatal` (`query_log` keeps the
+  exception), and compose caps its files at 10M × 2.
 
 **Security: server ingest**
 

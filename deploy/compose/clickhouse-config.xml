@@ -26,6 +26,22 @@ kept a traced query's exception three times and cannot take a storage
 policy (the image gives it an engine), is off; hopcorder does not trace.
 -->
 <clickhouse>
+    <!-- ClickHouse's own log files (in the container, on the host's disk,
+         outside the floor below): capped, and without the loggers that
+         repeat a failing query's whole exception message, which query_log
+         keeps. One failing query of Grafana's read-only user wrote it about
+         five times, 300 MB (review round seven). -->
+    <logger>
+        <size>10M</size>
+        <count>2</count>
+        <levels>
+            <logger><name>executeQuery</name><level>fatal</level></logger>
+            <logger><name>DynamicQueryHandler</name><level>fatal</level></logger>
+            <logger><name>HTTPHandler</name><level>fatal</level></logger>
+            <logger><name>TCPHandler</name><level>fatal</level></logger>
+            <logger><name>BackupsWorker</name><level>fatal</level></logger>
+        </levels>
+    </logger>
     <user_files_path>/srv/</user_files_path>
     <format_schema_path>/srv/</format_schema_path>
     <storage_configuration>
