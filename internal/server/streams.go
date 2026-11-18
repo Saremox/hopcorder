@@ -1,6 +1,7 @@
 package server
 
 import (
+	"slices"
 	"time"
 
 	"github.com/saremox/hopcorder/internal/clickhouse"
@@ -32,6 +33,30 @@ type stream struct {
 	// pending holds close rows of the stream's outages that could not be
 	// stored, to write again with its next part (at most maxPending).
 	pending []outageRow
+}
+
+// keepPending adds a lost close row o to s.pending, within maxPending. Past
+// it, a row of an outage that storage has nothing of (pendOwn) is dropped,
+// lost with its insert as round six accepted, so that one storage may hold
+// open (pendKeep) is kept. That takes at most one row a part: the outage
+// open when the part began. Only past maxPending such rows (eight failed
+// parts in a row, each of which closed an outage begun before it) is a row
+// that must be kept dropped, the newest; the oldest, which storage holds
+// open if any does, stays.
+func (s *stream) keepPending(o outageRow) {
+	if len(s.pending) < maxPending {
+		s.pending = append(s.pending, o)
+		return
+	}
+	if o.pend != pendKeep {
+		return
+	}
+	for i := len(s.pending) - 1; i >= 0; i-- {
+		if s.pending[i].pend == pendOwn {
+			s.pending = append(slices.Delete(s.pending, i, i+1), o)
+			return
+		}
+	}
 }
 
 // lastCycle is what the stream keeps of its previous cycle: not the record

@@ -15,18 +15,20 @@ import (
 // written again with the stream's next part, and counted once (review,
 // round twelve). Until then the stream was restored from storage, which
 // lost the outages whose rows were all in the failed inserts and rebuilt
-// the stream's open outage from what storage had. Past maxPending lost rows
-// the stream is restored, as then.
+// the stream's open outage from what storage had. Past maxPending rows the
+// newest outages whose rows were all in failed inserts are dropped, and the
+// stream is not restored (round thirteen: it was, as before round twelve).
 func TestLostCloseRowsAreWrittenAgain(t *testing.T) {
 	for _, tc := range []struct {
-		failed   int  // parts whose outages insert fails, each with a closed outage
-		restored bool // the stream was restored from storage
-		want     string
+		failed int // parts whose outages insert fails, each with a closed outage
+		want   string
 	}{
-		{failed: 3, restored: false, want: "map[15:end 16, 1 cycles 25:end 26, 1 cycles 35:end 36, 1 cycles 45:end 46, 1 cycles]"},
-		// Past the bound the stream is restored; the outages whose rows
-		// were all in failed inserts are lost (accepted, round six).
-		{failed: maxPending + 1, restored: true, want: fmt.Sprintf("map[%d:end %d, 1 cycles]", 10*(maxPending+2)+5, 10*(maxPending+2)+6)},
+		{failed: 3, want: "map[15:end 16, 1 cycles 25:end 26, 1 cycles 35:end 36, 1 cycles 45:end 46, 1 cycles]"},
+		// Past the bound the newest is dropped: lost with its insert
+		// (accepted, round six).
+		{failed: maxPending + 1, want: "map[15:end 16, 1 cycles 25:end 26, 1 cycles 35:end 36, 1 cycles " +
+			"45:end 46, 1 cycles 55:end 56, 1 cycles 65:end 66, 1 cycles 75:end 76, 1 cycles 85:end 86, 1 cycles " +
+			"105:end 106, 1 cycles]"},
 	} {
 		t.Run(fmt.Sprint(tc.failed), func(t *testing.T) {
 			st := newHookStore()
@@ -73,13 +75,119 @@ func TestLostCloseRowsAreWrittenAgain(t *testing.T) {
 			if got := fmt.Sprint(outagesOf(st.table("outages"))); got != tc.want {
 				t.Errorf("outages %s, want %s", got, tc.want)
 			}
-			if got := restores.Load() > 0; got != tc.restored {
-				t.Errorf("restored %v, want %v", got, tc.restored)
+			if got := restores.Load(); got != 0 {
+				t.Errorf("%d restore queries, want none", got)
 			}
 			n := tc.failed + 1
 			if got, want := outageEvents(t, reg), fmt.Sprintf("close %d open %d", n, n); got != want {
 				t.Errorf("outages counted: %s, want %s", got, want)
 			}
 		})
+	}
+}
+
+// One failed part in which the stream closes more outages than maxPending
+// (a lossy destination: every lost reply is a one-cycle outage) and is down
+// at its end. Until round thirteen the stream was restored past the bound,
+// and the restore rebuilt the long outage from storage, which never had its
+// open row: [91 to 200: 109 cycles] for [42 to 200: 158 cycles]. And the
+// failed part's own outages crowd out none that began before it: here the
+// long one, still down when the next part fails as well, and closed in it.
+func TestManyLostClosesInAPartKeepTheStreamsOutage(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		failed [][2]uint64 // parts whose outages insert fails
+		want   string
+	}{
+		// 20 one-cycle outages at 12, 14, ..., 50, then down from 54.
+		{"one part", [][2]uint64{{11, 120}}, "map[12:end 13, 1 cycles 14:end 15, 1 cycles 16:end 17, 1 cycles " +
+			"18:end 19, 1 cycles 20:end 21, 1 cycles 22:end 23, 1 cycles 24:end 25, 1 cycles 26:end 27, 1 cycles " +
+			"54:end 200, 146 cycles]"},
+		// The long outage begins in the first failed part and ends in the
+		// second (at 200): its close row is kept over the newest of the
+		// first part's own.
+		{"two parts", [][2]uint64{{11, 120}, {121, 210}}, "map[12:end 13, 1 cycles 14:end 15, 1 cycles " +
+			"16:end 17, 1 cycles 18:end 19, 1 cycles 20:end 21, 1 cycles 22:end 23, 1 cycles 24:end 25, 1 cycles " +
+			"54:end 200, 146 cycles]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newHookStore()
+			in := NewIngester(st, nil, quietLogger(), nil)
+			var failing atomic.Bool
+			var restores atomic.Int32
+			st.insert = func(table string, _ int) error {
+				if failing.Load() && table == "outages" {
+					return errors.New("clickhouse: connection refused")
+				}
+				return nil
+			}
+			st.query = func(q string) error {
+				if isRestore(q) {
+					restores.Add(1)
+				}
+				return nil
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				var recs []*record.Record
+				for seq := from; seq <= to; seq++ {
+					spec := pathA
+					if seq >= 12 && seq <= 50 && seq%2 == 0 || seq >= 54 && seq < 200 {
+						spec = brokenA
+					}
+					recs = append(recs, mk("lab", seq, spec...))
+				}
+				if _, err := in.Ingest(t.Context(), recs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ingest(1, 10)
+			restores.Store(0)
+			failing.Store(true)
+			next := uint64(11)
+			for _, p := range tc.failed {
+				ingest(p[0], p[1])
+				next = p[1] + 1
+			}
+			failing.Store(false)
+			ingest(next, 220)
+			if got := fmt.Sprint(outagesOf(st.table("outages"))); got != tc.want {
+				t.Errorf("outages %s, want %s", got, tc.want)
+			}
+			if got := restores.Load(); got != 0 {
+				t.Errorf("%d restore queries, want none", got)
+			}
+		})
+	}
+}
+
+// keepPending keeps at most maxPending rows: past it the newest of the
+// failed parts' own outages make way for one that storage may hold open,
+// and a row that must be kept is dropped only when all are such rows.
+func TestKeepPendingBound(t *testing.T) {
+	row := func(start uint64, k pendKind) outageRow { return outageRow{StartSeq: start, pend: k} }
+	starts := func(s *stream) []uint64 {
+		var out []uint64
+		for _, o := range s.pending {
+			out = append(out, o.StartSeq)
+		}
+		return out
+	}
+	s := &stream{}
+	for i := range uint64(maxPending) {
+		s.keepPending(row(10+i, pendOwn))
+	}
+	s.keepPending(row(100, pendOwn)) // dropped
+	s.keepPending(row(1, pendKeep))  // evicts 17
+	if got, want := fmt.Sprint(starts(s)), "[10 11 12 13 14 15 16 1]"; got != want {
+		t.Errorf("own rows past the bound: %s, want %s", got, want)
+	}
+	s = &stream{}
+	for i := range uint64(maxPending) {
+		s.keepPending(row(10+i, pendKeep))
+	}
+	s.keepPending(row(100, pendKeep)) // dropped: the oldest stay
+	if got, want := fmt.Sprint(starts(s)), "[10 11 12 13 14 15 16 17]"; got != want {
+		t.Errorf("kept rows past the bound: %s, want %s", got, want)
 	}
 }

@@ -162,7 +162,24 @@ type outageRow struct {
 	LastHopTTL int     `json:"last_hop_ttl"`
 	LastHopIP  string  `json:"last_hop_ip"`
 	Version    uint64  `json:"version"`
+	// pend is what storeRecords decided when this close row was first
+	// lost; it is kept with the row while the row is pending.
+	pend pendKind
 }
+
+// pendKind classifies a close row that could not be stored.
+type pendKind uint8
+
+const (
+	pendNew pendKind = iota // not lost yet
+	// pendOwn: the outage opened and closed within the part whose insert
+	// failed, which wrote no other row of it: storage has nothing of it.
+	pendOwn
+	// pendKeep: the outage started before that part (or the part was
+	// derived before, after a crash before its mark), so storage may hold
+	// it open: the close row must not be dropped.
+	pendKeep
+)
 
 func addrStrings(a []netip.Addr) []string {
 	out := make([]string, len(a))

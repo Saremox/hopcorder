@@ -265,6 +265,14 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round thirteen)**
+
+- Server: a batch whose events could not be stored no longer has a stream
+  rebuilt from storage when the stream closed more than eight outages in
+  it (a lossy destination): the rebuild recorded the stream's next outage
+  with a later start, or not at all. Past eight, the newest outages that
+  began and ended in the failed batch are dropped instead.
+
 **Fixed (review round twelve)**
 
 - Server: an outage that ended in a batch whose events could not be stored
@@ -272,7 +280,7 @@ The section for a version is the text of its GitHub release.
   being rebuilt from storage. The rebuild recorded the stream's next
   outage with a later start, or not at all, and lost the next batch's
   route changes when it could not run; outages lost whole with the failed
-  batch are now recorded as well.
+  batch are now recorded as well, up to eight a stream.
 
 **Fixed (review round eleven)**
 
