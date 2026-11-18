@@ -275,6 +275,14 @@ The section for a version is the text of its GitHub release.
   restart, continued that old outage: the read API, the UI and Grafana
   showed it ongoing since its old start or ending at the new cycle, with a
   wrong cycle count, and the new outage was not recorded.
+- ClickHouse (compose and the chart's bundled ClickHouse) takes native
+  protocol connections from its own container only. Nothing of hopcorder
+  uses that protocol, but it listened on every address, and ClickHouse
+  reserves memory for the user name a login declares before it checks the
+  password: two logins of about 1 KB each, with no credentials, from any
+  pod (without a CNI that enforces the chart's NetworkPolicy) OOM-killed
+  it. It also let Grafana's read-only user make ClickHouse log in to
+  itself and write about 1 MB of console log per query.
 
 **Security: server ingest**
 

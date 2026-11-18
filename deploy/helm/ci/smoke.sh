@@ -186,6 +186,15 @@ for i in $(seq 90); do
         echo "ClickHouse's temporary data is not capped at 2000000000 bytes"
         exit 1
       fi
+      # The native port listens on loopback only: before its password check
+      # ClickHouse reserves memory for the user name a login declares, up to
+      # 1 GiB, so two logins from any pod OOM-killed it.
+      if kubectl exec statefulset/hopcorder-server-clickhouse -- sh -c \
+        'awk "\$4 == \"0A\" { print \$2 }" /proc/net/tcp /proc/net/tcp6 2>/dev/null' |
+        grep -E ':2328$' | grep -qvE '^(0100007F|00000000000000000000000001000000):'; then
+        echo "ClickHouse's native port listens beyond loopback"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then

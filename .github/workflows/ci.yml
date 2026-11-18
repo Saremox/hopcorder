@@ -246,6 +246,13 @@ jobs:
           if grep -qE ':(232C|232D|2331)$' <<<"$ports"; then
             echo "ClickHouse listens on 9004, 9005 or 9009 (hex): $ports"; exit 1
           fi
+          # The native port (9000) on loopback only: before its password
+          # check ClickHouse reserves memory for the user name a login
+          # declares (up to 1 GiB), so two logins from anywhere OOM-killed it.
+          grep -qE '^0100007F:2328$' <<<"$ports" || { echo "no native listener on 127.0.0.1:9000: $ports"; exit 1; }
+          if grep -E ':2328$' <<<"$ports" | grep -qvE '^(0100007F|00000000000000000000000001000000):'; then
+            echo "ClickHouse's native port listens beyond loopback (hex): $ports"; exit 1
+          fi
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -554,9 +561,15 @@ jobs:
             { echo "hopcorder.xml: temporary data is not capped"; exit 1; }
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=0
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=2Gi
-          for l in mysql_port postgresql_port interserver_http_port; do
+          for l in mysql_port postgresql_port interserver_http_port tcp_port; do
             grep -qF "<$l remove=\"1\"/>" <<<"$ch" || { echo "hopcorder.xml: $l is open"; exit 1; }
           done
+          # The native protocol on loopback only, and on no other host.
+          grep -qF '<native_ipv4><type>tcp</type><host>127.0.0.1</host><port>9000</port></native_ipv4>' <<<"$ch" ||
+            { echo "hopcorder.xml: no native listener on 127.0.0.1"; exit 1; }
+          if grep -oE '<host>[^<]*</host>' <<<"$ch" | grep -vqxE '<host>(127\.0\.0\.1|::1|localhost)</host>'; then
+            echo "hopcorder.xml: a listener or host beyond loopback"; exit 1
+          fi
           if [ "$(grep -c '<storage_policy>system_logs</storage_policy><ttl>' <<<"$ch")" != 17 ]; then
             echo "hopcorder.xml: a system log off the system_logs disk"; exit 1
           fi
