@@ -34,6 +34,7 @@ services:
     volumes:
       - clickhouse:/var/lib/clickhouse
       - ./compose/clickhouse-config.xml:/etc/clickhouse-server/config.d/hopcorder.xml:ro
+      - ./compose/clickhouse-users.xml:/etc/clickhouse-server/users.d/hopcorder.xml:ro
       # Creates Grafana's read-only user and its limits on the first start
       # (an empty volume). The script can be re-run on an older volume:
       #   docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client \

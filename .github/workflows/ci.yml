@@ -253,6 +253,21 @@ jobs:
           if grep -E ':2328$' <<<"$ports" | grep -qvE '^(0100007F|00000000000000000000000001000000):'; then
             echo "ClickHouse's native port listens beyond loopback (hex): $ports"; exit 1
           fi
+      - name: ClickHouse bounds what an unauthenticated request holds
+        # Before it authenticates a client ClickHouse keeps a thread per
+        # connection and the request's whole header and URI: with its
+        # defaults (4096 connections, a million header fields of up to
+        # 128 KiB, a 1 MiB URI) unauthenticated clients OOM-killed it.
+        run: |
+          q() { docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client \
+            --user hopcorder --password hopcorder --query "$1"; }
+          test "$(q "SELECT (SELECT value FROM system.server_settings WHERE name = 'max_connections'), getSetting('http_max_fields'),
+            getSetting('http_max_field_name_size'), getSetting('http_max_field_value_size'), getSetting('http_max_uri_size')
+            FORMAT CSV")" = '"256",32,256,8192,65536' || { echo "ClickHouse's connection or HTTP header limits are not set"; exit 1; }
+          hdrs=(); for i in $(seq 40); do hdrs+=(--header "X-Pad-$i: v"); done
+          code=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse wget -O /dev/null -S "${hdrs[@]}" \
+            'http://localhost:8123/?query=SELECT+1' 2>&1 | awk '/HTTP\//{print $2}' | tail -1)
+          [ "$code" = 400 ] || { echo "40 header fields were not refused before authentication: $code"; exit 1; }
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -567,6 +582,14 @@ jobs:
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=2Gi
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=5000000000
           refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.persistence.size=lots
+          # Connections and what an HTTP request may hold before ClickHouse
+          # authenticates it are bounded (limits.xml, mounted in users.d).
+          grep -qF '<max_connections>256</max_connections>' <<<"$ch" || { echo "hopcorder.xml: max_connections unbounded"; exit 1; }
+          for l in '<http_max_fields>32</http_max_fields>' '<http_max_field_name_size>256</http_max_field_name_size>' \
+            '<http_max_field_value_size>8192</http_max_field_value_size>' '<http_max_uri_size>65536</http_max_uri_size>' \
+            'mountPath: /etc/clickhouse-server/users.d/limits.xml'; do
+            grep -qF "$l" <<<"$ch" || { echo "limits.xml: $l missing"; exit 1; }
+          done
           for l in mysql_port postgresql_port interserver_http_port tcp_port; do
             grep -qF "<$l remove=\"1\"/>" <<<"$ch" || { echo "hopcorder.xml: $l is open"; exit 1; }
           done

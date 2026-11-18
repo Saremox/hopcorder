@@ -108,6 +108,12 @@ data:
              hasColumnInTable() could make it log in to itself with a 1 MB
              name (review round eight). [::1] is skipped, with a warning,
              where the pod has no IPv6. -->
+        <!-- At most 256 connections: before it authenticates a client,
+             ClickHouse keeps a thread (about 220 KB) per connection and the
+             request's whole header and URI; with 4096 connections and the
+             default header limits, unauthenticated clients OOM-killed it
+             (review round nine). The header limits are in limits.xml. -->
+        <max_connections>256</max_connections>
         <tcp_port remove="1"/>
         <protocols>
             <native_ipv4><type>tcp</type><host>127.0.0.1</host><port>9000</port></native_ipv4>
@@ -135,6 +141,24 @@ data:
         <{{ . }}><storage_policy>system_logs</storage_policy><ttl>event_date + INTERVAL {{ $days }} DAY DELETE</ttl></{{ . }}>
         {{- end }}
         <opentelemetry_span_log remove="1"/>
+    </clickhouse>
+  # What an HTTP request may hold before ClickHouse authenticates it: the
+  # default profile's limits, which the server reads for every request.
+  # With ClickHouse's defaults (a million header fields of up to 128 KiB,
+  # a 1 MiB URI) a few unauthenticated requests of 500 MB of headers, or
+  # 2,200 with a 1 MB query string, OOM-killed ClickHouse at 2Gi (review
+  # round nine). hopcorder's server and Grafana's plugin send a few short
+  # headers and keep their queries in the body.
+  limits.xml: |
+    <clickhouse>
+        <profiles>
+            <default>
+                <http_max_fields>32</http_max_fields>
+                <http_max_field_name_size>256</http_max_field_name_size>
+                <http_max_field_value_size>8192</http_max_field_value_size>
+                <http_max_uri_size>65536</http_max_uri_size>
+            </default>
+        </profiles>
     </clickhouse>
   {{- if $d.readOnlyUser.enabled }}
   # The read-only user (for Grafana): SELECT on the hopcorder database only,
@@ -338,6 +362,10 @@ spec:
             - name: config
               mountPath: /etc/clickhouse-server/config.d/hopcorder.xml
               subPath: hopcorder.xml
+              readOnly: true
+            - name: config
+              mountPath: /etc/clickhouse-server/users.d/limits.xml
+              subPath: limits.xml
               readOnly: true
             {{- if $d.readOnlyUser.enabled }}
             - name: config
