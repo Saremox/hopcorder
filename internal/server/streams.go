@@ -29,6 +29,9 @@ type stream struct {
 	last    lastCycle  // what a route change reports about the cycle before it
 	outage  *outageRow // open outage, if any
 	used    time.Time  // last record, for evicting idle streams
+	// pending holds close rows of the stream's outages that could not be
+	// stored, to write again with its next part (at most maxPending).
+	pending []outageRow
 }
 
 // lastCycle is what the stream keeps of its previous cycle: not the record
@@ -49,6 +52,7 @@ type events struct {
 	changes []pathChangeRow
 	outages []outageRow
 	opened  int // outages opened (for the metric: open rows are written after the part, see derive)
+	resent  int // close rows in outages written again (pending), not counted again
 }
 
 // observe feeds rec to the stream and returns the events it produces. An
