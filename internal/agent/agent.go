@@ -72,6 +72,17 @@ type Options struct {
 	Observer Observer
 	Resolver Resolver
 	Logger   *slog.Logger
+	// Addresses carries the addresses of name targets from one Agent to the
+	// next (a reload); nil: this Agent's own. A target whose name it has an
+	// address for (same name, same af) starts with it, refreshed in the
+	// background at the first cycle and every DNSTTL after; while lookups
+	// fail it is kept.
+	Addresses *Addresses
+	// AddressStore, if set, keeps the addresses across restarts: every
+	// lookup that succeeds saves its address, and one the store has is the
+	// fallback when a target's first lookup fails. Run deletes those of
+	// names no target resolves.
+	AddressStore AddressStore
 }
 
 // Agent schedules cycles for all targets.
@@ -108,6 +119,9 @@ func New(opts Options) (*Agent, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.Addresses == nil {
+		opts.Addresses = NewAddresses()
+	}
 	return &Agent{opts: opts, log: opts.Logger}, nil
 }
 
@@ -117,6 +131,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.opts.Sink == nil {
 		return errors.New("agent: Run needs a sink")
 	}
+	a.prepareAddresses()
 	var wg sync.WaitGroup
 	n := len(a.opts.Targets)
 	for i := range a.opts.Targets {
@@ -131,6 +146,27 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
+// prepareAddresses readies the addresses for this Agent's run, which is
+// when the configuration it belongs to has started (a reload that fails
+// to start reverts to a configuration whose addresses are all still
+// there): those of names no target resolves are forgotten, in the store
+// too, and the store's fill in for the names without one, after a restart
+// all of them.
+func (a *Agent) prepareAddresses() {
+	keys := addressKeys(a.opts.Targets)
+	var saved map[string]netip.Addr
+	if st := a.opts.AddressStore; st != nil {
+		var err error
+		if saved, err = st.Addresses(); err != nil {
+			a.log.Warn("cannot read the targets' saved addresses", "err", err)
+		}
+		if err := st.KeepAddresses(keys); err != nil {
+			a.log.Warn("cannot delete the saved addresses of removed targets", "err", err)
+		}
+	}
+	a.opts.Addresses.prepare(keys, saved)
+}
+
 // RunOnce runs one cycle for every target concurrently and returns the
 // records in target order. Records are not published to the sink and keep
 // seq 0. Targets that failed are missing from the result and reported in
@@ -143,6 +179,7 @@ func (a *Agent) RunOnce(ctx context.Context) ([]*record.Record, error) {
 		t := &a.opts.Targets[i]
 		wg.Go(func() {
 			r := newRunner(a, t)
+			defer r.bg.Wait() // a refresh of an address an earlier RunOnce left
 			recs[i], errs[i] = r.cycle(ctx, time.Now())
 			if errs[i] != nil {
 				errs[i] = fmt.Errorf("%s: %w", t.Host, errs[i])
@@ -163,6 +200,7 @@ func (a *Agent) RunOnce(ctx context.Context) ([]*record.Record, error) {
 type runner struct {
 	a   *Agent
 	t   *Target
+	key string // addressKey(t); "" for a target given as an address
 	log *slog.Logger
 
 	// limit is the highest TTL the next adaptive cycle probes; 0 = MaxTTL.
@@ -175,12 +213,27 @@ type runner struct {
 	mu         sync.Mutex
 	ip         netip.Addr
 	resolvedAt time.Time
-	resolving  bool
-	bg         sync.WaitGroup
+	// fallback is the address an earlier process used for the name (the
+	// AddressStore's), taken if the first lookup fails.
+	fallback  netip.Addr
+	resolving bool
+	bg        sync.WaitGroup
 }
 
 func newRunner(a *Agent, t *Target) *runner {
-	return &runner{a: a, t: t, log: a.log.With("target", t.Host, "protocol", string(t.Protocol))}
+	r := &runner{a: a, t: t, key: addressKey(t), log: a.log.With("target", t.Host, "protocol", string(t.Protocol))}
+	if e, ok := a.opts.Addresses.get(r.key); ok && r.key != "" {
+		if e.saved {
+			// After a restart: possibly old, so a lookup goes first.
+			r.fallback = e.ip
+		} else {
+			// After a reload: the previous configuration's address. With
+			// resolvedAt zero it is refreshed in the background at the
+			// first cycle, which never waits for a resolver that is down.
+			r.ip = e.ip
+		}
+	}
+	return r
 }
 
 func (r *runner) loop(ctx context.Context, offset time.Duration) {
@@ -320,7 +373,8 @@ func pathEnded(res []probe.HopResult) bool {
 
 // address returns the target address, resolving it on first use and
 // re-resolving in the background once it is older than the DNS TTL, so a
-// slow or failing resolver never delays a cycle once an address is known.
+// slow or failing resolver never delays a cycle once an address is known
+// (from an earlier lookup, or from the configuration before a reload).
 func (r *runner) address(ctx context.Context, now time.Time) (netip.Addr, error) {
 	if ip, err := netip.ParseAddr(r.t.Host); err == nil {
 		return ip.Unmap(), nil
@@ -351,15 +405,13 @@ func (r *runner) resolveTimeout() time.Duration {
 	return min(5*time.Second, max(r.t.Interval/2, time.Second))
 }
 
+// resolve looks the target's name up. If that fails, the address it has is
+// kept, and the first lookup takes the fallback: an outage that takes DNS
+// down with it is still recorded, as unreached cycles, rather than a gap.
+// A lookup that succeeds is kept for the next configuration and saved for
+// the next start.
 func (r *runner) resolve(ctx context.Context) (netip.Addr, error) {
-	network := "ip"
-	switch r.t.AF {
-	case 4:
-		network = "ip4"
-	case 6:
-		network = "ip6"
-	}
-	addrs, err := r.a.opts.Resolver.LookupNetIP(ctx, network, r.t.Host)
+	addrs, err := r.a.opts.Resolver.LookupNetIP(ctx, lookupNetwork(r.t.AF), r.t.Host)
 	var ip netip.Addr
 	if err == nil {
 		ip = pickAddr(addrs)
@@ -369,23 +421,40 @@ func (r *runner) resolve(ctx context.Context) (netip.Addr, error) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.resolving = false
 	if err != nil {
-		if r.ip.IsValid() && ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled) {
+		defer r.mu.Unlock()
+		shutdown := ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled)
+		switch {
+		case r.ip.IsValid() && shutdown:
 			return r.ip, nil // shutting down; not a resolver failure
-		}
-		if r.ip.IsValid() {
+		case r.ip.IsValid():
 			r.a.opts.Observer.ResolveFailed(r.t)
 			r.log.Warn("re-resolving target failed; keeping previous address", "ip", r.ip, "err", err)
+			return r.ip, nil
+		case r.fallback.IsValid() && !shutdown:
+			r.ip, r.fallback = r.fallback, netip.Addr{}
+			r.a.opts.Addresses.set(r.key, r.ip)
+			r.a.opts.Observer.ResolveFailed(r.t)
+			r.log.Warn("resolving target failed; using the address it had before the restart", "ip", r.ip, "err", err)
 			return r.ip, nil
 		}
 		return netip.Addr{}, fmt.Errorf("resolve %s: %w", r.t.Host, err)
 	}
-	if r.ip.IsValid() && r.ip != ip {
+	switch {
+	case r.ip.IsValid() && r.ip != ip:
 		r.log.Info("target address changed", "old", r.ip, "new", ip)
+	case !r.ip.IsValid() && r.fallback.IsValid() && r.fallback != ip:
+		r.log.Info("target address changed since the last start", "old", r.fallback, "new", ip)
 	}
-	r.ip, r.resolvedAt = ip, time.Now()
+	r.ip, r.resolvedAt, r.fallback = ip, time.Now(), netip.Addr{}
+	r.mu.Unlock()
+	r.a.opts.Addresses.set(r.key, ip)
+	if st := r.a.opts.AddressStore; st != nil {
+		if err := st.SaveAddress(r.key, ip); err != nil {
+			r.log.Warn("cannot save the target's address for the next start", "ip", ip, "err", err)
+		}
+	}
 	return ip, nil
 }
 

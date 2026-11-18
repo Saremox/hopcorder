@@ -167,6 +167,15 @@ The section for a version is the text of its GitHub release.
   as that user (a ClickHouse 25.8 bug) and removed every privilege of the
   grantee, Grafana's or the server's, for good. The user is created with
   `GRANTEES NONE`.
+- Agent: a reload (SIGHUP) or a restart during an outage that also takes
+  DNS down no longer leaves targets given by name without records. Each
+  configuration and each start resolved them anew, and with DNS down every
+  cycle failed: no record for the rest of the outage, while targets given
+  as addresses recorded it. A reload now keeps each name's address and
+  refreshes it in the background, and the spool keeps the last address
+  across restarts: if a name cannot be resolved at start, its target is
+  probed at the address it had, with a warning. In the chart a config
+  change restarts the pods, so this covers it too.
 
 **Security: server ingest**
 

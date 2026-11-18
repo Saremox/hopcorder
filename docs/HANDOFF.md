@@ -522,7 +522,9 @@ added in the commit that introduced it.
   segment index or cursor file to keep consistent, which segment files would
   need. Layout: `meta` (next seq, byte and record counters), `records` (8-byte
   big-endian seq → 8-byte timestamp + zstd-compressed JSON, compressed per
-  record), `cursors` (output name → last delivered seq). Trade-off: a bbolt
+  record), `cursors` (output name → last delivered seq), and since round
+  seven of the review `addresses` (a name target's lookup → the address it
+  last resolved to; see there). Trade-off: a bbolt
   file never shrinks; it reuses freed pages, so disk usage tracks the
   high-water mark of the pages in use. Since round six of the review
   `max_bytes` bounds the file, B+tree included (see there); before, it
@@ -556,7 +558,8 @@ added in the commit that introduced it.
   metrics, schedulers) shuts down as on SIGTERM and starts again with
   the new config; only the prober and its raw sockets survive (and, since
   round three of the security review, the metrics listener while its
-  address is unchanged). A full
+  address is unchanged; since round seven, the addresses the targets'
+  names resolved to). A full
   in-process restart was chosen over diffing configs because it applies every
   setting the same way and has one code path; the cost is a pause of about
   one shutdown (≤3s) and Prometheus counters restarting from zero, which
@@ -3899,3 +3902,86 @@ decisions:
   - Check: CI's `grafana` job runs the statement as Grafana's user for
     itself and for the server's user, requires the refusal, and that
     Grafana can still read.
+- **A reload or a restart keeps a name target's address while DNS is
+  down.** The address a name resolved to lived in the target's runner,
+  and every configuration starts new runners, as does every start: after
+  a SIGHUP (log rotation, a config push) or a restart during an outage
+  that took DNS down too, each cycle of a target given by name failed to
+  resolve and left no record, although the configuration before had kept
+  the address and recorded the outage as unreached cycles, and targets
+  given as addresses went on recording it. For names, the outage became a
+  gap again (review, round six; reproduced: the real binary in netns with
+  its own DNS server, SIGHUP 8 s into the outage, no record of the name
+  for 10 s while the address recorded 10 unreached cycles). In the chart
+  a config change is a restart (the pods roll on the ConfigMap's
+  checksum), so restarts matter as much as reloads. Now:
+  - The supervisor keeps an `agent.Addresses` across configurations: the
+    address each name resolved to, by its lookup (the name and its `af`,
+    as the network `ip`, `ip4` or `ip6`). A target of the next
+    configuration with the same name and `af` starts with it, whatever
+    its protocol, port or `flow_id`, refreshes it in the background at
+    its first cycle (as if `dns_ttl` had passed) and then every
+    `dns_ttl`, and keeps it while lookups fail, as a running
+    configuration always did. A changed answer is still picked up at a
+    reload, one cycle later than before, and the first cycle after a
+    reload no longer waits for a lookup of a name it had an address for.
+  - The spool keeps the addresses across restarts, in a bucket of its own
+    (`addresses`, which the first save creates; not `meta`, whose values
+    are its counters). Every lookup that succeeds saves its address, in a
+    transaction of its own that commits only if the address changed. At a
+    start the first lookup still goes first, since a saved address may be
+    from long ago; only if it fails is the saved one taken, with a warning
+    ("using the address it had before the restart") and
+    `hopcorder_resolve_errors_total` counted, and it is then refreshed
+    every cycle until DNS answers. Persisting was chosen over leaving
+    restarts out because it touches nothing of the spool's record path
+    and uses its existing transactions (`change`, `guard`, the
+    quarantine) as they are.
+  - Bounded: when a configuration's agent runs (not before, so a reload
+    that fails and is reverted finds every address of the configuration
+    it goes back to), it forgets the addresses of names none of its
+    targets looks up, in memory and in the spool. Targets given as
+    addresses have none.
+  - §5.2 (locked) is kept: records, `seq`, cursors and the bounds are not
+    touched. Each address operation is one bbolt transaction, atomic and
+    fsynced like every other, so a crash leaves the old or the new
+    address; at the size bound or on a full disk it makes room as any
+    operation does (`change`). A spool that never saved an address has no
+    such bucket, so the damage corpus's file is unchanged.
+  - Tests (fake prober, fake resolver): TestReloadKeepsAddressWhileDNSFails
+    (agent: the outage begins, then a reload with DNS failing records the
+    name unreached at its old address as often as the address target,
+    with no failed cycle; DNS answers another address, which is taken;
+    the next reload starts with it at once and looks it up once in five
+    cycles with an hour's `dns_ttl`), TestSavedAddressIsTheFallbackAfterARestart
+    (a stored address taken when the first lookup fails, but not one of
+    another family, and not when the lookup answers; names no target has
+    deleted from the store), TestAddressesForgetRemovedTargets (20
+    reloads with new names: only the current name's two lookups kept, in
+    memory and in the store), TestUsableSavedAddress, the review's run
+    with the fake network through `superviseDaemon` and a SIGHUP, with
+    lookups hanging as behind the review's dropped hop
+    (TestReloadKeepsNameTargetsRecordedWhileDNSFails: only the
+    supervisor's addresses keep the first cycle from waiting for a
+    lookup), and through `runDaemon` started again on the same spool
+    with lookups failing (TestRestartKeepsNameTargetsRecordedWhileDNSFails),
+    and the spool's TestAddressesPersist, TestAddressesBucket and
+    TestAddressAtTheSizeBound. Before the fix (the parent commit with only
+    the test hook, the package variable `resolver`, added): "after the
+    reload, while DNS fails: 0 records of dst.example, 10 of 192.0.2.1",
+    and the same after the restart. The tests fail with each part of the
+    fix taken out: the carried address, the supervisor passing it on, the
+    saved one, saving it (0 records of the name each), the pruning in
+    memory and in the store, the refresh at a reload.
+  - Accepted: a restart while DNS hangs (rather than failing) waits for
+    the first lookup's timeout (half the interval, 1 to 5 s) before it
+    takes the saved address, so that target's first cycle is late; later
+    ones are not. A saved address may be old (the agent was stopped for
+    long); it is probed only while lookups fail, and every record carries
+    `target_ip`. As before, any failed lookup keeps the address, NXDOMAIN
+    included. Targets with the same lookup share one address, so with
+    round-robin DNS (each lookup may answer another address first) a
+    reload may move one to the address another got, as a fresh lookup did
+    before. A target whose `af` changes starts without an address.
+    `--once` opens no spool and resolves every name. A spool file that is
+    quarantined takes its addresses with it.

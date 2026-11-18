@@ -124,11 +124,17 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 // fails to start (doubling from the first to the second).
 var restartBackoffMin, restartBackoffMax = time.Second, time.Minute
 
+// resolver looks up the targets' names; nil is the system's
+// (net.DefaultResolver). Tests replace it.
+var resolver agent.Resolver
+
 // superviseDaemon runs the daemon and restarts it with a freshly loaded
 // configuration whenever reload fires (SIGHUP). An invalid configuration is
 // logged and the running one is kept. A valid one replaces everything except
-// the prober (raw sockets stay open) and the metrics listener while its
-// address stays the same; the spool persists, so seq continues.
+// the prober (raw sockets stay open), the metrics listener while its
+// address stays the same, and the addresses the targets' names resolved to
+// (so a reload while DNS is down keeps recording them); the spool persists,
+// so seq continues.
 //
 // Only the first start can end the supervisor (returning its error); a
 // running agent is never stopped by a reload. If a new configuration fails
@@ -137,7 +143,7 @@ var restartBackoffMin, restartBackoffMax = time.Second, time.Minute
 // it starts or a reload brings one that does.
 func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, reload <-chan os.Signal,
 	load func() (*config.Config, error), mkLogger func(*config.Config) *slog.Logger) error {
-	s := &supervisor{prober: prober}
+	s := &supervisor{prober: prober, addrs: agent.NewAddresses()}
 	defer s.closeMetrics()
 	var (
 		good    *config.Config // the configuration that started last; nil before the first start
@@ -209,11 +215,16 @@ func superviseDaemon(ctx context.Context, cfg *config.Config, prober probe.Probe
 }
 
 // supervisor owns what superviseDaemon keeps across configurations besides
-// the prober: the metrics listener, and the flows the prober holds.
+// the prober: the metrics listener, the flows the prober holds, and the
+// targets' addresses.
 type supervisor struct {
 	prober  probe.Prober
 	metrics *output.MetricsServer // bound for the running configuration; nil: it has no metrics
 	flows   []probe.Flow          // held for the configuration that started last
+	// addrs are the addresses the names of the configuration that ran last
+	// resolved to. Each configuration's agent forgets the others once it
+	// runs, so a reload that is reverted finds the previous ones.
+	addrs *agent.Addresses
 }
 
 // daemonRun is a started runDaemon.
@@ -256,7 +267,7 @@ func (s *supervisor) start(ctx context.Context, cfg *config.Config, logger *slog
 	started := make(chan struct{})
 	go func() {
 		r.done <- runDaemon(runCtx, cfg, s.prober, logger,
-			daemonEnv{metrics: ms, flowsHeld: true, started: func() { close(started) }})
+			daemonEnv{metrics: ms, flowsHeld: true, addrs: s.addrs, started: func() { close(started) }})
 	}()
 	select {
 	case <-started:
@@ -440,7 +451,7 @@ func runOnce(ctx context.Context, cfg *config.Config, prober probe.Prober, logge
 	holdFlows(prober, flowsOf(targets), logger)
 	a, err := agent.New(agent.Options{
 		AgentID: cfg.AgentID, Targets: targets, DNSTTL: cfg.DNSTTL.D(),
-		Prober: prober, Logger: logger,
+		Prober: prober, Resolver: resolver, Logger: logger,
 	})
 	if err != nil {
 		logger.Error("cannot start agent", "err", err)
@@ -476,6 +487,10 @@ type daemonEnv struct {
 	// flowsHeld says the supervisor holds cfg's flows (see
 	// supervisor.start); if false, runDaemon holds them itself.
 	flowsHeld bool
+	// addrs are the addresses of the previous configuration's targets'
+	// names, which the agent starts from; nil: none (the spool still has
+	// those of the last start).
+	addrs *agent.Addresses
 	// started, if set, is called once the daemon runs.
 	started func()
 }
@@ -561,9 +576,12 @@ func runDaemon(ctx context.Context, cfg *config.Config, prober probe.Prober, log
 		observer = metrics
 	}
 
+	// The spool keeps the names' addresses for the next start, as the
+	// supervisor does for the next configuration.
 	a, err := agent.New(agent.Options{
 		AgentID: cfg.AgentID, Targets: targets, DNSTTL: cfg.DNSTTL.D(),
-		Prober: prober, Sink: sp, Observer: observer, Logger: logger,
+		Prober: prober, Sink: sp, Observer: observer, Resolver: resolver, Logger: logger,
+		Addresses: env.addrs, AddressStore: sp,
 	})
 	if err != nil {
 		return err
