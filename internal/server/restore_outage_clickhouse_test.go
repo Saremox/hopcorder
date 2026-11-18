@@ -712,3 +712,155 @@ func TestLateCommitOfALostCloseRowLeavesNothingOpen(t *testing.T) {
 		t.Errorf("at the end: %s, want %s", got, want)
 	}
 }
+
+// flapThenDown is n one-cycle outages at 52, 54, ..., then a long outage
+// from longFrom to longTo: a lossy destination, every lost reply a
+// one-cycle outage, then down.
+func flapThenDown(n int, longFrom, longTo uint64) func(uint64) []string {
+	return func(seq uint64) []string {
+		if seq >= 52 && seq < 52+2*uint64(n) && seq%2 == 0 || seq >= longFrom && seq <= longTo {
+			return brokenA
+		}
+		return pathA
+	}
+}
+
+// shortOutages is storedOutages' text for the first n one-cycle outages
+// of flapThenDown.
+func shortOutages(n int) string {
+	var b strings.Builder
+	for i := range n {
+		fmt.Fprintf(&b, "[%d to %d: 1 cycles] ", 52+2*i, 53+2*i)
+	}
+	return b.String()
+}
+
+// One failed part in which the stream closes more outages than maxPending,
+// then is down (review, round thirteen). Until then the stream was restored
+// past the bound, and the restore rebuilt the long outage from storage,
+// which never had its open row: [121 to 161: 40 cycles] in a catch-up
+// batch. Now the newest one-cycle outages are dropped (lost with their
+// insert, as round six accepted) and the stream goes on from its own state.
+func TestManyLostClosesInACatchUpPartKeepTheNextOutagesStart(t *testing.T) {
+	for _, n := range []int{maxPending + 1, 20} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &faultStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			longFrom := uint64(52 + 2*n + 2)
+			spec := flapThenDown(n, longFrom, 160)
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			st.failOutages = 3
+			ingest(51, 150) // n one-cycle outages and the start of the long one: all rows lost
+			ingest(151, 160)
+			ingest(161, 170)
+			want := fmt.Sprintf("[%s[%d to 161: %d cycles]]", shortOutages(maxPending), longFrom, 161-longFrom)
+			if got := storedOutages(t, c); got != want {
+				t.Errorf("got %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// The same in an ordinary batch, with the stream's next restore failed or
+// skipped while the long outage ends: it was not recorded at all, and the
+// batch's route change was lost with the skipped cycles.
+func TestManyLostClosesThenSkippedRestoreKeepTheNextBatch(t *testing.T) {
+	for _, why := range []string{"failed", "budget"} {
+		t.Run(why, func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &faultStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			n := maxPending + 1
+			longFrom := uint64(52 + 2*n + 2)
+			end := longFrom + 6
+			flap := flapThenDown(n, longFrom, end-1)
+			spec := func(seq uint64) []string {
+				if seq >= end+4 {
+					return pathB
+				}
+				return flap(seq)
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			st.failOutages = 3
+			ingest(51, longFrom+2) // n one-cycle outages and the start of the long one: rows lost
+			if why == "failed" {
+				st.failReplay = true
+			} else {
+				in.maxRestores = 0
+			}
+			ingest(longFrom+3, end+10) // reached again at end, the route changes at end+4
+			st.failReplay, in.maxRestores = false, maxRestores
+			ingest(end+11, end+20)
+			want := fmt.Sprintf("[%s[%d to %d: 6 cycles]]", shortOutages(maxPending), longFrom, end)
+			if got := storedOutages(t, c); got != want {
+				t.Errorf("outages %s, want %s", got, want)
+			}
+			type change struct {
+				Seq     uint64 `json:"seq"`
+				PrevSeq uint64 `json:"prev_seq"`
+				Reason  string `json:"reason"`
+			}
+			rows, err := clickhouse.QueryInto[change](t.Context(), c,
+				"SELECT seq, prev_seq, reason FROM path_changes FINAL ORDER BY seq", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := fmt.Sprint(rows), fmt.Sprintf("[{%d %d router}]", end+4, end+3); got != want {
+				t.Errorf("path changes %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+// And with the failed insert committed after the next part: the restore's
+// later copy of the long outage stood beside the original, which stayed
+// "ongoing" for good.
+func TestManyLostClosesLateCommitLeavesNothingOpen(t *testing.T) {
+	c := testClickHouse(t)
+	st := &lateStore{Client: c}
+	in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+	n := maxPending + 1
+	longFrom := uint64(52 + 2*n + 2)
+	spec := flapThenDown(n, longFrom, 160)
+	ingest := func(from, to uint64) {
+		t.Helper()
+		if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for from := uint64(1); from <= 41; from += 10 {
+		ingest(from, from+9)
+	}
+	st.late = true
+	ingest(51, 150)
+	ingest(151, 160)
+	st.late = false
+	if err := c.InsertJSON(t.Context(), "outages", st.saved); err != nil { // ClickHouse commits it now
+		t.Fatal(err)
+	}
+	ingest(161, 170)
+	want := fmt.Sprintf("[%s[%d to 161: %d cycles]]", shortOutages(n), longFrom, 161-longFrom)
+	if got := storedOutages(t, c); got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}

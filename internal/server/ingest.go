@@ -120,7 +120,8 @@ func newAgentState() *agentState {
 const (
 	// DefaultMaxStreams: a stream costs about 1 KiB (15 IPv4 hops) to 9 KiB
 	// (255 IPv6 hops and a 255-character target), so 20,000 hold at most
-	// about 170 MiB.
+	// about 170 MiB; while outages inserts fail, up to maxPending close rows
+	// a stream add at most 4.7 KiB more (about 93 MiB).
 	DefaultMaxStreams = 20000
 	// DefaultMaxStreamsPerAgent is as many streams as one request may
 	// carry; an agent has a stream per target, protocol and flow. (At most
@@ -527,13 +528,14 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 		}
 		part := recs[stored:end]
 		last := part[len(part)-1].Seq
-		sure := !a.unsure
+		sure, rederived := !a.unsure, false
 		if a.unsure {
 			found, err := in.findStored(wctx, id, part)
 			if err != nil {
 				return stored, err
 			}
 			if len(found) > 0 {
+				rederived = true
 				if err := in.fillViews(wctx, id, part, found); err != nil {
 					return stored, err
 				}
@@ -563,16 +565,21 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 		// held open but rebuilt the stream's next outage, whose open row was
 		// lost in the same insert, from storage, which never had it: with a
 		// later start, or not at all if that restore failed or did not fit.
-		// Only past maxPending is the stream restored, as then.
+		// A loaded stream is never restored now (round thirteen: past a
+		// bound of 8 rows it still was, and one part of a lossy destination
+		// has more closes than that).
 		for _, o := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
 			s, ok := a.streams[streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID}]
-			switch {
-			case !ok || !s.loaded:
-			case len(s.pending) < maxPending:
-				s.pending = append(s.pending, o)
-			default:
-				s.loaded, s.pending = false, nil
+			if !ok || !s.loaded {
+				continue
 			}
+			if o.pend == pendNew {
+				o.pend = pendOwn
+				if o.StartSeq < part[0].Seq || rederived {
+					o.pend = pendKeep
+				}
+			}
+			s.keepPending(o)
 		}
 		in.writeMark(wctx, id, last)
 		a.highWater, a.unsure = last, !sure
@@ -1252,8 +1259,8 @@ func clickhouseQuery[T any](ctx context.Context, st Store, q string, p clickhous
 }
 
 // maxPending is how many outage close rows that could not be stored a
-// stream keeps to write again with its next part; past it, the stream is
-// restored from storage at its next cycle instead (storeRecords).
+// stream keeps to write again with its next part (keepPending): at most
+// about 600 bytes each with the longest names, 4.7 KiB a stream.
 const maxPending = 8
 
 // insertEvents stores events in inserts of at most partBytes of JSON each,

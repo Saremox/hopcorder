@@ -5235,11 +5235,11 @@ MEDIUM.
     `storeRecords` keeps them on their stream (`pending`, at most
     `maxPending` = 8); `derive` adds them to the stream's next part's
     events, so the stream stays loaded and goes on from its own state, as it
-    does for a lost open row. Only a stream with more than 8 lost close rows
-    in a row (8 failed parts that each closed one of its outages) is
-    restored from storage, as #85 did: storage then holds at most one of
-    those outages open (the one open when the failures began; the later
-    ones' rows were all in failed inserts), and the restore closes it.
+    does for a lost open row. As first merged, a stream with more than 8
+    lost close rows was restored from storage, as #85 did; that took one
+    failed part of a lossy destination, not 8 failed parts, and rebuilt
+    the stream's current outage (round thirteen: see "A loaded stream is
+    never rebuilt from storage").
   - Outages whose rows were all in failed inserts are now recorded too, as
     long as the stream comes again within the bound: a close row carries
     the whole outage. They are still lost if the server restarts, or the
@@ -5248,7 +5248,7 @@ MEDIUM.
   - A close row written again is not counted again in
     `hopcorder_server_outages_total` (`events.resent`); round eleven's L1
     (a lost row's event counted twice through the restore's repair row)
-    remains only past the bound.
+    is gone with the restore (round thirteen).
   - Tests (`clickhouse` tag), each failing on 192d757:
     `TestLostCloseRowKeepsTheNextOutagesStart` (`[[121 to 161: 40 cycles]]`
     before, `[[60 to 61: 1 cycles] [70 to 161: 91 cycles]]` after),
@@ -5272,4 +5272,74 @@ MEDIUM.
   prefix in every database of the ClickHouse server, so two hopcorder
   servers sharing one ClickHouse and agent_ids can cancel each other's
   writes (retried; nothing lost).
+
+### Security and correctness review, round thirteen
+
+A focused round (the owner's choice) on round twelve's fix (#90). Within
+its bound #90 holds: round twelve's PoCs and differentials pass (but the
+documented restart case, seed 5033), round eleven's oracle passes 199 of
+200 (the one failure the oracle's own model), and the chaos harness on the
+real binary matched the clean run on all 77 outages in two of four runs,
+the other two differing only by the documented loss when the server is
+killed. But the bound was reached by rows, not failed parts: one HIGH, one
+MEDIUM.
+
+- **A loaded stream is never rebuilt from storage** (`storeRecords` and
+  `stream.keepPending`, `internal/server/ingest.go` and `streams.go`;
+  `outageRow.pend`, `rows.go`; review round thirteen, H1, HIGH, and M1, both
+  from #90). Past `maxPending` (8) lost close rows #90 restored the stream
+  from storage, as #85 had for every lost close row. One failed outages
+  insert in which a stream closes nine outages reaches that: with 5% reply
+  loss a stream has nine one-cycle outages in about 180 cycles, and the
+  agent's batch is 500 records. The restore then rebuilt the stream's
+  current outage, whose open row was in the same failed insert, from
+  storage: round twelve's H1 again (a later start in a catch-up batch, not
+  recorded when the next restore failed or did not fit, "ongoing" for good
+  beside a later copy after a late commit), and its M1 (the next batch's
+  route changes lost when that restore could not run). Measured by the
+  reviewer with round twelve's differential extended to a lossy
+  destination (one reply in four lost, catch-up batches of 300-500
+  records): 8 of 100 runs wrong, each from a single lost batch; with up to
+  four lost batches in a row and late commits, 10 of 100, 4 of them
+  "ongoing" for good.
+  - Now `storeRecords` classifies each lost close row when it is first
+    lost: `pendOwn` if its outage opened and closed within the failed part
+    (that part wrote no other row of it, so storage has nothing of it),
+    `pendKeep` if it started before the part, or the part was derived
+    before (found stored after a crash before its mark), so that storage may
+    hold it open. Past the bound `keepPending` drops a `pendOwn` row, lost
+    with its insert as round six accepted, and lets a `pendKeep` row take the
+    place of the newest `pendOwn` one. The stream is never unloaded, so
+    nothing rebuilds its tracker or its current outage.
+  - A part adds at most one `pendKeep` row a stream (the outage open when
+    it began), so a row that must be kept is dropped only after more than
+    8 failed parts in a row each of which closed an outage begun before it;
+    then the newest is dropped and the oldest stays. Storage holds an
+    outage open only through an insert that succeeded, so without late
+    commits only the oldest of those can be open there. Residual (not
+    measured): a dropped `pendKeep` row whose open row was committed late
+    leaves that outage "ongoing" until a restore of the stream closes it
+    (a restart or an idle drop, then #82's restore, which looks at the
+    newest outage only).
+  - Memory: about 600 bytes a pending row with the longest names, 4.7 KiB a
+    stream at the bound, about 93 MB at the default 20,000 streams on top of
+    their 170 MiB; only failing outages inserts fill it (noted at
+    `DefaultMaxStreams`).
+  - Tests (`clickhouse` tag), each failing on 27e9cd8:
+    `TestManyLostClosesInACatchUpPartKeepTheNextOutagesStart` (9 and 20
+    one-cycle outages: `[[121 to 161: 40 cycles]]` before; after, the first
+    8 and `[72 to 161: 89 cycles]`),
+    `TestManyLostClosesThenSkippedRestoreKeepTheNextBatch` (a failed
+    restore and a used-up budget: no outages and no route change before)
+    and `TestManyLostClosesLateCommitLeavesNothingOpen` (`[72 to ongoing:
+    79 cycles]` beside `[121 to 161: 40 cycles]` before). Default run:
+    `TestManyLostClosesInAPartKeepTheStreamsOutage` (one failed part with
+    20 closes, and the long outage closing in a second failed part: its row
+    kept over the first part's newest; `[91 to 200: 109 cycles]` for
+    `[54 to 200: 146 cycles]` on 27e9cd8), `TestKeepPendingBound`, and
+    `TestLostCloseRowsAreWrittenAgain` (past the bound: the newest dropped,
+    no restore; restored on 27e9cd8).
+- **Not fixed (low):** `hopcorder_server_outages_total` counts outages
+  when they are derived, so one whose rows are dropped past the bound is
+  counted though not stored.
 
