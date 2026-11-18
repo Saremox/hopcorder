@@ -289,6 +289,11 @@ func (c *Client) do(ctx context.Context, useDB bool, q url.Values, params Params
 	for k, v := range params {
 		q.Set("param_"+k, escapeParam(v))
 	}
+	// No progress in the headers, whatever the user's profile says: once
+	// ClickHouse has sent a progress header the status is 200, and an
+	// exception after it goes into the body (review, round six). A
+	// profile that makes the setting constant fails every request instead.
+	q.Set("send_progress_in_http_headers", "0")
 	u := c.base
 	u.RawQuery = q.Encode()
 	// Statements and inserts: the whole exchange within the timeout. Queries:
@@ -336,7 +341,9 @@ func (c *Client) do(ctx context.Context, useDB bool, q url.Values, params Params
 		w.t.Stop()
 		rb = w
 	}
-	if resp.StatusCode != http.StatusOK {
+	// An exception code is an error whatever the status: the 200 of an
+	// answer whose status went out before the exception.
+	if resp.StatusCode != http.StatusOK || len(resp.Header.Values("X-ClickHouse-Exception-Code")) > 0 {
 		text, _ := io.ReadAll(io.LimitReader(rb, 4<<10))
 		return &Error{Status: resp.StatusCode, Code: resp.Header.Get("X-ClickHouse-Exception-Code"),
 			Text: strings.TrimSpace(string(text))}

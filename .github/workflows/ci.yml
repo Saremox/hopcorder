@@ -103,8 +103,9 @@ jobs:
           grep -q -- '--- PASS: TestFullTmpfs ' spool.out
 
   clickhouse:
-    # Server tests against a real ClickHouse: migrations, every query, and
-    # the agent -> server -> ClickHouse path.
+    # Server tests against a real ClickHouse: migrations, every query, the
+    # client's answers to a user with progress headers, and the agent ->
+    # server -> ClickHouse path.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -130,7 +131,7 @@ jobs:
       - name: test against ClickHouse
         env:
           HOPCORDER_CLICKHOUSE_URL: http://127.0.0.1:8123
-        run: go test -tags clickhouse -race -count=1 ./internal/server/... ./cmd/hopcorder/...
+        run: go test -tags clickhouse -race -count=1 ./internal/clickhouse/... ./internal/server/... ./cmd/hopcorder/...
 
   grafana:
     # The docker-compose try-out stack built from this commit, with the real
@@ -188,7 +189,9 @@ jobs:
             fi
             grep -q 'not allowed as grantee' <<<"$out" || { echo "unexpected refusal: $out"; exit 1; }
           done
-          test "$(as grafana "SELECT count() > 0 FROM hopcorder.cycles")" = 1 || { echo "the Grafana user lost its grants"; exit 1; }
+          # Its SELECT still works (the count may still be 0 this early).
+          out=$(as grafana "SELECT count() FROM hopcorder.cycles")
+          [[ "$out" =~ ^[0-9]+$ ]] || { echo "the Grafana user lost its grants: $out"; exit 1; }
       - name: ClickHouse's logs leave room for the data
         # One failing query of Grafana's user wrote its exception message,
         # up to its memory limit, into query_log and text_log: the system
