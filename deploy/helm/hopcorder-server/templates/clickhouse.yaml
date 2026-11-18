@@ -59,6 +59,9 @@ data:
     <clickhouse>
         <user_files_path>/srv/</user_files_path>
         <format_schema_path>/srv/</format_schema_path>
+        <!-- remote() and the like resolve their host before the grant
+             check; with this they resolve nothing (review round seven). -->
+        <remote_url_allow_hosts><host>localhost</host></remote_url_allow_hosts>
         <logger>
             <level>warning</level>
             <console>1</console>
@@ -322,10 +325,11 @@ spec:
 {{- if $d.networkPolicy.enabled }}
 ---
 # Only the hopcorder server (and networkPolicy.from) may reach ClickHouse,
-# and ClickHouse may reach nothing but DNS: Grafana's read-only user can make
-# it open connections to any host and port with hasColumnInTable('host:port',
-# ...), which no grant covers (review round seven). ClickHouse here needs no
-# outbound connection.
+# and ClickHouse may reach nothing: Grafana's read-only user can make it open
+# connections to any host and port with hasColumnInTable('host:port', ...),
+# which no grant covers, and look up any name (review round seven; a rule
+# for DNS let it reach port 53 anywhere). ClickHouse here needs neither an
+# outbound connection nor DNS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -349,11 +353,6 @@ spec:
       ports:
         - port: http
           protocol: TCP
-  egress:
-    - ports:
-        - port: 53
-          protocol: UDP
-        - port: 53
-          protocol: TCP
+  egress: []
 {{- end }}
 {{- end }}

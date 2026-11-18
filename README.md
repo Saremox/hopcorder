@@ -200,7 +200,7 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   `clickhouse.passwordSecret`), points the server at it, sizes its caches for
   about 2 GiB, keeps its own logs for 7 days on a disk of their own that
   leaves a quarter of the volume to the data, and lets only the server reach
-  it and it reach nothing but DNS (a NetworkPolicy; add Grafana with
+  it and it reach nothing (a NetworkPolicy; add Grafana with
   `clickhouse.deploy.networkPolicy.from`).
   `clickhouse.deploy.readOnlyUser.enabled` adds a read-only user for Grafana
   (SELECT on the hopcorder database, bounded queries), with its password in a

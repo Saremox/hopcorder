@@ -3746,8 +3746,17 @@ decisions:
   `remote_url_allow_hosts` does not cover it, and nothing in 25.8 turns
   the function off. ClickHouse needs no outbound connection here, so:
   - The chart's ClickHouse NetworkPolicy has `policyTypes: [Ingress,
-    Egress]` and allows egress to port 53 only (DNS, UDP and TCP), with a
-    CNI that enforces NetworkPolicy.
+    Egress]` and `egress: []`: ClickHouse may connect to nothing, with a
+    CNI that enforces NetworkPolicy. A first rule allowing DNS (port 53,
+    no `to:`) let it reach port 53 of any address and look up any name
+    (the confirming sweep); ClickHouse here starts, serves and stores
+    without DNS (checked there).
+  - Both configs set `remote_url_allow_hosts` to `localhost`: `remote()`
+    and `remoteSecure()` resolved their host before the grant check
+    refused them (up to 1,000 lookups a query with a host pattern); now
+    they are refused (`UNACCEPTABLE_URL`) before any lookup.
+    `hasColumnInTable` still resolves and connects; the network is what
+    stops it.
   - Compose puts ClickHouse on an `internal` network (`clickhouse`), with
     the server and Grafana on it and on the default network: ClickHouse
     reaches neither the internet nor the host's other networks, and
@@ -3756,8 +3765,13 @@ decisions:
   - Checks: CI's `grafana` job runs `hasColumnInTable('1.1.1.1:9000', …)`
     as Grafana's user and requires "Network is unreachable" (the runner
     has a route there, so before it the attempt went out); the helm job
-    checks the rendered NetworkPolicy. kind's enforcement of
-    NetworkPolicy is not relied on.
+    checks the rendered NetworkPolicy (`egress: []`) and
+    `remote_url_allow_hosts`. kind's enforcement of NetworkPolicy is not
+    relied on.
+  - Left: compose's internal network still reaches the host through its
+    gateway address. The bridge option that removes it
+    (`com.docker.network.bridge.inhibit_ipv4`) needs a recent Docker, and
+    older ones would refuse the stack; the try-out runs on one host.
 - **ClickHouse's own logs cannot take the data's last quarter of the
   volume.** One failing query of Grafana's read-only user (`SELECT 1 WHERE
   throwIf(1, <a message as long as its memory limit allows>)`) stored the
