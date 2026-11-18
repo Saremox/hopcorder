@@ -274,3 +274,55 @@ func TestDrainFutureTimestampsDoNotStall(t *testing.T) {
 	}
 	eventually(t, 2*time.Second, func() bool { return len(out.all()) == 3 }, "future-stamped records stalled")
 }
+
+// An open goes on from the clock (the spool's raise), so after a restart
+// the seqs skip ahead of the records still to deliver; batching counts the
+// records, not the seqs skipped (review, round eight). A partial batch
+// keeps waiting for its flush interval while fewer than MaxRecords are
+// pending, the records from before and after the restart go out together
+// once a full batch is, in order, and nothing is pending after it.
+func TestDrainAcrossTheClock(t *testing.T) {
+	opts := spool.Options{Dir: t.TempDir(), MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"m"}}
+	s, err := spool.Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := s.Stats().LastSeq
+	push(t, s, 3) // undelivered before the restart
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	opts.Now = func() time.Time { return later }
+	if s, err = spool.Open(opts); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if p := s.Pending("m"); p != 3 {
+		t.Errorf("%d pending after the restart, want 3", p)
+	}
+	out := &memOutput{name: "m"}
+	startDrain(t, s, out, DrainOptions{MaxRecords: 10, FlushInterval: time.Hour})
+	push(t, s, 1)
+	time.Sleep(100 * time.Millisecond)
+	if n := out.calls.Load(); n != 0 {
+		t.Fatalf("a partial batch of %d records went out at once (%d deliveries)", s.Pending("m"), n)
+	}
+	push(t, s, 6) // ten pending: a full batch
+	eventually(t, 2*time.Second, func() bool { return len(out.all()) == 10 }, "the full batch was not delivered")
+	want := []string{}
+	for i := range uint64(3) {
+		want = append(want, fmt.Sprintf(`{"seq":%d}`, base+1+i))
+	}
+	first := clockSeq(later)
+	for i := range uint64(7) {
+		want = append(want, fmt.Sprintf(`{"seq":%d}`, first+i))
+	}
+	if got := strings.Join(out.all(), ","); len(out.batches) != 1 || got != strings.Join(want, ",") {
+		t.Errorf("delivered %d batches, %s; want one, %s", len(out.batches), got, strings.Join(want, ","))
+	}
+	eventually(t, time.Second, func() bool { return s.Pending("m") == 0 }, "records pending after delivery")
+}
+
+// clockSeq is the seq a spool opened at now goes on from (the spool's).
+func clockSeq(now time.Time) uint64 { return uint64(now.UnixMicro()) } //nolint:gosec // after 1970

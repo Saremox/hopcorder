@@ -137,7 +137,8 @@ const (
 	sweepInterval       = time.Minute
 	// staleWindow: a batch whose seqs all lie this far below the agent's
 	// stored ones is not a retry but a reset spool or a second agent with
-	// the same agent_id.
+	// the same agent_id, unless the server holds every one of its cycles
+	// (see holdsAll).
 	staleWindow = 100000
 	// insertTimeout bounds the writes of one agent's batch (cycles, hop
 	// and loop rows filled in, the mark), which are not cancelled when the
@@ -179,8 +180,9 @@ const (
 )
 
 // ErrStaleBatch is returned for a batch whose records all lie far below the
-// agent's stored seqs; storing nothing and reporting success would make the
-// agent discard them silently.
+// agent's stored seqs, and which the server does not hold as they are (see
+// holdsAll); storing nothing and reporting success would make the agent
+// discard them silently.
 var ErrStaleBatch = errors.New("seqs far below the ones stored for this agent_id: was the agent's spool reset, " +
 	"or does another agent use the same agent_id? Give it a new agent_id")
 
@@ -477,9 +479,15 @@ func (in *Ingester) ingestAgent(ctx context.Context, id string, recs []*record.R
 	}
 	if len(fresh) == 0 {
 		if n := len(recs); n > 0 && recs[n-1].Seq < a.highWater && a.highWater-recs[n-1].Seq > staleWindow {
-			in.log.Warn("agent sends seqs far below what is stored; refusing the batch so the agent keeps it",
-				"agent_id", id, "batch_max_seq", recs[n-1].Seq, "stored_max_seq", a.highWater)
-			return 0, 0, ErrStaleBatch
+			held, err := in.holdsAll(ctx, id, recs)
+			if err != nil {
+				return 0, 0, err
+			}
+			if !held {
+				in.log.Warn("agent sends seqs far below what is stored; refusing the batch so the agent keeps it",
+					"agent_id", id, "batch_max_seq", recs[n-1].Seq, "stored_max_seq", a.highWater)
+				return 0, 0, ErrStaleBatch
+			}
 		}
 		in.metrics.records(0, dups)
 		return 0, dups, nil
@@ -685,6 +693,36 @@ func (in *Ingester) findStored(ctx context.Context, id string, part []*record.Re
 		}
 	}
 	return found, nil
+}
+
+// holdsAll reports whether cycles holds every one of recs (agent id's, in
+// seq order) as it is: a cycle at its seq with its ts, to the millisecond
+// that cycles keeps. A batch far below the agent's mark that it holds so
+// is one the server stored before, delivered again, not a reset spool's
+// or another agent's (review, round eight): an agent's seqs jump at every
+// open of its spool (they go on from the clock), so the batch of a spool
+// that went back to an earlier state, or a retry cut shorter, can lie
+// that far below.
+func (in *Ingester) holdsAll(ctx context.Context, id string, recs []*record.Record) (bool, error) {
+	type row struct {
+		Seq uint64 `json:"seq"`
+		MS  int64  `json:"ms"`
+	}
+	rows, err := clickhouseQuery[row](ctx, in.store,
+		"SELECT DISTINCT seq, toUnixTimestamp64Milli(ts) AS ms FROM cycles WHERE "+partWindow, windowParams(id, recs))
+	if err != nil {
+		return false, fmt.Errorf("look up stored cycles of %s: %w", id, err)
+	}
+	held := make(map[row]bool, len(rows))
+	for _, r := range rows {
+		held[r] = true
+	}
+	for _, r := range recs {
+		if !held[row{r.Seq, r.TS.UnixMilli()}] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // The hop and loop rows of stored cycles that hops_mv and loop_events_mv

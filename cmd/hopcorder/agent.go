@@ -134,7 +134,8 @@ var resolver agent.Resolver
 // the prober (raw sockets stay open), the metrics listener while its
 // address stays the same, and the addresses the targets' names resolved to
 // (so a reload while DNS is down keeps recording them); the spool persists,
-// so seq continues.
+// so seq goes on (from the clock, when that is ahead: see the spool's
+// clockSeq).
 //
 // Only the first start can end the supervisor (returning its error); a
 // running agent is never stopped by a reload. If a new configuration fails

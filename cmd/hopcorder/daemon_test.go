@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -214,8 +215,9 @@ func getMetrics(t *testing.T, addr string) string {
 // TestOutageAndRecovery is the M1 acceptance scenario against a mock ingest
 // endpoint: the network dies mid-run (connections reset), the server then
 // answers 503, the agent is restarted during the outage, and once the
-// endpoint recovers every spooled record arrives, with no gaps and no
-// duplicates after dedup on (agent_id, seq).
+// endpoint recovers every spooled record arrives, with no gaps (in the
+// seqs of each run: the restart goes on from the clock) and no duplicates
+// after dedup on (agent_id, seq).
 func TestOutageAndRecovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("multi-second end-to-end test")
@@ -257,6 +259,10 @@ func TestOutageAndRecovery(t *testing.T) {
 	shutdownGrace = 200 * time.Millisecond // the endpoint is down; do not wait long
 	stop()                                 // agent restarted during the outage
 
+	// A restart goes on from the clock (see the spool's raise): here from
+	// an hour further ahead, so that the seqs of each run are known.
+	last := lastSeq(t, dir+"/spool")
+	base2 := newSpoolAhead(t, dir+"/spool", 2*time.Hour)
 	// Records produced so far must all be in the spool or delivered.
 	ingest.mode.Store("up")
 	stop = startDaemon(t, cfg, fakeNetwork())
@@ -264,14 +270,12 @@ func TestOutageAndRecovery(t *testing.T) {
 	shutdownGrace = 5 * time.Second // now drain everything before exiting
 	stop()
 
-	sp, err := spool.Open(spool.Options{Dir: dir + "/spool", MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	sp := openSpool(t, dir+"/spool")
 	defer sp.Close()
 	st := sp.Stats()
 	unique, dupes, maxSeq := ingest.snapshot()
-	produced := st.LastSeq - base
+	runs := [][2]uint64{{base, last}, {base2, st.LastSeq}} // the seqs before each run's first, and its last
+	produced := last - base + st.LastSeq - base2
 	t.Logf("spool produced %d records, delivered %d unique (%d duplicates) in %d posts", produced, unique, dupes, ingest.posts)
 	// At least the 8 outage cycles beyond what was delivered before it
 	// (allowing for the last cycles being counted before they are spooled).
@@ -284,9 +288,11 @@ func TestOutageAndRecovery(t *testing.T) {
 	if maxSeq != st.LastSeq || uint64(unique) != produced {
 		t.Errorf("delivered %d unique records up to seq %d; spool assigned %d up to %d", unique, maxSeq, produced, st.LastSeq)
 	}
-	for seq := base + 1; seq <= st.LastSeq; seq++ {
-		if ingest.received[seq] == 0 {
-			t.Errorf("seq %d never delivered", seq)
+	for _, run := range runs {
+		for seq := run[0] + 1; seq <= run[1]; seq++ {
+			if ingest.received[seq] == 0 {
+				t.Errorf("seq %d never delivered", seq)
+			}
 		}
 	}
 	if len(ingest.invalid) > 0 {
@@ -349,10 +355,7 @@ func TestShutdownShipsPartialBatch(t *testing.T) {
 	if d := time.Since(start); d > 2*time.Second {
 		t.Errorf("shutdown took %v; it should end as soon as the spool is drained", d)
 	}
-	sp, err := spool.Open(spool.Options{Dir: dir + "/spool", MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	sp := openSpool(t, dir+"/spool")
 	defer sp.Close()
 	unique, _, _ := ingest.snapshot()
 	if p := sp.Pending("http"); p != 0 || unique == 0 || uint64(unique) != sp.Stats().LastSeq-base {
@@ -360,11 +363,24 @@ func TestShutdownShipsPartialBatch(t *testing.T) {
 	}
 }
 
-// newSpool creates the spool an http-only daemon will use and returns the
-// seq before its first record: a new spool's seqs start at the clock.
+// newSpool creates the spool an http-only daemon will use, an hour ahead
+// (see newSpoolAhead), and returns the seq before its first record.
 func newSpool(t *testing.T, dir string) uint64 {
 	t.Helper()
-	sp, err := spool.Open(spool.Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
+	return newSpoolAhead(t, dir, time.Hour)
+}
+
+// newSpoolAhead opens (or creates) the spool an http-only daemon will use
+// with the clock ahead by d, so that it goes on from the clock's seq then,
+// and returns the seq before its next record. A daemon started after it
+// has the clock behind that and goes on from the spool's counter (see the
+// spool's raise): its records are the seqs after the one returned, one by
+// one.
+func newSpoolAhead(t *testing.T, dir string, d time.Duration) uint64 {
+	t.Helper()
+	now := time.Now().Add(d)
+	sp, err := spool.Open(spool.Options{Dir: dir, MaxAge: d + 24*time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"},
+		Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,6 +389,83 @@ func newSpool(t *testing.T, dir string) uint64 {
 		t.Fatal(err)
 	}
 	return base
+}
+
+// openSpool opens the spool an http-only daemon used, as it is: with the
+// clock behind its seqs it goes on from its counter, so its LastSeq is the
+// last seq the daemon assigned.
+func openSpool(t *testing.T, dir string) *spool.Spool {
+	t.Helper()
+	sp, err := spool.Open(spool.Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"},
+		Now: func() time.Time { return time.Unix(0, 0) }, Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sp
+}
+
+// lastSeq is the last seq the daemon that used the spool in dir assigned.
+func lastSeq(t *testing.T, dir string) uint64 {
+	t.Helper()
+	sp := openSpool(t, dir)
+	last := sp.Stats().LastSeq
+	if err := sp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return last
+}
+
+// waitIdle, the shutdown's wait for the outputs to deliver, counts records,
+// not seqs: an open goes on from the clock (see the spool's raise), and
+// the seqs skip ahead of what an output has delivered (review, round
+// eight). It waits while an output has records to deliver, and ends at
+// once when every output has delivered what the spool holds, whether or
+// not anything was appended since the open.
+func TestWaitIdleAcrossTheClock(t *testing.T) {
+	dir := t.TempDir()
+	names := []string{"jsonl", "http"}
+	opts := spool.Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: names}
+	sp, err := spool.Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []uint64
+	for range 5 {
+		seq, err := sp.Append(time.Now(), func(seq uint64) ([]byte, error) { return fmt.Appendf(nil, `{"seq":%d}`, seq), nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, seq)
+	}
+	if err := errors.Join(sp.Ack("jsonl", seqs[4]), sp.Ack("http", seqs[1]), sp.Close()); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour) // the restart: an hour of seqs skipped
+	opts.Now = func() time.Time { return later }
+	if sp, err = spool.Open(opts); err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+	if p, q := sp.Pending("jsonl"), sp.Pending("http"); p != 0 || q != 3 || sp.Stats().LastSeq < seqs[4]+uint64(time.Hour/time.Microsecond) {
+		t.Errorf("pending %d and %d after the restart, want 0 and 3; %+v", p, q, sp.Stats())
+	}
+	start := time.Now()
+	waitIdle(sp, names, 300*time.Millisecond)
+	if took := time.Since(start); took < 300*time.Millisecond {
+		t.Errorf("waitIdle returned after %v with 3 records to deliver", took)
+	}
+	es, err := sp.Read("http", 10, 1<<20)
+	if err != nil || len(es) != 3 {
+		t.Fatalf("http read %d records (%v), want 3", len(es), err)
+	}
+	if err := sp.Ack("http", es[2].Seq); err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	waitIdle(sp, names, 3*time.Second)
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("waitIdle took %v with everything delivered (pending %d and %d)", took, sp.Pending("jsonl"), sp.Pending("http"))
+	}
 }
 
 func readRecords(t *testing.T, path string) []record.Record {

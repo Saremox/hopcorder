@@ -17,7 +17,6 @@ import (
 
 	"github.com/saremox/hopcorder/internal/clickhouse"
 	"github.com/saremox/hopcorder/internal/config"
-	"github.com/saremox/hopcorder/internal/spool"
 )
 
 // TestAgentServerClickHouse runs the agent daemon (fake prober, real spool
@@ -79,10 +78,7 @@ enrich:
 	time.Sleep(1500 * time.Millisecond)
 	stopAgent()
 
-	sp, err := spool.Open(spool.Options{Dir: dir + "/spool", MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	sp := openSpool(t, dir+"/spool")
 	last := sp.Stats().LastSeq
 	pending := sp.Pending("http")
 	_ = sp.Close()

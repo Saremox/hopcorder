@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,36 @@ import (
 func open(t *testing.T, dir string, consumers ...string) *Spool {
 	t.Helper()
 	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: consumers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// behind is a clock behind every seq the tests' spools assign: opened with
+// it, a spool goes on from its own counter, not from the clock (see raise).
+func behind() time.Time { return time.Unix(0, 0) }
+
+// reopen opens the spool in dir as open does, but with the clock behind,
+// so that its seqs go on from where they were: for tests of what an open
+// keeps, seq by seq.
+func reopen(t *testing.T, dir string, consumers ...string) *Spool {
+	t.Helper()
+	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: consumers, Now: behind,
+		Logger: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// ahead opens the spool in dir as open does, but with the clock an hour
+// ahead: it goes on from the clock's seq, far above the ones it assigned.
+func ahead(t *testing.T, dir string, consumers ...string) *Spool {
+	t.Helper()
+	now := time.Now().Add(time.Hour)
+	s, err := Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: consumers,
+		Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,14 +166,29 @@ func TestSeqAndCursorsPersist(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s = open(t, dir, "a")
-	defer s.Close()
+	// With the clock behind its seqs, the spool goes on from its counter.
+	s = reopen(t, dir, "a")
 	if seqs := appendN(t, s, 1); seqs[0] != base+4 {
 		t.Errorf("seq after reopen = %d, want %d", seqs[0], base+4)
 	}
 	es, _ := s.Read("a", 10, 1<<20)
 	if fmt.Sprint(rel(base, seqsOf(es))) != "[3 4]" {
 		t.Errorf("read after reopen: %v", seqsOf(es))
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// With the clock ahead, from the clock; the cursor is kept all the same.
+	before := clockSeq(time.Now())
+	s = open(t, dir, "a")
+	defer s.Close()
+	seq := appendN(t, s, 1)[0]
+	if seq < before {
+		t.Errorf("seq after a reopen with the clock at %d: %d", before, seq)
+	}
+	es, _ = s.Read("a", 10, 1<<20)
+	if fmt.Sprint(rel(base, seqsOf(es))) != fmt.Sprint([]uint64{3, 4, seq - base}) {
+		t.Errorf("read after the second reopen: %v, want %d, %d and %d", seqsOf(es), base+3, base+4, seq)
 	}
 }
 
@@ -162,18 +208,21 @@ func TestConsumerChanges(t *testing.T) {
 	if len(es) != 0 {
 		t.Errorf("new consumer saw old records %v", seqsOf(es))
 	}
-	appendN(t, s, 1)
+	if p := s.Pending("new"); p != 0 {
+		t.Errorf("new consumer: %d pending", p)
+	}
+	seqs := appendN(t, s, 1)
 	es, _ = s.Read("new", 10, 1<<20)
-	if fmt.Sprint(rel(base, seqsOf(es))) != "[4]" {
-		t.Errorf("new consumer: %v", seqsOf(es))
+	if fmt.Sprint(seqsOf(es)) != fmt.Sprint(seqs) || seqs[0] <= base+3 {
+		t.Errorf("new consumer: %v, want %v, above %d", seqsOf(es), seqs, base+3)
 	}
 	_ = s.Close()
 
 	// No consumers: records are not kept, but seq still advances.
 	s = open(t, dir)
 	defer s.Close()
-	if seqs := appendN(t, s, 2); fmt.Sprint(rel(base, seqs)) != "[5 6]" {
-		t.Errorf("seqs %v", seqs)
+	if next := appendN(t, s, 2); next[0] <= seqs[0] || next[1] != next[0]+1 {
+		t.Errorf("seqs %v after %d", next, seqs[0])
 	}
 	if st := s.Stats(); st.Records != 0 || st.Bytes != 0 {
 		t.Errorf("stats without consumers %+v", st)
@@ -211,15 +260,32 @@ func appendNoise(t testing.TB, s *Spool, n, size int) {
 
 // checkNewestKept checks that s holds its newest records, all unread by
 // consumer, and if first is not 0, that every record since seq first that
-// it does not hold counts as dropped.
-func checkNewestKept(t testing.TB, s *Spool, consumer string, first uint64) Stats {
+// it does not hold counts as dropped. skips are where an open went on from
+// the clock (see raise), each as Stats().LastSeq before the spool was
+// closed and after it was opened again: no seq between them was assigned.
+func checkNewestKept(t testing.TB, s *Spool, consumer string, first uint64, skips ...[2]uint64) Stats {
 	t.Helper()
 	st := s.Stats()
-	if st.Records == 0 || first != 0 && st.Dropped != st.LastSeq-first-uint64(st.Records) {
-		t.Fatalf("stats %+v: want every record not kept counted as dropped (%d appended)", st, st.LastSeq-first)
+	appended := st.LastSeq - first
+	for _, k := range skips {
+		appended -= k[1] - k[0]
+	}
+	if st.Records == 0 || first != 0 && st.Dropped != appended-uint64(st.Records) {
+		t.Fatalf("stats %+v: want every record not kept counted as dropped (%d appended)", st, appended)
 	}
 	es, err := s.Read(consumer, int(st.Records)+1, 1<<30)
-	if err != nil || len(es) != int(st.Records) || es[0].Seq != st.LastSeq-uint64(st.Records)+1 || es[len(es)-1].Seq != st.LastSeq {
+	// The newest seqs assigned, counting back from the last past the skips.
+	want, ok := st.LastSeq, err == nil && len(es) == int(st.Records)
+	for i := len(es) - 1; ok && i >= 0; i-- {
+		ok = es[i].Seq == want
+		want--
+		for _, k := range skips {
+			if want == k[1] {
+				want = k[0]
+			}
+		}
+	}
+	if !ok {
 		var from, to uint64
 		if len(es) > 0 {
 			from, to = es[0].Seq, es[len(es)-1].Seq
@@ -297,7 +363,10 @@ func TestLowerMaxBytes(t *testing.T) {
 		t.Fatalf("dropped under the larger bound: %+v", s.Stats())
 	}
 	const maxBytes = MinMaxBytes
-	s, err = Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: maxBytes, Consumers: []string{"c"}})
+	// With the clock behind, the seqs go on from the counter (see raise),
+	// so the records kept can be checked by seq.
+	s, err = Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: maxBytes, Consumers: []string{"c"}, Now: behind,
+		Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,13 +562,18 @@ func TestConcurrentAppends(t *testing.T) {
 
 // TestKill9 appends from a child process, SIGKILLs it at an arbitrary moment,
 // and checks that every append the child reported as done survived, intact,
-// and that seq continues after the highest committed one. Mode "noalloc"
-// runs the child without fallocate: it writes zeros ahead of its pages.
+// and that seq goes on after the highest committed one: right after it
+// with the clock behind (the counter is committed with the record), from
+// the clock otherwise. Mode "noalloc" runs the child without fallocate: it
+// writes zeros ahead of its pages. Mode "reopen" has the child close and
+// reopen its spool every ten appends, each open going on from the clock
+// (see raise), so that the kill may land in an open: the seqs it reported
+// must only go up, and those after it lie above them.
 func TestKill9(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns processes")
 	}
-	for _, mode := range []string{"alloc", "noalloc"} {
+	for _, mode := range []string{"alloc", "noalloc", "reopen"} {
 		t.Run(mode, func(t *testing.T) { kill9(t, mode) })
 	}
 }
@@ -539,8 +613,13 @@ func kill9(t *testing.T, mode string) {
 		if len(acked) < killAt {
 			t.Fatalf("child produced only %d appends", len(acked))
 		}
+		for i := 1; i < len(acked); i++ {
+			if acked[i] <= acked[i-1] {
+				t.Fatalf("round %d: the child assigned %d after %d", round, acked[i], acked[i-1])
+			}
+		}
 
-		s := open(t, dir, "reader", "acker")
+		s := reopen(t, dir, "reader", "acker") // the clock behind: the spool goes on from its counter
 		es, err := s.Read("reader", 100000, 1<<30)
 		if err != nil {
 			t.Fatal(err)
@@ -562,9 +641,17 @@ func kill9(t *testing.T, mode string) {
 		}
 		last := acked[len(acked)-1]
 		next := appendN(t, s, 1)[0]
-		// At most one append can have committed without being reported.
-		if next != last+1 && next != last+2 {
+		// At most one append can have committed without being reported
+		// (in mode reopen, after an open that went on from the clock).
+		if next <= last || mode != "reopen" && next > last+2 {
 			t.Errorf("round %d: seq after crash %d, last reported %d", round, next, last)
+		}
+		_ = s.Close()
+		// With the clock ahead of the counter, from the clock.
+		before := clockSeq(time.Now())
+		s = open(t, dir, "reader", "acker")
+		if seq := appendN(t, s, 1)[0]; seq < before || seq <= next {
+			t.Errorf("round %d: seq after a reopen with the clock at %d: %d, after %d", round, before, seq, next)
 		}
 		_ = s.Close()
 	}
@@ -576,15 +663,17 @@ func TestCrashChild(t *testing.T) {
 	if dir == "" {
 		t.Skip("helper process for TestKill9")
 	}
-	if os.Getenv("HOPCORDER_SPOOL_CRASH_MODE") == "noalloc" {
+	mode := os.Getenv("HOPCORDER_SPOOL_CRASH_MODE")
+	if mode == "noalloc" {
 		allocate = func(string, int64, int64) error { return errors.ErrUnsupported }
 	}
-	s, err := Open(Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"reader", "acker"}})
+	opts := Options{Dir: dir, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"reader", "acker"}}
+	s, err := Open(opts)
 	if err != nil {
 		fmt.Println("open failed:", err)
 		os.Exit(1)
 	}
-	for {
+	for n := 1; ; n++ {
 		seq, err := s.Append(time.Now(), func(seq uint64) ([]byte, error) {
 			return []byte(fmt.Sprintf(`{"seq":%d,"pad":%q}`, seq, strings.Repeat("y", 500))), nil
 		})
@@ -596,6 +685,16 @@ func TestCrashChild(t *testing.T) {
 		if seq%7 == 0 {
 			if err := s.Ack("acker", seq-3); err != nil {
 				fmt.Println("ack failed:", err)
+				os.Exit(1)
+			}
+		}
+		if mode == "reopen" && n%10 == 0 {
+			if err := s.Close(); err != nil {
+				fmt.Println("close failed:", err)
+				os.Exit(1)
+			}
+			if s, err = Open(opts); err != nil {
+				fmt.Println("open failed:", err)
 				os.Exit(1)
 			}
 		}
@@ -656,10 +755,10 @@ func TestHealthyFileIsKept(t *testing.T) {
 	if moved, _ := filepath.Glob(filepath.Join(dir, fileName) + ".corrupt-*"); len(moved) != 0 {
 		t.Errorf("healthy file moved: %v", moved)
 	}
-	s = open(t, dir, "a")
+	s = reopen(t, dir, "a") // the clock behind: the seqs go on from the counter
 	defer s.Close()
-	if seqs := appendN(t, s, 1); seqs[0] != base+4 {
-		t.Errorf("seq after reopen %d, want %d", seqs[0], base+4)
+	if seqs := appendN(t, s, 1); seqs[0] != base+4 || s.Stats().Records != 4 {
+		t.Errorf("seq after reopen %d, want %d; %+v", seqs[0], base+4, s.Stats())
 	}
 }
 
@@ -753,7 +852,9 @@ func TestOpenDamagedChild(t *testing.T) {
 // A new spool starts its seqs at the clock in microseconds, so records of a
 // spool that was deleted and recreated under the same agent_id lie above
 // everything the old one sent (the server drops seqs at or below its
-// high-water mark as duplicates). An existing spool keeps counting.
+// high-water mark as duplicates). Since round eight an existing spool goes
+// on from the clock too when that is ahead of its counter, and from its
+// counter when the clock is behind: its seqs never go back.
 func TestNewSpoolStartsAtTheClock(t *testing.T) {
 	dir := t.TempDir()
 	before := time.Now()
@@ -762,44 +863,223 @@ func TestNewSpoolStartsAtTheClock(t *testing.T) {
 	if first < uint64(before.UnixMicro()) || first > uint64(time.Now().UnixMicro()) { //nolint:gosec // positive
 		t.Errorf("first seq %d, want the time in microseconds (%d)", first, before.UnixMicro())
 	}
-	last := appendN(t, s, 2)[1]
+	appendN(t, s, 2)
 	_ = s.Close()
 
-	// Reopened much later, it continues where it was.
-	later := func() time.Time { return time.Now().Add(24 * time.Hour) }
-	s, err := Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Now: later})
+	// Reopened much later, it goes on from the clock.
+	later := time.Now().Add(24 * time.Hour)
+	s, err := Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"},
+		Now: func() time.Time { return later }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq := appendN(t, s, 1)[0]; seq != clockSeq(later) {
+		t.Errorf("seq after a reopen a day later %d, want %d", seq, clockSeq(later))
+	}
+	last := s.Stats().LastSeq
+	_ = s.Close()
+
+	// Reopened with the clock behind (the day before), it goes on from its
+	// counter, and says so.
+	var logs bytes.Buffer
+	s, err = Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"},
+		Logger: slog.New(slog.NewTextHandler(&logs, nil))})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if seq := appendN(t, s, 1)[0]; seq != last+1 {
-		t.Errorf("seq after reopen %d, want %d", seq, last+1)
+		t.Errorf("seq after a reopen with the clock behind %d, want %d", seq, last+1)
 	}
+	if !strings.Contains(logs.String(), "the clock is behind") {
+		t.Errorf("no warning that the clock is behind: %q", logs.String())
+	}
+	last++
 	_ = s.Close()
 
-	// Deleted and recreated, it starts above the old one.
+	// Deleted and recreated, it starts above the old one (as long as the
+	// clock is right).
 	if err := os.Remove(filepath.Join(dir, fileName)); err != nil {
 		t.Fatal(err)
 	}
-	s = open(t, dir, "a")
-	if seq := appendN(t, s, 1)[0]; seq <= last+1 {
-		t.Errorf("seq of a recreated spool %d, not above the old %d", seq, last+1)
+	s, err = Open(Options{Dir: dir, MaxAge: 48 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"},
+		Now: func() time.Time { return later.Add(time.Hour) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq := appendN(t, s, 1)[0]; seq <= last {
+		t.Errorf("seq of a recreated spool %d, not above the old %d", seq, last)
 	}
 	_ = s.Close()
 
 	// A spool created before seqs came from the clock (counting from 1)
-	// keeps its counter.
+	// goes on from the clock too.
 	old := t.TempDir()
 	epoch := func() time.Time { return time.Unix(0, 0) } // the clock's seq is 1
 	s, err = Open(Options{Dir: old, MaxAge: time.Hour, MaxBytes: 1 << 30, Consumers: []string{"a"}, Logger: slog.Default(), Now: epoch})
 	if err != nil {
 		t.Fatal(err)
 	}
-	appendN(t, s, 3)
+	if seqs := appendN(t, s, 3); fmt.Sprint(seqs) != "[1 2 3]" {
+		t.Errorf("seqs of a spool created at the epoch %v", seqs)
+	}
 	_ = s.Close()
+	before = time.Now()
 	s = open(t, old, "a")
 	defer s.Close()
-	if seq := appendN(t, s, 1)[0]; seq != 4 {
-		t.Errorf("seq of a pre-existing spool after reopen %d, want 4", seq)
+	if seq := appendN(t, s, 1)[0]; seq < clockSeq(before) {
+		t.Errorf("seq of a spool counting from 1 after reopen %d, want the clock's (%d)", seq, clockSeq(before))
+	}
+}
+
+// A spool that went back to an earlier state (a VM snapshot reverted, a
+// volume restored from a backup, a disk that lost writes it had
+// confirmed) went on from the seq it held then, and so reused seqs the
+// server already had: the server dropped the new cycles as duplicates
+// (review, round eight, agent M1). Opened, a spool goes on from the clock
+// when that is ahead, above every seq assigned before the rollback; the
+// records the earlier state held are delivered as they were.
+func TestRolledBackSpoolGoesOnAboveItsSeqs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, fileName)
+	now := time.Now()
+	opts := Options{Dir: dir, MaxAge: 7 * 24 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"http"},
+		Now: func() time.Time { return now }}
+	s, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	early := appendN(t, s, 3)
+	if err := s.Ack("http", early[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The agent runs on (and restarts, and delivers) for a while...
+	var issued []uint64
+	for range 3 {
+		now = now.Add(time.Minute)
+		if s, err = Open(opts); err != nil {
+			t.Fatal(err)
+		}
+		issued = append(issued, appendN(t, s, 5)...)
+		if err := s.Ack("http", issued[len(issued)-1]); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// ...then the spool goes back to the snapshot.
+	if err := os.WriteFile(path, snapshot, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	if s, err = Open(opts); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	after := appendN(t, s, 5)
+	if top := slices.Max(issued); after[0] <= top {
+		t.Errorf("after the rollback the spool assigned %v; before it, up to %d", after, top)
+	}
+	if es, err := s.Read("http", 100, 1<<20); err != nil || fmt.Sprint(seqsOf(es)) != fmt.Sprint(append(early[2:], after...)) {
+		t.Errorf("read %v (%v), want %d then %v", seqsOf(es), err, early[2], after)
+	}
+}
+
+// Pending counts records, not seqs: an open that goes on from the clock
+// skips seqs that no record holds (review, round eight), and the outputs'
+// batching, the shutdown's wait and the pending metric read it. After the
+// open, an output that had delivered everything has nothing pending, as
+// has one added then; one that had not has the records it had not
+// delivered, and nothing once it delivered them, though nothing was
+// appended since.
+func TestPendingAcrossTheClock(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, "jsonl", "http")
+	seqs := appendN(t, s, 5)
+	if err := errors.Join(s.Ack("jsonl", seqs[4]), s.Ack("http", seqs[1]), s.Close()); err != nil {
+		t.Fatal(err)
+	}
+	consumers := []string{"jsonl", "http", "new"}
+	s = ahead(t, dir, consumers...)
+	defer s.Close()
+	pending := func(want ...uint64) {
+		t.Helper()
+		for i, c := range consumers {
+			if p := s.Pending(c); p != want[i] {
+				t.Errorf("%s: %d pending, want %d (%+v)", c, p, want[i], s.Stats())
+			}
+		}
+	}
+	if st := s.Stats(); st.LastSeq < seqs[4]+uint64(time.Hour/time.Microsecond) || st.Records != 3 {
+		t.Errorf("after the open: %+v, want the last seq an hour of microseconds past %d, 3 records", st, seqs[4])
+	}
+	pending(0, 3, 0)
+	got, _ := readAll(t, s, "http", 0)
+	if fmt.Sprint(got) != fmt.Sprint(seqs[2:]) {
+		t.Errorf("http read %v, want %v", got, seqs[2:])
+	}
+	pending(0, 0, 0)
+	added := appendN(t, s, 2)
+	pending(2, 2, 2)
+	for _, c := range consumers {
+		if got, _ := readAll(t, s, c, 0); fmt.Sprint(got) != fmt.Sprint(added) {
+			t.Errorf("%s read %v, want %v", c, got, added)
+		}
+	}
+	pending(0, 0, 0)
+	if st := s.Stats(); st.Records != 0 {
+		t.Errorf("delivered records kept: %+v", st)
+	}
+}
+
+// With the clock behind a spool's counter (no RTC, no NTP yet, set back),
+// a spool goes on from its counter: its seqs never go back, and nothing
+// else changes. A rolled-back spool then reuses seqs, as before round
+// eight; that the clock is behind is logged (see TestNewSpoolStartsAtTheClock).
+func TestClockBehindKeepsTheCounter(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	opts := Options{Dir: dir, MaxAge: 7 * 24 * time.Hour, MaxBytes: 1 << 30, Consumers: []string{"jsonl", "http"},
+		Now: func() time.Time { return now }, Logger: slog.New(slog.DiscardHandler)}
+	s, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seqs := appendN(t, s, 4)
+	if err := errors.Join(s.Ack("jsonl", seqs[3]), s.Ack("http", seqs[1])); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pending := uint64(2)
+	for _, back := range []time.Duration{time.Microsecond, time.Hour, 50 * 365 * 24 * time.Hour} {
+		now = now.Add(-back)
+		if s, err = Open(opts); err != nil {
+			t.Fatal(err)
+		}
+		last := seqs[len(seqs)-1]
+		if st := s.Stats(); st.LastSeq != last || st.Records != int64(pending) || s.Pending("jsonl") != 0 || s.Pending("http") != pending {
+			t.Errorf("clock %v back: %+v, pending %d and %d; want last seq %d, %d records, 0 and %d pending",
+				back, st, s.Pending("jsonl"), s.Pending("http"), last, pending, pending)
+		}
+		next := appendN(t, s, 1)[0]
+		if next != last+1 {
+			t.Errorf("clock %v back: seq %d, want %d", back, next, last+1)
+		}
+		seqs = append(seqs, next)
+		pending++
+		if err := errors.Join(s.Ack("jsonl", next), s.Close()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -854,48 +1134,62 @@ func TestCursorAboveLastSeqIsRewound(t *testing.T) {
 		consumers []string
 		acked     []uint64 // each consumer's cursor before the damage, from base
 		pending   uint64   // "a"'s after the open
-		want      string   // what "a" reads first
+		want      string   // the stored records "a" reads first
 	}{
-		{"one output", []string{"a"}, []uint64{3}, 7, "[4 5 6 7 8 9 10 11 12]"},
-		{"behind the other output", []string{"a", "b"}, []uint64{2, 6}, 8, "[3 4 5 6 7 8 9 10 11 12]"},
+		{"one output", []string{"a"}, []uint64{3}, 7, "[4 5 6 7 8 9 10"},
+		{"behind the other output", []string{"a", "b"}, []uint64{2, 6}, 8, "[3 4 5 6 7 8 9 10"},
 		// The records between the two cursors are delivered again.
-		{"ahead of the other output", []string{"a", "b"}, []uint64{6, 2}, 8, "[3 4 5 6 7 8 9 10 11 12]"},
+		{"ahead of the other output", []string{"a", "b"}, []uint64{6, 2}, 8, "[3 4 5 6 7 8 9 10"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			s := open(t, dir, tc.consumers...)
-			base := s.Stats().LastSeq
-			appendN(t, s, 10)
-			for i, c := range tc.consumers {
-				if err := s.Ack(c, base+tc.acked[i]); err != nil {
+		// The cursor far above the last seq (a high bit set), or just above
+		// it, below the seq the spool goes on from (the clock's, see raise):
+		// it is found all the same.
+		for _, damage := range []struct {
+			name   string
+			cursor func(base, acked uint64) uint64
+		}{
+			{"far above", func(base, acked uint64) uint64 { return base + acked | 1<<52 }},
+			{"just above", func(base, _ uint64) uint64 { return base + 15 }},
+		} {
+			t.Run(tc.name+"/"+damage.name, func(t *testing.T) {
+				dir := t.TempDir()
+				s := open(t, dir, tc.consumers...)
+				base := s.Stats().LastSeq
+				appendN(t, s, 10)
+				for i, c := range tc.consumers {
+					if err := s.Ack(c, base+tc.acked[i]); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := s.Close(); err != nil {
 					t.Fatal(err)
 				}
-			}
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
-			rawUpdate(t, dir, func(tx *bolt.Tx) error {
-				return putU64(tx.Bucket(bucketCursors), []byte("a"), base+tc.acked[0]|1<<52)
-			})
-			s = open(t, dir, tc.consumers...)
-			defer s.Close()
-			if p := s.Pending("a"); p != tc.pending {
-				t.Errorf("pending %d, want %d", p, tc.pending)
-			}
-			appendN(t, s, 2)
-			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != tc.want {
-				t.Errorf("read %v, want %s", got, tc.want)
-			}
-			appendN(t, s, 1)
-			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != "[13]" {
-				t.Errorf("read after the next append %v, want [13]", got)
-			}
-			if len(tc.consumers) > 1 {
-				if got, _ := readAll(t, s, "b", base); fmt.Sprint(got) != fmt.Sprint(seqRange(tc.acked[1]+1, 13)) {
-					t.Errorf("b read %v", got)
+				rawUpdate(t, dir, func(tx *bolt.Tx) error {
+					return putU64(tx.Bucket(bucketCursors), []byte("a"), damage.cursor(base, tc.acked[0]))
+				})
+				s = ahead(t, dir, tc.consumers...)
+				defer s.Close()
+				if p := s.Pending("a"); p != tc.pending {
+					t.Errorf("pending %d, want %d", p, tc.pending)
 				}
-			}
-		})
+				added := rel(base, appendN(t, s, 2))
+				if want := tc.want + " " + strings.Trim(fmt.Sprint(added), "[]") + "]"; added[0] <= 15 {
+					t.Errorf("appended as %v", added)
+				} else if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != want {
+					t.Errorf("read %v, want %s", got, want)
+				}
+				more := rel(base, appendN(t, s, 1))
+				if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != fmt.Sprint(more) {
+					t.Errorf("read after the next append %v, want %v", got, more)
+				}
+				if len(tc.consumers) > 1 {
+					want := append(append(seqRange(tc.acked[1]+1, 10), added...), more...)
+					if got, _ := readAll(t, s, "b", base); fmt.Sprint(got) != fmt.Sprint(want) {
+						t.Errorf("b read %v, want %v", got, want)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -915,7 +1209,9 @@ func seqRange(from, to uint64) []uint64 {
 // gets the next seq, keeping its data and the seq in it (which the server
 // deduplicates on), so nothing is lost. A next_seq lowered by damage, with
 // records above it, comes back above them; before, appends overwrote
-// those records.
+// those records. Each case opens with the clock behind, where the spool
+// goes on right after the records, and with the clock ahead, where it
+// goes on from the clock (see raise).
 func TestKeyAboveNextSeqIsRenumbered(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -924,6 +1220,11 @@ func TestKeyAboveNextSeqIsRenumbered(t *testing.T) {
 	}{
 		{"newest key raised", func(tx *bolt.Tx, base uint64) error {
 			return rekey(tx, base+5, base+5|1<<62)
+		}, "[1 2 3 4 6]"},
+		// Below the seq the spool goes on from (the clock's): renumbered
+		// all the same.
+		{"newest key raised a little", func(tx *bolt.Tx, base uint64) error {
+			return rekey(tx, base+5, base+105)
 		}, "[1 2 3 4 6]"},
 		{"two newest keys raised", func(tx *bolt.Tx, base uint64) error {
 			return errors.Join(rekey(tx, base+4, base+4+1<<40), rekey(tx, base+5, base+5|1<<62))
@@ -936,37 +1237,44 @@ func TestKeyAboveNextSeqIsRenumbered(t *testing.T) {
 			return putU64(tx.Bucket(bucketMeta), keyNextSeq, base+3)
 		}, "[1 2 3 4 5]"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			s := open(t, dir, "a")
-			base := s.Stats().LastSeq
-			appendN(t, s, 5)
-			if err := s.Close(); err != nil {
-				t.Fatal(err)
-			}
-			rawUpdate(t, dir, func(tx *bolt.Tx) error { return tc.damage(tx, base) })
-			s = open(t, dir, "a")
-			defer s.Close()
-			got, data := readAll(t, s, "a", base)
-			if fmt.Sprint(got) != tc.want {
-				t.Errorf("read %v, want %s", got, tc.want)
-			}
-			if len(got) != 5 {
-				t.FailNow()
-			}
-			for i, d := range data {
-				if !bytes.HasPrefix(d, fmt.Appendf(nil, `{"seq":%d,`, base+uint64(i)+1)) {
-					t.Errorf("record %d: %.30s, want the one appended as %d", got[i], d, i+1)
+		for _, clock := range []string{"behind", "ahead"} {
+			t.Run(tc.name+"/clock "+clock, func(t *testing.T) {
+				dir := t.TempDir()
+				s := open(t, dir, "a")
+				base := s.Stats().LastSeq
+				appendN(t, s, 5)
+				if err := s.Close(); err != nil {
+					t.Fatal(err)
 				}
-			}
-			last := got[4]
-			if seqs := appendN(t, s, 2); fmt.Sprint(rel(base, seqs)) != fmt.Sprint([]uint64{last + 1, last + 2}) {
-				t.Errorf("appended as %v after %d", rel(base, seqs), last)
-			}
-			if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != fmt.Sprint([]uint64{last + 1, last + 2}) {
-				t.Errorf("read after appending %v, want %d and %d", got, last+1, last+2)
-			}
-		})
+				rawUpdate(t, dir, func(tx *bolt.Tx) error { return tc.damage(tx, base) })
+				if clock == "behind" {
+					s = reopen(t, dir, "a")
+				} else {
+					s = ahead(t, dir, "a")
+				}
+				defer s.Close()
+				got, data := readAll(t, s, "a", base)
+				if fmt.Sprint(got) != tc.want {
+					t.Errorf("read %v, want %s", got, tc.want)
+				}
+				if len(got) != 5 {
+					t.FailNow()
+				}
+				for i, d := range data {
+					if !bytes.HasPrefix(d, fmt.Appendf(nil, `{"seq":%d,`, base+uint64(i)+1)) {
+						t.Errorf("record %d: %.30s, want the one appended as %d", got[i], d, i+1)
+					}
+				}
+				last := got[4]
+				added := rel(base, appendN(t, s, 2))
+				if clock == "behind" && added[0] != last+1 || added[0] <= last+100 && clock == "ahead" || added[1] != added[0]+1 {
+					t.Errorf("appended as %v after %d", added, last)
+				}
+				if got, _ := readAll(t, s, "a", base); fmt.Sprint(got) != fmt.Sprint(added) {
+					t.Errorf("read after appending %v, want %v", got, added)
+				}
+			})
+		}
 	}
 }
 

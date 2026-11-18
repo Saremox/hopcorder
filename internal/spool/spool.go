@@ -64,7 +64,8 @@ type Options struct {
 	// removed; new consumers start at the newest record.
 	Consumers []string
 	Logger    *slog.Logger
-	// Now returns the current time, for the age bound; default time.Now.
+	// Now returns the current time, for the age bound and for the seq an
+	// open goes on from (see clockSeq); default time.Now.
 	Now func() time.Time
 }
 
@@ -80,16 +81,18 @@ type Stats struct {
 	Bytes   int64  // stored (compressed) record bytes; the file holding them and their B+tree is bounded by MaxBytes
 	Records int64  // records stored
 	Dropped uint64 // undelivered records dropped by the age or size bound (or a full disk) since Open
-	LastSeq uint64 // highest seq assigned so far
+	LastSeq uint64 // the next seq less one: the highest assigned so far, unless none was since the spool was opened (see clockSeq)
 }
 
 // Spool is a durable, bounded, multi-consumer queue of records.
 type Spool struct {
-	opts     Options
-	path     string
-	enc      *zstd.Encoder
-	dec      *zstd.Decoder
-	firstSeq uint64 // seq of a new spool's first record
+	opts Options
+	path string
+	enc  *zstd.Encoder
+	dec  *zstd.Decoder
+	// clockNext is clockSeq as the file was opened: a new spool's first
+	// seq, and the least an existing one goes on from (see initDB).
+	clockNext uint64
 
 	// dbMu guards db: transactions hold it for reading; it is held for
 	// writing to close the database, or to replace a file that bbolt
@@ -178,7 +181,7 @@ func (s *Spool) openLocked() error {
 				"err", s.damaged, "kept_as", bad)
 			s.damaged = nil
 		}
-		s.firstSeq = clockSeq(s.opts.Now())
+		s.clockNext = clockSeq(s.opts.Now())
 		db, err := openDB(s.path)
 		if err == nil {
 			if err = s.initDB(db); err != nil {
@@ -212,13 +215,17 @@ func closeWithin(db *bolt.DB, log *slog.Logger) {
 	}
 }
 
-// clockSeq is the first seq of a new spool: the current time in
-// microseconds. A spool counts up by one per record, far slower than the
-// clock, so a new spool (the old one deleted, lost or quarantined) starts
-// above any seq an earlier one under the same agent_id reached. Starting at
-// 1 instead, its records would be dropped by the server as duplicates until
-// the seq passed the old high-water mark. An existing spool keeps its
-// counter; only a clock far behind (no RTC, no NTP yet) defeats this.
+// clockSeq is the current time in microseconds: the first seq of a new
+// spool, and the least seq an existing one goes on from when it is opened
+// (see initDB). A spool counts up by one per record, far slower than the
+// clock, so a spool opened later starts above any seq the agent assigned
+// before: whether it is new (the old one deleted, lost or quarantined) or
+// back at an earlier state (a VM snapshot reverted, a volume restored from
+// a backup, a disk that lost writes it had confirmed). Starting at 1, or
+// going on from the counter such a spool holds, its records would be
+// dropped by the server as duplicates until the seq passed the high-water
+// mark there. Only a clock behind (no RTC, no NTP yet, set back) defeats
+// this.
 func clockSeq(now time.Time) uint64 {
 	return uint64(max(now.UnixMicro(), 1)) //nolint:gosec // positive
 }
@@ -498,7 +505,7 @@ func (s *Spool) initDB(db *bolt.DB) error {
 		meta, curs, recs := tx.Bucket(bucketMeta), tx.Bucket(bucketCursors), tx.Bucket(bucketRecords)
 		next := getU64(meta, keyNextSeq)
 		if next == 0 {
-			next = s.firstSeq
+			next = s.clockNext
 			if err := putU64(meta, keyNextSeq, next); err != nil {
 				return err
 			}
@@ -550,6 +557,9 @@ func (s *Spool) initDB(db *bolt.DB) error {
 			}
 			cursors[c] = cur
 		}
+		if err := s.raise(meta, curs, cursors, next); err != nil {
+			return err
+		}
 		var err error
 		more, err = s.trimLocked(tx, st)
 		return err
@@ -561,6 +571,35 @@ func (s *Spool) initDB(db *bolt.DB) error {
 	s.cursors = cursors
 	s.mu.Unlock()
 	return s.settle(run, more)
+}
+
+// raise makes the spool go on from the clock (clockNext) if that is ahead
+// of next, its next seq (review, round eight): no seq at or above the
+// clock was assigned before, as long as the clock is right, even by a
+// spool that has since gone back to an earlier state (see clockSeq). The
+// seqs skipped hold no record, so a cursor at the last seq (an output that
+// had delivered everything) moves to the new last seq, and its pending
+// count stays 0; cursors, records and their seqs are otherwise left as
+// they are. It runs in the transaction that loads the state, after the
+// repairs that compare with next (renumber, rewound), so it is committed
+// with them or not at all.
+func (s *Spool) raise(meta, curs *bolt.Bucket, cursors map[string]uint64, next uint64) error {
+	if s.clockNext <= next {
+		if s.clockNext < next-1 {
+			s.opts.Logger.Warn("spool: the clock is behind the spool's last seq; going on from that, not from the clock",
+				"last_seq", next-1, "clock_seq", s.clockNext)
+		}
+		return nil
+	}
+	for c, cur := range cursors {
+		if cur == next-1 {
+			if err := putU64(curs, []byte(c), s.clockNext-1); err != nil {
+				return err
+			}
+			cursors[c] = s.clockNext - 1
+		}
+	}
+	return putU64(meta, keyNextSeq, s.clockNext)
 }
 
 // renumber gives every record stored at or above next the next seq, in
@@ -847,17 +886,20 @@ func (s *Spool) Ack(consumer string, seq uint64) error {
 // wake-up for many appends.
 func (s *Spool) Notify(consumer string) <-chan struct{} { return s.notify[consumer] }
 
-// Pending returns how many records consumer has not yet acknowledged
-// (including any that the bounds have since dropped).
+// Pending returns how many records consumer has not yet acknowledged: the
+// seqs after its cursor up to the last seq, but no more than the records
+// stored, since the seqs skip ahead where the spool went on from the clock
+// (see raise) and no record lies in what they skip. It is never less than
+// the records stored after the cursor, so it is 0 only when the consumer
+// has nothing left to read.
 func (s *Spool) Pending(consumer string) uint64 {
 	s.mu.Lock()
-	c := s.cursors[consumer]
-	s.mu.Unlock()
-	last := s.lastSeq.Load()
+	defer s.mu.Unlock()
+	c, last := s.cursors[consumer], s.lastSeq.Load()
 	if last <= c {
 		return 0
 	}
-	return last - c
+	return min(last-c, uint64(max(s.records.Load(), 0)))
 }
 
 // Stats returns current counters.

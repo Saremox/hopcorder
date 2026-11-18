@@ -399,18 +399,20 @@ func TestCommitsAfterBacklogWriteLittle(t *testing.T) {
 		}
 	}
 	perAppend("backlog delivered")
+	skip := [2]uint64{s.Stats().LastSeq}
 	if err := s.Close(); err != nil { // the freelist found again
 		t.Fatal(err)
 	}
 	if s, err = Open(opts); err != nil {
 		t.Fatal(err)
 	}
+	skip[1] = s.Stats().LastSeq // went on from the clock
 	perAppend("after a restart")
 	appendNoise(t, s, 5000, 480) // into the free pages
 	if size := fileSize(t, dir); size > built {
 		t.Errorf("file grew from %d to %d bytes", built, size)
 	}
-	checkNewestKept(t, s, "http", 0)
+	checkNewestKept(t, s, "http", 0, skip)
 }
 
 // buildBacklog writes, in a few large transactions, a spool file at path

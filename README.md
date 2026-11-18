@@ -383,10 +383,13 @@ and in `agent.example.yaml` show.
 ### The record
 
 One JSON record per (target, cycle). `seq` is monotonic per agent and survives
-restarts; `(agent_id, seq)` is the idempotency key. A new spool (the first
-start, or after the spool was deleted) begins at the current time in
-microseconds, so its seqs lie above anything an earlier spool of the same
-`agent_id` sent, as long as the clock is right. Per hop, `status` is
+restarts; `(agent_id, seq)` is the idempotency key. Each time the agent opens
+its spool (a start, a reload), the seqs go on from the current time in
+microseconds if that is ahead of the spool's counter, so they lie above
+anything the agent sent before, as long as the clock is right: whether the
+spool is new (the first start, or after it was deleted) or back at an earlier
+state (a VM snapshot reverted, a volume restored from a backup). They are not
+consecutive: they skip ahead at every start and reload. Per hop, `status` is
 `reply` (the destination answered; for UDP, its port-unreachable),
 `ttl-expired`, `unreachable` (with the ICMP `code`) or `no-reply`; `ip` and
 `rtt_us` are present unless `no-reply`. Routers inside an MPLS tunnel often
@@ -593,8 +596,8 @@ groups:
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent
   restarts in-process with it (raw sockets stay open, target names keep their
-  addresses (see DNS below), seq continues, and so does the metrics listener
-  while its address is unchanged; a new address is
+  addresses (see DNS below), seq goes on (see The record), and so does the
+  metrics listener while its address is unchanged; a new address is
   bound before the old one is released, and the ICMP echo identifiers and
   TCP source ports of both configurations are held until the new one
   runs). If the new
@@ -648,6 +651,17 @@ groups:
   `spool.db.corrupt-<time>` and an empty spool starts, its seqs taken from
   the clock like any new spool's; the error is logged. The records
   in the old file are not delivered.
+- **A spool back at an earlier state** (a VM snapshot reverted, a volume
+  restored from a backup, a disk that lost writes it had confirmed) goes on
+  from the clock like any spool the agent opens, above the seqs the agent
+  sent since; the records the earlier state still held are delivered again,
+  and the server answers them as duplicates. Two cases are left: a VM
+  reverted with its memory resumes the running agent, which goes on from
+  the snapshot's seqs, so restart the agent right after such a revert (until
+  then the server drops its cycles as duplicates); and a clock behind the
+  spool's last seq (no RTC, no NTP yet at boot, a clock set back) makes the
+  spool go on from its own counter, logged as a warning, so start the agent
+  after the clock is set.
 - **The HTTP output never follows redirects**: point `url` at the server
   itself. A 3xx is logged as an error and the batch retried. With a plain
   `http://` URL the agent warns at startup if credentials or headers are
@@ -750,14 +764,17 @@ are left out, and `truncated: true` says so (`false` otherwise); `topology` fill
 **Ingest semantics.** Records are deduplicated on `(agent_id, seq)`: a retried
 batch is stored once. Invalid records are rejected for good and reported in the
 response (`{"accepted", "duplicates", "rejected", "errors"}`); a storage
-failure returns 503 and the agent retries. Agents must never reuse seqs: a new
-spool starts its seqs at the clock (time in microseconds), above anything an
-earlier spool of the same agent sent; only on a host whose clock is wrong does
-a wiped spool also need a new `agent_id`. A batch whose seqs all lie
-far below the stored ones is refused with 409, so the agent keeps it and its
-errors show what happened. So every agent needs an `agent_id` of its own:
-of two agents sharing one, the one whose spool started earlier is refused
-for good (or, within 0.1 s, its records are taken for the other's
+failure returns 503 and the agent retries. Agents must never reuse seqs:
+whenever the agent opens its spool, its seqs go on from the clock (time in
+microseconds) if that is ahead, above anything it sent before, from a new,
+wiped or restored spool too; only on a host whose clock is behind does a wiped
+or restored spool also need a new `agent_id`. A batch whose seqs all lie far below the stored ones
+is refused with 409, so the agent keeps it and its errors show what happened,
+unless the server holds every one of its cycles (seq and timestamp): then it
+was delivered before (by a restored spool, say) and is answered as
+duplicates. So every agent needs an `agent_id` of its own: of two agents
+sharing one, the one that started or reloaded earlier is refused until it
+does again (or, within 0.1 s, its records are taken for the other's
 duplicates), and their streams are merged.
 
 **Limits.** Ingest takes `Content-Type: application/x-ndjson` (agents send it;

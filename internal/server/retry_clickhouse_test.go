@@ -3,6 +3,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -207,5 +208,37 @@ func TestLateCommitRetriedExactlyOnce(t *testing.T) {
 				t.Error(d)
 			}
 		})
+	}
+}
+
+// holdsAll's query against ClickHouse: a batch far below the agent's mark
+// that cycles holds cycle for cycle (its ts kept to the millisecond, from
+// one with sub-millisecond digits) is answered as duplicates; one with a
+// cycle at a held seq but another ts, or with a seq not held, is refused.
+func TestStaleRedeliveryClickHouse(t *testing.T) {
+	c := testClickHouse(t)
+	in := clickhouseIngester(c)
+	in.now = func() time.Time { return t0.Add((staleWindow + 100) * 5 * time.Second) }
+	old := func() []*record.Record {
+		recs := richRecords("v", 1, 30)
+		for _, r := range recs {
+			r.TS = r.TS.Add(123456789 * time.Nanosecond)
+		}
+		return recs
+	}
+	ingestOK(t, in, old())
+	ingestOK(t, in, richRecords("v", staleWindow+50, staleWindow+50))
+	if res, err := in.Ingest(t.Context(), old()); err != nil || res.Duplicates != 30 || res.Accepted != 0 {
+		t.Errorf("delivered again: %+v, %v; want 30 duplicates", res, err)
+	}
+	other := old()
+	other[29].TS = other[29].TS.Add(time.Millisecond)
+	for name, recs := range map[string][]*record.Record{"another cycle": other, "not held": richRecords("v", 31, 40)} {
+		if _, err := in.Ingest(t.Context(), recs); !errors.Is(err, ErrStaleBatch) {
+			t.Errorf("%s: %v, want ErrStaleBatch", name, err)
+		}
+	}
+	if n := count(t, c, "SELECT count() AS n FROM cycles WHERE agent_id = 'v'"); n != 31 {
+		t.Errorf("%d cycles stored, want 31", n)
 	}
 }
