@@ -38,11 +38,13 @@ type stream struct {
 // keepPending adds a lost close row o to s.pending, within maxPending. Past
 // it, a row of an outage that storage has nothing of (pendOwn) is dropped,
 // lost with its insert as round six accepted, so that one storage may hold
-// open (pendKeep) is kept. That takes at most one row a part: the outage
-// open when the part began. Only past maxPending such rows (eight failed
-// parts in a row, each of which closed an outage begun before it) is a row
-// that must be kept dropped, the newest; the oldest, which storage holds
-// open if any does, stays.
+// open (pendKeep) is kept. A part adds few such rows a stream: the outage
+// open when the part began, and in a part derived again those an earlier
+// derivation left open in storage (heldOpen; at most one for each part it
+// was derived in). Only past maxPending such rows (eight failed parts in a
+// row, each of which closed an outage begun before it) is a row that must
+// be kept dropped, the newest; the oldest, which storage holds open if any
+// does, stays.
 func (s *stream) keepPending(o outageRow) {
 	if len(s.pending) < maxPending {
 		s.pending = append(s.pending, o)

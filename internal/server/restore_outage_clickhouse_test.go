@@ -864,3 +864,189 @@ func TestManyLostClosesLateCommitLeavesNothingOpen(t *testing.T) {
 		t.Errorf("got %s, want %s", got, want)
 	}
 }
+
+// rederiveStore is the ClickHouse store with the faults of a part derived
+// again: the mark insert fails (a kill before the mark), a cycles insert
+// is committed but reports an error (the agent's retry finds it stored),
+// and outages inserts fail, optionally kept to be committed late.
+type rederiveStore struct {
+	*clickhouse.Client
+	failMark    bool
+	cyclesLate  bool // the next cycles insert commits but reports an error
+	failOutages int  // outages inserts that fail from now on
+	lateOut     bool // a failing outages insert is kept, to be committed late
+	saved       [][]byte
+}
+
+func (f *rederiveStore) InsertJSON(ctx context.Context, table string, rows [][]byte) error {
+	switch {
+	case f.failMark && table == "agent_seq":
+		return errors.New("killed before the mark")
+	case table == "cycles" && f.cyclesLate:
+		f.cyclesLate = false
+		if err := f.Client.InsertJSON(ctx, table, rows); err != nil {
+			return err
+		}
+		return errors.New("a view failed after the cycles part was committed")
+	case table == "outages" && f.failOutages > 0:
+		f.failOutages--
+		if f.lateOut && f.saved == nil {
+			f.saved = append([][]byte(nil), rows...)
+		}
+		return errors.New("ClickHouse went away after the cycles insert")
+	}
+	return f.Client.InsertJSON(ctx, table, rows)
+}
+
+// A part derived again after a kill before its mark, whose outages insert
+// fails, and the next part's too, in which the outage open at the end of
+// the killed attempt (its open row stored then) closes (review, round
+// fourteen). #91 marked every lost close row of a part derived again as
+// one to keep: eight harmless closes of a lossy stream filled its pending
+// rows, the close that mattered was dropped as the newest, and the outage
+// stayed "ongoing" for good. Without the kill the same run held.
+func TestKilledPartThenTwoLostPartsLeaveNothingOpen(t *testing.T) {
+	for _, n := range []int{maxPending - 1, maxPending, 20} {
+		for _, kill := range []bool{false, true} {
+			t.Run(fmt.Sprintf("n=%d/kill=%v", n, kill), func(t *testing.T) {
+				c := testClickHouse(t)
+				st := &rederiveStore{Client: c}
+				in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+				ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+				longFrom := uint64(52 + 2*n + 2)
+				flap := flapThenDown(n, longFrom, 160)
+				spec := func(seq uint64) []string {
+					if seq >= 185 && seq < 191 {
+						return brokenA
+					}
+					return flap(seq)
+				}
+				ingest := func(from, to uint64) {
+					t.Helper()
+					if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for from := uint64(1); from <= 41; from += 10 {
+					ingest(from, from+9)
+				}
+				if kill {
+					st.failMark = true
+					ingest(51, 150) // stored with its events, not its mark: then killed
+					st.failMark = false
+					in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+				}
+				st.failOutages = 3
+				ingest(51, 150) // the part again: its outages insert fails
+				st.failOutages = 3
+				ingest(151, 170) // the long outage closes at 161: this insert fails too
+				ingest(171, 180)
+				ingest(181, 200)                                                       // another outage, 185 to 191
+				in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a later restart
+				ingest(201, 210)
+				shorts := n // stored by the killed attempt
+				if !kill {
+					shorts = min(n, maxPending-1) // past the bound, lost with their insert
+				}
+				want := fmt.Sprintf("[%s[%d to 161: %d cycles] [185 to 191: 6 cycles]]", shortOutages(shorts), longFrom, 161-longFrom)
+				if got := storedOutages(t, c); got != want {
+					t.Errorf("got  %s\nwant %s", got, want)
+				}
+			})
+		}
+	}
+}
+
+// The same with one failed insert: the agent's retry after the kill reads
+// its spool again from the cursor and carries what came in since, so the
+// outage left open closes in the retry itself, after the eight closes.
+func TestKilledPartThenLargerLostRetryLeavesNothingOpen(t *testing.T) {
+	for _, n := range []int{maxPending - 1, maxPending, 20} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &rederiveStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			longFrom := uint64(52 + 2*n + 2)
+			longTo := longFrom + 40
+			flap := flapThenDown(n, longFrom, longTo)
+			spec := func(seq uint64) []string {
+				if seq >= 185 && seq < 191 {
+					return brokenA
+				}
+				return flap(seq)
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			st.failMark = true
+			ingest(51, longFrom+20) // stored with its events, the long outage open: then killed
+			st.failMark = false
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			st.failOutages = 3
+			ingest(51, 150) // the retry, with what came in since: its outages insert fails
+			ingest(151, 180)
+			ingest(181, 200)
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a later restart
+			ingest(201, 210)
+			want := fmt.Sprintf("[%s[%d to %d: %d cycles] [185 to 191: 6 cycles]]", shortOutages(n), longFrom, longTo+1, longTo+1-longFrom)
+			if got := storedOutages(t, c); got != want {
+				t.Errorf("got  %s\nwant %s", got, want)
+			}
+		})
+	}
+}
+
+// No kill: a cycles insert fails after ClickHouse committed it, so the
+// agent's retry finds the part stored; the retry's outages insert fails
+// but is committed late (the long outage's open row stored then), and the
+// next part's, in which that outage closes, fails. #91's late-commit
+// residual, reached with two failed inserts instead of more than eight.
+func TestCommittedCyclesThenLateCommitLeaveNothingOpen(t *testing.T) {
+	for _, n := range []int{maxPending - 1, maxPending, 20} {
+		for _, rederived := range []bool{false, true} {
+			t.Run(fmt.Sprintf("n=%d/rederived=%v", n, rederived), func(t *testing.T) {
+				c := testClickHouse(t)
+				st := &rederiveStore{Client: c}
+				in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+				ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+				longFrom := uint64(52 + 2*n + 2)
+				spec := flapThenDown(n, longFrom, 160)
+				ingest := func(from, to uint64) {
+					t.Helper()
+					if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for from := uint64(1); from <= 41; from += 10 {
+					ingest(from, from+9)
+				}
+				if rederived {
+					st.cyclesLate = true
+					if _, err := in.Ingest(t.Context(), cyclesFor(51, 150, ts, spec)); err == nil {
+						t.Fatal("want the cycles insert to fail")
+					}
+				}
+				st.failOutages, st.lateOut = 3, true
+				ingest(51, 150) // the outages insert "fails"; ClickHouse goes on with it
+				st.lateOut = false
+				st.failOutages = 3
+				ingest(151, 170)                                                       // the long outage closes at 161: this insert fails
+				if err := c.InsertJSON(t.Context(), "outages", st.saved); err != nil { // committed now
+					t.Fatal(err)
+				}
+				ingest(171, 180)
+				want := fmt.Sprintf("[%s[%d to 161: %d cycles]]", shortOutages(n), longFrom, 161-longFrom)
+				if got := storedOutages(t, c); got != want {
+					t.Errorf("got  %s\nwant %s", got, want)
+				}
+			})
+		}
+	}
+}

@@ -179,6 +179,29 @@ func (f *fakeStore) Query(_ context.Context, q string, p clickhouse.Params, row 
 			b, _ := json.Marshal(c)
 			out = append(out, string(b))
 		}
+	case strings.Contains(q, "FROM outages FINAL WHERE agent_id") && strings.Contains(q, "start_seq >= {lo:UInt64}"): // heldOpen
+		lo, _ := strconv.ParseUint(p["lo"], 10, 64)
+		hi, _ := strconv.ParseUint(p["hi"], 10, 64)
+		type k struct {
+			target, protocol string
+			flow, start      uint64
+		}
+		latest := map[k]map[string]any{}
+		for _, o := range f.rows["outages"] {
+			s := num(o["start_seq"])
+			if o["agent_id"] != p["agent"] || s < lo || s > hi {
+				continue
+			}
+			key := k{o["target"].(string), o["protocol"].(string), num(o["flow_id"]), s}
+			if cur, ok := latest[key]; !ok || num(o["version"]) >= num(cur["version"]) {
+				latest[key] = o
+			}
+		}
+		for _, o := range latest {
+			b, _ := json.Marshal(map[string]any{"target": o["target"], "protocol": o["protocol"],
+				"flow_id": o["flow_id"], "start_seq": o["start_seq"], "end_ts": o["end_ts"]})
+			out = append(out, string(b))
+		}
 	case strings.Contains(q, "FROM outages FINAL WHERE agent_id"): // restore: the newest outage, open or closed
 		latest := map[uint64]map[string]any{}
 		for _, o := range f.rows["outages"] {

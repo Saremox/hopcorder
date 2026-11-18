@@ -528,14 +528,17 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 		}
 		part := recs[stored:end]
 		last := part[len(part)-1].Seq
-		sure, rederived := !a.unsure, false
+		sure := !a.unsure
+		var heldOpen map[heldKey]bool
 		if a.unsure {
 			found, err := in.findStored(wctx, id, part)
 			if err != nil {
 				return stored, err
 			}
 			if len(found) > 0 {
-				rederived = true
+				if heldOpen, err = in.heldOpen(wctx, id, part); err != nil {
+					return stored, err
+				}
 				if err := in.fillViews(wctx, id, part, found); err != nil {
 					return stored, err
 				}
@@ -575,7 +578,7 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 			}
 			if o.pend == pendNew {
 				o.pend = pendOwn
-				if o.StartSeq < part[0].Seq || rederived {
+				if o.StartSeq < part[0].Seq || heldOpen[heldKey{s.key, o.StartSeq}] {
 					o.pend = pendKeep
 				}
 			}
@@ -717,6 +720,42 @@ func (in *Ingester) findStored(ctx context.Context, id string, part []*record.Re
 		}
 	}
 	return found, nil
+}
+
+type heldKey struct {
+	k     streamKey
+	start uint64
+}
+
+// heldOpen returns the outages of agent id that started within part and
+// that storage holds open: written by an earlier derivation of part's
+// cycles (a crash before its mark, or a cycles insert that failed but was
+// committed). Of the close rows of outages that start in part, only theirs
+// must not be dropped when lost (review, round fourteen: marking every
+// close row of such a part pendKeep filled the stream's pending rows with
+// harmless ones, and the row that mattered was dropped as the newest).
+func (in *Ingester) heldOpen(ctx context.Context, id string, part []*record.Record) (map[heldKey]bool, error) {
+	type row struct {
+		Target   string  `json:"target"`
+		Protocol string  `json:"protocol"`
+		FlowID   int     `json:"flow_id"`
+		StartSeq uint64  `json:"start_seq"`
+		EndTS    *string `json:"end_ts"`
+	}
+	rows, err := clickhouseQuery[row](ctx, in.store, `SELECT target, protocol, flow_id, start_seq, end_ts
+		FROM outages FINAL WHERE agent_id = {agent:String} AND start_seq >= {lo:UInt64} AND start_seq <= {hi:UInt64}`,
+		clickhouse.Params{"agent": id, "lo": strconv.FormatUint(part[0].Seq, 10),
+			"hi": strconv.FormatUint(part[len(part)-1].Seq, 10)})
+	if err != nil {
+		return nil, fmt.Errorf("look up outages of %s held open: %w", id, err)
+	}
+	held := map[heldKey]bool{}
+	for _, r := range rows {
+		if r.EndTS == nil {
+			held[heldKey{streamKey{Agent: id, Target: r.Target, Protocol: r.Protocol, Flow: r.FlowID}, r.StartSeq}] = true
+		}
+	}
+	return held, nil
 }
 
 // holdsAll reports whether cycles holds every one of recs (agent id's, in

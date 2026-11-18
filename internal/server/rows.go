@@ -175,9 +175,10 @@ const (
 	// pendOwn: the outage opened and closed within the part whose insert
 	// failed, which wrote no other row of it: storage has nothing of it.
 	pendOwn
-	// pendKeep: the outage started before that part (or the part was
-	// derived before, after a crash before its mark), so storage may hold
-	// it open: the close row must not be dropped.
+	// pendKeep: the outage started before that part, or storage holds it
+	// open (an earlier derivation of the part, before a crash or a failed
+	// cycles insert, wrote its open row: heldOpen), so the close row must
+	// not be dropped.
 	pendKeep
 )
 

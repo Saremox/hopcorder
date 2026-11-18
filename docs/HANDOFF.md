@@ -5305,14 +5305,18 @@ MEDIUM.
   - Now `storeRecords` classifies each lost close row when it is first
     lost: `pendOwn` if its outage opened and closed within the failed part
     (that part wrote no other row of it, so storage has nothing of it),
-    `pendKeep` if it started before the part, or the part was derived
-    before (found stored after a crash before its mark), so that storage may
-    hold it open. Past the bound `keepPending` drops a `pendOwn` row, lost
+    `pendKeep` if it started before the part, so that storage may hold it
+    open. (As first merged, every lost close row of a part derived again,
+    found stored after a crash before its mark, was `pendKeep` too; round
+    fourteen: now only those storage holds open, see "In a part derived
+    again, only the outages storage holds open are kept".) Past the bound
+    `keepPending` drops a `pendOwn` row, lost
     with its insert as round six accepted, and lets a `pendKeep` row take the
     place of the newest `pendOwn` one. The stream is never unloaded, so
     nothing rebuilds its tracker or its current outage.
   - A part adds at most one `pendKeep` row a stream (the outage open when
-    it began), so a row that must be kept is dropped only after more than
+    it began; in a part derived again, also those an earlier derivation
+    left open in storage), so a row that must be kept is dropped only after more than
     8 failed parts in a row each of which closed an outage begun before it;
     then the newest is dropped and the oldest stays. Storage holds an
     outage open only through an insert that succeeded, so without late
@@ -5342,4 +5346,58 @@ MEDIUM.
 - **Not fixed (low):** `hopcorder_server_outages_total` counts outages
   when they are derived, so one whose rows are dropped past the bound is
   counted though not stored.
+
+### Security and correctness review, round fourteen
+
+A focused round (the owner's choice) on round thirteen's fix (#91). Outside
+parts derived again #91 behaved as documented in every run: up to 12 lost
+batches in a row, with and without late commits (0 of 50 wrong each),
+split inserts that partly succeed (0 wrong in 50), and no loaded stream is
+rebuilt. But its own `|| rederived` clause brought back the round-ten end
+state: one HIGH.
+
+- **In a part derived again, only the outages storage holds open are
+  kept** (`storeRecords` and `heldOpen`, `internal/server/ingest.go`;
+  review round fourteen, H1, HIGH, from #91; MEDIUM if a kill met by a
+  failed insert counts as an unusual combination). #91 marked every lost
+  close row of a part found stored (`findStored`, after a kill before the
+  part's mark or a cycles insert that failed but was committed) as
+  `pendKeep`. Most of them are harmless: the earlier derivation stored
+  those outages closed. Eight of them from a lossy stream filled its
+  pending rows, and the close row that mattered, of the outage the
+  earlier derivation left open in storage (it closes after the others),
+  was dropped as the newest. The stream is never restored while loaded,
+  and a later restart's restore looks only at its newest outage, so that
+  outage stayed "ongoing" for good. Reached with one failed outages insert
+  (a kill before the mark, then the agent's retry, larger as its drain
+  reads the spool again from the cursor, losing its outages insert), with
+  two (the retry the same batch), or with no kill at all (a committed
+  cycles insert that reported an error, then a late commit: #91's
+  documented residual with two failed inserts instead of more than
+  eight). Measured by the reviewer with round thirteen's differential and
+  crashes whose retries lose their outages insert: 57 of 100 runs wrong,
+  85 outages left "ongoing"; with round thirteen's fault mix and half the
+  crash retries lost, 24 of 100 (19 "ongoing", 5 the documented restart
+  case).
+  - Now a part found stored asks storage once which of the agent's
+    outages that start within it are held open (`heldOpen`: `outages
+    FINAL` by `agent_id` and `start_seq`, `end_ts` checked in Go, never
+    filtered by a SELECT alias); a lost close row is `pendKeep` if its
+    outage started before the part or is among those. If the lookup fails,
+    the part is not marked and is retried. A part found stored is rare
+    (after a kill or a committed-but-failed cycles insert), so the query is
+    too.
+  - Tests (`clickhouse` tag), each failing on 6c1ade5 for 8 or more
+    one-cycle outages, with controls (7 outages, or no kill or committed
+    cycles insert) passing there: `TestKilledPartThenTwoLostPartsLeaveNothingOpen`
+    (`[70 to ongoing: 81 cycles]` for `[70 to 161: 91 cycles]` before),
+    `TestKilledPartThenLargerLostRetryLeavesNothingOpen` (one failed
+    insert) and `TestCommittedCyclesThenLateCommitLeaveNothingOpen`.
+    Default run: `TestRederivedPartKeepsTheCloseOfTheOutageItLeftOpen`
+    (`end 0, 21 cycles`, ongoing, before); the fake store models
+    `heldOpen`.
+- **Not fixed (lows):** a stream that never sends again after a part whose
+  outages insert failed keeps its pending close row until it is dropped
+  idle (an hour), and that outage stays "ongoing" (as since round ten:
+  #85's restore also needed the stream's next cycle).
 

@@ -265,6 +265,14 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round fourteen)**
+
+- Server: after a crash before a batch was marked stored, a retry whose
+  events could not be stored no longer leaves an outage "ongoing" for
+  good. Every outage that ended in the retried batch was treated as one
+  that storage might hold open, and eight of them crowded out the one it
+  did hold open; the server now asks storage which it holds open.
+
 **Fixed (review round thirteen)**
 
 - Server: a batch whose events could not be stored no longer has a stream
