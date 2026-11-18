@@ -428,8 +428,9 @@ added in the commit that introduced it.
   random nonce | "hopcorder\0"` (the paris word now compensates for seq and
   the nonce), and the IPv4 IP ID is random on its own; see round three.
 - **`flow_id`** is the ICMP identifier (icmp) or UDP source port (udp),
-  default 33434, constant across TTLs *and* cycles so paris keeps a target on
-  one ECMP path over time; per-target configurable. Classic mode
+  default 29434 (33434 until round seven, see there), constant across
+  TTLs *and* cycles so paris keeps a target on one ECMP path over time;
+  per-target configurable. Classic mode
   (`paris: false`) varies the ICMP checksum or walks the UDP destination port.
   (Since round five of the review, two targets of one host and protocol
   need different ones: the server tells streams apart by it.)
@@ -3859,3 +3860,24 @@ decisions:
   - Tests: `TestPathTracker` ("outage answered with an unreachable":
     none, there or back; it failed before; "router before the destination
     changed, answering with an unreachable": a change).
+- **The default `flow_id` is 29434, outside the ports the kernel hands
+  out.** It is the ICMP echo identifier and the UDP and TCP source port of
+  every target that does not set one, and since round six the agent holds
+  a TCP flow's source port with a bound socket. 33434 lies in Linux's
+  ephemeral range (32768–60999): on a host-network agent (DaemonSet,
+  compose, systemd) any unrelated connection the kernel happened to give
+  that port, kubelet's or a browser's, or its TIME_WAIT, made the hold
+  fail at a start or reload, and that agent's TCP targets went unprobed,
+  visibly (`hopcorder_flow_in_use`), until the connection ended, hours for
+  a long-lived one (review, round seven: the reviewer's own run met one by
+  chance). 29434 is below the ephemeral range and below Kubernetes'
+  NodePort range (30000–32767), above the privileged ports, and no common
+  service's port; once held, the kernel gives it to nothing else. The UDP
+  destination port's default stays 33434, traceroute's. No deployment
+  existed, so the change of every default stream's `flow_id` (and so of
+  its stream identity) was free. A host with a wider ephemeral range
+  (`ip_local_port_range` from 1024) still needs the port reserved
+  (`ip_local_reserved_ports`); README says so.
+  - Tests: `TestDefaultFlowIDIsNoEphemeralPort` (1024 to 29999; failed
+    with 33434) and `TestDefaultFlowIDsAgree` (the probe package's and the
+    config's); the tests that assert the default use the constant.

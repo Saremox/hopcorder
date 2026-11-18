@@ -88,7 +88,7 @@ The section for a version is the text of its GitHub release.
   that is already in use stops that flow's TCP targets, visibly (an error
   in the log, `hopcorder_flow_in_use` 1, cycle errors), and they resume by
   themselves once it is free. **Upgrading:** a TCP `flow_id` (default
-  33434) must be a port nothing else on the agent's host uses. A server
+  29434, see below) must be a port nothing else on the agent's host uses. A server
   listening on it, or a second hopcorder on the same TCP flow (`--once`
   next to the daemon), now stops those TCP targets: give them another
   `flow_id`. A connection from the port that closed less than a minute
@@ -155,6 +155,13 @@ The section for a version is the text of its GitHub release.
   counted as two route changes on an unchanged route, at its start and its
   end. Unreachable hops are no longer compared with the addresses seen at
   their TTL.
+- Agent: the default `flow_id` is now 29434 (was 33434). It is the TCP
+  source port the agent holds, and 33434 lies in Linux's ephemeral port
+  range: on a host-network agent, any unrelated connection the kernel
+  happened to give that port stopped the agent's TCP targets until it
+  ended. 29434 is below the ephemeral and NodePort ranges. Every target
+  without its own `flow_id` is a new stream (records carry the new
+  `flow_id`); the UDP destination port's default stays 33434.
 
 **Security: server ingest**
 

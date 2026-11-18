@@ -9,7 +9,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/saremox/hopcorder/internal/config"
+	"github.com/saremox/hopcorder/internal/probe"
 )
+
+// The probe package's default flow ID is the config's.
+func TestDefaultFlowIDsAgree(t *testing.T) {
+	if probe.DefaultFlowID != config.DefaultFlowID {
+		t.Errorf("probe.DefaultFlowID %d, config.DefaultFlowID %d", probe.DefaultFlowID, config.DefaultFlowID)
+	}
+}
 
 func TestRunCommands(t *testing.T) {
 	var out, errb bytes.Buffer
@@ -137,7 +147,7 @@ outputs: {jsonl: {path: /var/log/x.jsonl}}
 		t.Fatal(err)
 	}
 	if len(cfg.Targets) != 1 || cfg.Targets[0].Host != "x.example" || cfg.Targets[0].AF != 6 ||
-		cfg.Targets[0].Protocol != "udp" || cfg.Targets[0].Port != 33434 || cfg.Targets[0].FlowID != 33434 {
+		cfg.Targets[0].Protocol != "udp" || cfg.Targets[0].Port != 33434 || cfg.Targets[0].FlowID != config.DefaultFlowID {
 		t.Errorf("positional targets: %+v", cfg.Targets)
 	}
 

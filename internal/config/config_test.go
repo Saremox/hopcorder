@@ -158,6 +158,18 @@ outputs: {jsonl: {path: "-"}}
 // flow_id; the record has neither port nor the af asked for) are refused,
 // with a hint to give each its own flow_id. Before, the default flow_id put
 // one host's IPv4 and IPv6 targets, or two TCP ports, into one stream.
+// The default flow_id is a TCP source port the agent holds, so it lies where
+// the kernel hands out no ports to other connections: below Linux's
+// ephemeral range and Kubernetes' NodePort range, and above the privileged
+// ports. 33434, inside the ephemeral range, could be taken by any local
+// connection by chance, which stopped a host-network agent's TCP targets
+// until it closed (review, round seven).
+func TestDefaultFlowIDIsNoEphemeralPort(t *testing.T) {
+	if DefaultFlowID < 1024 || DefaultFlowID >= 30000 {
+		t.Errorf("default flow_id %d: want 1024 to 29999", DefaultFlowID)
+	}
+}
+
 func TestTargetsNeedTheirOwnStream(t *testing.T) {
 	const tail = "spool: {dir: /tmp/x}\noutputs: {jsonl: {path: \"-\"}}\n"
 	for name, targets := range map[string]string{
@@ -200,7 +212,7 @@ targets:
 	for _, tg := range c.Targets {
 		got = append(got, tg.FlowID)
 	}
-	if want := []int{33434, 33435, 33434, 33436, 33434}; !slices.Equal(got, want) {
+	if want := []int{DefaultFlowID, 33435, DefaultFlowID, 33436, DefaultFlowID}; !slices.Equal(got, want) {
 		t.Errorf("flow_ids %v, want %v", got, want)
 	}
 

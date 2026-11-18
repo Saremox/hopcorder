@@ -294,13 +294,19 @@ address family that never listens or connects: the `flow_id` of every TCP
 target, and in classic mode (`paris: false`, which walks the source port)
 every port from `flow_id` to `flow_id + max_ttl - 1`. Otherwise any local
 user could keep a connection from the port to the target's service
-(`nc -p 33434 target 443`), and the target would answer every probe for
-that connection, so each cycle would be recorded as not reaching it; 33434
-also lies in Linux's ephemeral port range, so any local connection could
-get it by chance. Nothing needs to be configured. A port that is already
-in use (a connection from it, one closed less than a minute ago, which the
-kernel keeps in TIME_WAIT, a server listening on it, or another hopcorder)
-stops that flow's TCP targets the same way until it is free. UDP ports are
+(`nc -p 29434 target 443`), and the target would answer every probe for
+that connection, so each cycle would be recorded as not reaching it.
+Nothing needs to be configured. A port that is already in use (a
+connection from it, one closed less than a minute ago, which the kernel
+keeps in TIME_WAIT, a server listening on it, or another hopcorder) stops
+that flow's TCP targets the same way until it is free. The default
+`flow_id`, 29434, lies below Linux's ephemeral port range (32768–60999,
+`net.ipv4.ip_local_port_range`) and Kubernetes' NodePort range
+(30000–32767), so the kernel gives it to no other connection; a TCP
+`flow_id` inside the ephemeral range can be taken by any local connection
+by chance (on a host-network agent, any process on the host), and then
+stops those targets until that connection ends. Reserve such a port with
+`net.ipv4.ip_local_reserved_ports`, or pick one outside the range. UDP ports are
 not held (a bound UDP port would swallow other tracers' probes), and a UDP
 target's answer does not depend on the agent's sockets.
 
@@ -462,7 +468,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
 | `probe_past` | `2` | `--probe-past` | Silent TTLs kept past the last responder when unreached |
 | `protocol` | `icmp` | `--protocol` | Default protocol: `icmp`, `udp` or `tcp` |
-| `flow_id` | `33434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own, and so does every target of one host and protocol; a TCP one must be a port nothing else on the host uses |
+| `flow_id` | `29434` | `--flow-id` | Default ICMP identifier / UDP or TCP source port; every hopcorder process on a host needs its own, and so does every target of one host and protocol; a TCP one must be a port nothing else on the host uses |
 | `paris` | `true` | `--paris` | Flow-stable probing |
 | `adaptive_max_ttl` | `true` | | Probe only 3 TTLs past the destination's last distance (see below) |
 | `dns_ttl` | `5m` | | Re-resolve target names this often |
