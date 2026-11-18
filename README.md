@@ -582,8 +582,9 @@ groups:
 - **Reload** (SIGHUP, `systemctl reload hopcorder`): the config file is read
   again with the same command-line flags applied on top. If it is invalid, the
   error is logged and the running configuration stays. Otherwise the agent
-  restarts in-process with it (raw sockets stay open, seq continues, and so
-  does the metrics listener while its address is unchanged; a new address is
+  restarts in-process with it (raw sockets stay open, target names keep their
+  addresses (see DNS below), seq continues, and so does the metrics listener
+  while its address is unchanged; a new address is
   bound before the old one is released, and the ICMP echo identifiers and
   TCP source ports of both configurations are held until the new one
   runs). If the new
@@ -612,7 +613,12 @@ groups:
   nothing answered, so outages are visible as data rather than gaps.
 - **DNS**: names are re-resolved in the background every `dns_ttl`; if that
   fails the last address keeps being used. Address changes are logged and every
-  record carries `target_ip`.
+  record carries `target_ip`. A reload keeps each name's address (same name and
+  `af`) and refreshes it in the background at once, and the spool keeps the last
+  address across restarts: if a name cannot be resolved at start, its target is
+  probed at the address it had before, with a warning. So an outage that takes
+  DNS down with it stays visible as data through a reload or a restart.
+  `--once` resolves every name.
 - **Spool disk use** is bounded by `max_bytes`: the spool file, records and
   database overhead together, grows to it and no further (the records take
   half to two thirds, depending on their size), allocating a little ahead of
