@@ -24,6 +24,12 @@ for i in $(seq 90); do
     echo "agents with cycles: $agents/$want, reached tcp streams: $reached"
     if [ "$agents" -ge "$want" ] && [ "$reached" -ge 1 ]; then
       jq -c '.rows[] | {agent_id, target, protocol, cycles, last_reached, last_path_len}' <<<"$streams"
+      # The DaemonSet's agentIdPrefix (agent-ds-values.yaml) before each
+      # node's name: one agent per node.
+      if [ "$(jq '[.rows[] | select(.cycles > 0) | .agent_id | select(startswith("ds-"))] | unique | length' <<<"$streams")" != "$nodes" ]; then
+        echo "not every node's agent_id has the DaemonSet's agentIdPrefix ds-"
+        exit 1
+      fi
       curl -sf http://127.0.0.1:18080/ui/ | grep -q '<div id="app">'
       # DNS rebinding: through the port-forward, a page whose own name
       # resolves to 127.0.0.1 gets 421; probes and scrapers, which use the

@@ -206,6 +206,14 @@ The section for a version is the text of its GitHub release.
   with the password of Grafana's read-only user made ClickHouse buffer a
   result on the data volume until it was full, and the server's inserts
   failed meanwhile.
+- Agent chart: `agentIdPrefix` goes before every agent ID, the pod's or
+  the node's name. Agent IDs must be unique per server, but with the chart
+  in several clusters shipping to one server, every cluster had an agent
+  `hopcorder-agent-0`, and node names often repeat too: of two agents with
+  one ID, one was refused for good (or its records taken for the other's
+  duplicates) and lost its records, and their streams were merged. In
+  daemonset mode there was no way to tell them apart. Give each cluster
+  its own prefix; the chart refuses one that cannot make a valid agent ID.
 
 **Security: server ingest**
 

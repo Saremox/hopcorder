@@ -3,6 +3,7 @@ image:
   tag: ci
   pullPolicy: Never
 mode: daemonset
+agentIdPrefix: ds-   # before the node's name in the agent_id (smoke.sh looks for it)
 hostNetwork: true
 server:
   url: http://hopcorder-server.default.svc:8080

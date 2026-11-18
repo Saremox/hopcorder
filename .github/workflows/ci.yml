@@ -453,6 +453,32 @@ jobs:
             config.spool.max_bytes=512KiB config.spool.max_bytes=lots persistence.size=1Gb persistence.size=1Mi; do
             refused "${agent[@]}" --set "$v"
           done
+          # Agent IDs must be unique per server, and pod and node names
+          # repeat across clusters: agentIdPrefix goes before the pod's or
+          # the node's name (review, round seven; smoke.sh sees the
+          # DaemonSet's ds- arrive). A prefix the agent could never take is
+          # refused: characters outside [A-Za-z0-9._:-], or more than 128
+          # with the last pod's name (agent-values.yaml has 2 replicas:
+          # a-hopcorder-agent-1, 19 characters) or a one-character node name.
+          ds=(deploy/helm/hopcorder-agent -f deploy/helm/ci/agent-ds-values.yaml)
+          aid() { helm template a "$@" | sed -n '/^ *- --agent-id$/{n;s/^ *- //p;}'; }
+          from() { helm template a "$@" | sed -n '/^ *- name: AGENT_ID$/,/fieldPath:/s/^ *fieldPath: //p'; }
+          test "$(aid "${agent[@]}")" = '"$(AGENT_ID)"'
+          test "$(aid "${agent[@]}" --set agentIdPrefix=eu1-)" = '"eu1-$(AGENT_ID)"'
+          test "$(from "${agent[@]}" --set agentIdPrefix=eu1-)" = metadata.name
+          test "$(aid "${ds[@]}")" = '"ds-$(AGENT_ID)"'
+          test "$(aid "${ds[@]}" --set agentIdPrefix=eu1:)" = '"eu1:$(AGENT_ID)"'
+          test "$(from "${ds[@]}")" = spec.nodeName
+          p=$(printf 'p%.0s' {1..128})
+          helm template a "${agent[@]}" --set "agentIdPrefix=${p:0:109}" >/dev/null
+          helm template a "${ds[@]}" --set "agentIdPrefix=${p:0:127}" >/dev/null
+          for v in 'eu 1-' 'eu/1-' '$(HOSTNAME)-'; do
+            refused "${agent[@]}" --set "agentIdPrefix=$v"
+            refused "${ds[@]}" --set "agentIdPrefix=$v"
+          done
+          refused "${agent[@]}" --set "agentIdPrefix=${p:0:110}"
+          refused "${agent[@]}" --set replicas=11 --set "agentIdPrefix=${p:0:109}"
+          refused "${ds[@]}" --set "agentIdPrefix=$p"
           refused deploy/helm/hopcorder-server --set config.clickhouse.password=x
           refused deploy/helm/hopcorder-server --set networkPolicy.enabled=true
           # Names that go into the bundled ClickHouse's XML configuration.

@@ -210,7 +210,11 @@ helm install hopcorder-agent ./hopcorder-agent-0.1.1.tgz \
   after their pods, each with its own spool volume (`persistence.size`, 1Gi;
   `config.spool.max_bytes` is 75% of it unless set, at most 1GiB, and the
   chart refuses more than 90%); `mode: daemonset` runs one agent per node,
-  named after the node, with its spool on the node.
+  named after the node, with its spool on the node. An agent's ID must be
+  unique on its server (see [Ingest semantics](#server)), and pod and node
+  names repeat across clusters: when agents of several clusters ship to one
+  server, give each cluster its own `agentIdPrefix` (`eu1-` gives
+  `eu1-hopcorder-agent-0`, or `eu1-` and the node's name).
   `hostNetwork: true` traces from the node's network. The pods run as root
   with `NET_RAW`, which Pod Security `baseline` does not allow: give the
   agent a namespace of its own at the `privileged` level. Credentials for the
@@ -462,7 +466,7 @@ is reported at once. See [`deploy/agent.example.yaml`](deploy/agent.example.yaml
 
 | Key | Default | Flag | Meaning |
 | --- | --- | --- | --- |
-| `agent_id` | hostname | `--agent-id` | Identifies the agent in records and metrics |
+| `agent_id` | hostname | `--agent-id` | Identifies the agent in records and metrics; unique per server |
 | `interval` | `5s` | `--interval` | Minimum period between cycles of a target (≥ 100ms) |
 | `timeout` | `1s` | `--timeout` | Per-probe timeout; must be shorter than the interval |
 | `max_ttl` | `30` | `--max-ttl` | Highest TTL probed (1–255) |
@@ -745,7 +749,10 @@ spool starts its seqs at the clock (time in microseconds), above anything an
 earlier spool of the same agent sent; only on a host whose clock is wrong does
 a wiped spool also need a new `agent_id`. A batch whose seqs all lie
 far below the stored ones is refused with 409, so the agent keeps it and its
-errors show what happened.
+errors show what happened. So every agent needs an `agent_id` of its own:
+of two agents sharing one, the one whose spool started earlier is refused
+for good (or, within 0.1 s, its records are taken for the other's
+duplicates), and their streams are merged.
 
 **Limits.** Ingest takes `Content-Type: application/x-ndjson` (agents send it;
 the content types a web page can send without a CORS preflight are refused),

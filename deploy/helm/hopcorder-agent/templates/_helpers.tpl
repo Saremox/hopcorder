@@ -148,6 +148,31 @@ a whole number, with B, KB, MB, GB, TB, KiB, MiB, GiB or TiB after it.
 {{- toYaml $cfg }}
 {{- end }}
 
+{{/*
+The --agent-id argument: agentIdPrefix, then the pod's name (statefulset) or
+the node's (daemonset), which the kubelet puts into $(AGENT_ID). Agent IDs
+must be unique per server, and pod and node names repeat across clusters
+(review, round seven). The agent takes 1 to 128 characters from
+[A-Za-z0-9._:-] (record.ValidAgentID), so the chart refuses a prefix with
+any other character (none can start a $(VAR) for the kubelet, either), or
+one too long with the last pod's name or a node name of one character.
+*/}}
+{{- define "hopcorder-agent.agentId" -}}
+{{- $prefix := toString (.Values.agentIdPrefix | default "") }}
+{{- if not (regexMatch "^[A-Za-z0-9._:-]*$" $prefix) }}
+{{- fail (printf "agentIdPrefix %q: letters, digits, '.', '_', ':' and '-' only (an agent_id has no others)" $prefix) }}
+{{- end }}
+{{- if eq .Values.mode "statefulset" }}
+{{- $pod := printf "%s-%d" (include "hopcorder-agent.fullname" .) (sub (max 1 (int .Values.replicas)) 1) }}
+{{- if gt (add (len $prefix) (len $pod)) 128 }}
+{{- fail (printf "agentIdPrefix (%d characters) and the pod name %s (%d): an agent_id has at most 128 characters" (len $prefix) $pod (len $pod)) }}
+{{- end }}
+{{- else if gt (len $prefix) 127 }}
+{{- fail (printf "agentIdPrefix (%d characters) and the node's name: an agent_id has at most 128 characters" (len $prefix)) }}
+{{- end }}
+{{- printf "%s$(AGENT_ID)" $prefix }}
+{{- end }}
+
 {{/* The pod template, shared by the StatefulSet and the DaemonSet. */}}
 {{- define "hopcorder-agent.podTemplate" -}}
 metadata:
@@ -201,7 +226,7 @@ spec:
         - --config
         - /etc/hopcorder/agent.yaml
         - --agent-id
-        - $(AGENT_ID)
+        - {{ include "hopcorder-agent.agentId" . | quote }}
         {{- with .Values.extraArgs }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
