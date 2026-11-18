@@ -191,3 +191,55 @@ func TestKeepPendingBound(t *testing.T) {
 		t.Errorf("kept rows past the bound: %s, want %s", got, want)
 	}
 }
+
+// A part derived again after a crash before its mark (review, round
+// fourteen): the agent's retry carries more than the killed attempt, and
+// its outages insert fails. The killed attempt stored its events, among
+// them the open row of the outage open at its end. #91 marked every lost
+// close row of such a part as one to keep, so the eight one-cycle outages'
+// closes (stored already, and harmless) filled the stream's pending rows
+// and the long outage's close row, the one that mattered, was dropped as
+// the newest: "ongoing" for good. Now only the outages storage holds open
+// are kept so.
+func TestRederivedPartKeepsTheCloseOfTheOutageItLeftOpen(t *testing.T) {
+	st := newHookStore()
+	in := NewIngester(st, nil, quietLogger(), nil)
+	var failMark, failOutages atomic.Bool
+	st.insert = func(table string, _ int) error {
+		switch {
+		case failMark.Load() && table == "agent_seq":
+			return errors.New("killed before the mark")
+		case failOutages.Load() && table == "outages":
+			return errors.New("clickhouse: connection refused")
+		}
+		return nil
+	}
+	ingest := func(from, to uint64) {
+		t.Helper()
+		var recs []*record.Record
+		for seq := from; seq <= to; seq++ {
+			spec := pathA
+			// 8 one-cycle outages at 12, 14, ..., 26, then down from 30 to 70.
+			if seq >= 12 && seq <= 26 && seq%2 == 0 || seq >= 30 && seq <= 70 {
+				spec = brokenA
+			}
+			recs = append(recs, mk("lab", seq, spec...))
+		}
+		if _, err := in.Ingest(t.Context(), recs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ingest(1, 10)
+	failMark.Store(true)
+	ingest(11, 50) // stored with its events, the long outage open: then killed
+	failMark.Store(false)
+	in = NewIngester(st, nil, quietLogger(), nil) // the server restarts
+	failOutages.Store(true)
+	ingest(11, 120) // the agent's retry, with what came in since: its outages insert fails
+	failOutages.Store(false)
+	ingest(121, 130)
+	got := outagesOf(st.table("outages"))
+	if got[30] != "end 71, 41 cycles" {
+		t.Errorf("the long outage: %q, want end 71, 41 cycles (all: %v)", got[30], got)
+	}
+}
