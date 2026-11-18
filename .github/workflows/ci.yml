@@ -278,6 +278,17 @@ jobs:
           code=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse wget -O /dev/null -S "${hdrs[@]}" \
             'http://localhost:8123/?query=SELECT+1' 2>&1 | awk '/HTTP\//{print $2}' | tail -1)
           [ "$code" = 400 ] || { echo "40 header fields were not refused before authentication: $code"; exit 1; }
+          # An unauthenticated request whose body cannot be drained after its
+          # 401 (a bad chunk header) logs no stack trace (sendExceptionToHTTPClient).
+          docker compose -f deploy/docker-compose.yml exec -T clickhouse bash -c 'for i in 1 2 3 4 5; do
+            exec 3<>/dev/tcp/127.0.0.1/8123
+            printf "POST /?query=SELECT+1 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzzzz\r\n" >&3
+            timeout 2 head -c 200 <&3 >/dev/null; exec 3>&-; done'
+          sleep 1
+          if docker compose -f deploy/docker-compose.yml exec -T clickhouse sh -c \
+            'grep -a -l "sendExceptionToHTTPClient" /var/log/clickhouse-server/*' | grep -q .; then
+            echo "ClickHouse logs a stack trace for an unauthenticated request it cannot drain"; exit 1
+          fi
       - name: ClickHouse cannot connect out
         # hasColumnInTable('host:port', ...) makes ClickHouse open a
         # connection for Grafana's read-only user, which no grant covers;
@@ -588,6 +599,8 @@ jobs:
           grep -qF "$cancel" <<<"$ch" || { echo "hopcorder.xml: cancelWithException logs stack traces"; exit 1; }
           grep -qF "$cancel" deploy/compose/clickhouse-config.xml ||
             { echo "compose clickhouse-config.xml: cancelWithException logs stack traces"; exit 1; }
+          grep -qF '<logger><name>sendExceptionToHTTPClient</name><level>fatal</level></logger>' <<<"$ch" ||
+            { echo "hopcorder.xml: sendExceptionToHTTPClient logs stack traces"; exit 1; }
           # All temporary data together is capped (wait_end_of_query), by
           # default at a tenth of the volume: 1Gi here, 20Gi by default.
           grep -qF '<max_temporary_data_on_disk_size>107374182</max_temporary_data_on_disk_size>' <<<"$ch" ||
