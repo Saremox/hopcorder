@@ -25,6 +25,20 @@ fullnameOverride: ""
 mode: statefulset
 replicas: 1
 
+# Put before every agent_id as it is: eu1- gives eu1-hopcorder-agent-0, or
+# eu1-<node name>. Agent IDs must be unique per server: it keeps one
+# sequence high-water mark per agent_id, so of two agents with one ID, one
+# is refused for good (or its records are dropped as the other's
+# duplicates) and their streams are merged. Pod names repeat across
+# clusters (each has its hopcorder-agent-0), and node names do too (kind,
+# minikube and k3s defaults, cloud nodes named after addresses in the same
+# CIDR) whatever the release name: when agents of several clusters ship to
+# one server, give each cluster its own prefix. Letters, digits, '.', '_',
+# ':' and '-', at most 128 characters with the name: the chart checks the
+# pod names, and the agent refuses at start an ID too long with its node's.
+# config.agent_id is ignored.
+agentIdPrefix: ""
+
 # Trace from the node's network instead of the pod network (no CNI hops in
 # the path, and the node's own source address).
 hostNetwork: false
@@ -56,9 +70,9 @@ server:
     serverName: ""
 
 # The agent's configuration file (see deploy/agent.example.yaml for every
-# key; unknown keys are rejected). The chart sets agent_id, spool.dir,
-# outputs.http (from server) and outputs.metrics (from metrics); other
-# outputs.http keys given here are kept.
+# key; unknown keys are rejected). The chart sets agent_id (see
+# agentIdPrefix), spool.dir, outputs.http (from server) and outputs.metrics
+# (from metrics); other outputs.http keys given here are kept.
 config:
   interval: 5s
   log:

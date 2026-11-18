@@ -2,6 +2,11 @@ hopcorder agent {{ .Chart.AppVersion }} ({{ .Values.mode }}) traces {{ len .Valu
 and ships to {{ .Values.server.url }}.
 
   kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/instance={{ .Release.Name }} --tail=20
+{{- $prefix := include "hopcorder-agent.agentId" . | trimSuffix "$(AGENT_ID)" }}
+
+Agent IDs: {{ $prefix }}{{ if eq .Values.mode "daemonset" }}<node name>{{ else }}{{ include "hopcorder-agent.fullname" . }}-0{{ if gt (int .Values.replicas) 1 }} to -{{ sub (int .Values.replicas) 1 }}{{ end }}{{ end }}
+An agent ID must be unique on its server: when agents of other clusters ship
+to it too, give each cluster its own agentIdPrefix.
 
 The agent runs as root with CAP_NET_RAW, which Pod Security "baseline" does
 not allow: keep it in a namespace of its own with the "privileged" level.

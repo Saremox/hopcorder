@@ -6,9 +6,9 @@ metadata:
   labels:
     {{- include "hopcorder-agent.labels" . | nindent 4 }}
 spec:
-  # Each replica is its own agent (agent_id = pod name) with its own spool:
-  # a stable name keeps its sequence numbers unique and its streams
-  # continuous across restarts.
+  # Each replica is its own agent (agent_id = agentIdPrefix + pod name) with
+  # its own spool: a stable name keeps its sequence numbers unique and its
+  # streams continuous across restarts.
   replicas: {{ .Values.replicas }}
   serviceName: {{ include "hopcorder-agent.fullname" . }}
   podManagementPolicy: Parallel

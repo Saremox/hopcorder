@@ -932,6 +932,8 @@ added in the commit that introduced it.
   A Deployment would get a new name with an empty spool on every
   reschedule. `mode: daemonset` uses the node's name as `--agent-id` and a
   hostPath spool, so an agent keeps its identity and spool on its node.
+  Both put `agentIdPrefix` before the name (round seven): agent IDs must be
+  unique per server, and pod and node names repeat across clusters.
   `hostNetwork` traces from the node's network namespace. The chart owns
   `spool.dir`, `outputs.http.url` (from `server.url`) and `outputs.metrics`,
   and in `mode: statefulset` sets `spool.max_bytes` from `persistence.size`
@@ -4190,3 +4192,41 @@ decisions:
     or about 5 GB written on the runner); the helm job checks the rendered
     setting and refuses 0 and `2Gi`; `smoke.sh` checks the setting in the
     running pod (not run here: no kind).
+- **Agent IDs can be made unique across clusters (`agentIdPrefix`).** The
+  agent chart's `--agent-id` was the pod's name (statefulset) or the
+  node's (daemonset), and the flag overrides `config.agent_id`. The server
+  keeps one high-water mark per agent_id, so with the chart in two
+  clusters shipping to one server (the natural central-server setup), the
+  two `hopcorder-agent-0`, or two nodes of one name (kind, minikube and k3s
+  defaults, `ip-10-0-…` in VPCs of the same CIDR), were one agent: the
+  agent whose spool started later won, the other was refused with 409 for
+  good and lost its records at `max_age` or `max_bytes` (or, with spools
+  started within 0.1 s, had them dropped silently as duplicates), and
+  their streams were merged. In daemonset mode another release name did
+  not help, and nothing said IDs must be unique (review, round seven;
+  from the code, not run in a cluster). Now:
+  - `agentIdPrefix` (default empty) goes before `$(AGENT_ID)` as it is,
+    in both modes (`eu1-` gives `eu1-hopcorder-agent-0` or `eu1-<node>`).
+    One string value rather than a `tpl`-able `agentId`: the cases need
+    only a per-cluster constant, and the pod or node name must stay in the
+    ID for it to be unique within the cluster.
+  - The chart refuses a prefix the agent could never take
+    (`record.ValidAgentID`: 1 to 128 characters from `[A-Za-z0-9._:-]`):
+    another character (which also keeps `$(` out of the kubelet's
+    expansion), or more than 128 characters with the longest pod name
+    (`<fullname>-<replicas-1>`, known at render) or, in daemonset mode,
+    with a node name of one character. A node name that makes the ID too
+    long is refused by the agent at start, as before.
+  - values.yaml, README (the agent chart, the `agent_id` row and the
+    ingest semantics) and the chart's NOTES (the IDs it gives) say that
+    agent IDs must be unique per server and when the prefix is needed.
+  - Checks: the helm job renders the argument in both modes with and
+    without a prefix, takes 109 characters with the CI values' last pod
+    `a-hopcorder-agent-1` and 127 in daemonset mode, and refuses a space,
+    `/`, `$(HOSTNAME)-`, 110 characters, 109 with 11 replicas and 128 in
+    daemonset mode (before, the prefix was ignored and nothing refused).
+    The agent took the 128-character IDs these limits allow and refused
+    the 129-character ones. `smoke.sh` gives the CI DaemonSet
+    `agentIdPrefix: ds-` and requires each node's agent to arrive as
+    `ds-<node>`, which checks the kubelet's expansion (not run here: no
+    kind in the development container).
