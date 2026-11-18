@@ -23,6 +23,10 @@ image, one replica, a persistent volume, no operator. See values.yaml.
 {{- if and $d.readOnlyUser.enabled (or (lt $roQuery 1) (lt $roUser $roQuery)) }}
 {{- fail "clickhouse.deploy.readOnlyUser: maxMemoryUsage at least 1 (bytes), maxMemoryUsageForUser at least maxMemoryUsage" }}
 {{- end }}
+{{- $tmp := int64 $d.maxTemporaryDataOnDisk }}
+{{- if lt $tmp 1 }}
+{{- fail "clickhouse.deploy.maxTemporaryDataOnDisk: at least 1 (bytes)" }}
+{{- end }}
 {{- $db := .Values.config.clickhouse.database | default "hopcorder" }}
 {{- if not (regexMatch $ident (toString $db)) }}
 {{- fail "config.clickhouse.database: letters, digits and _ (not starting with a digit) with clickhouse.deploy" }}
@@ -62,6 +66,12 @@ data:
         <!-- remote() and the like resolve their host before the grant
              check; with this they resolve nothing (review round seven). -->
         <remote_url_allow_hosts><host>localhost</host></remote_url_allow_hosts>
+        <!-- All temporary data on the volume together, from every user: a
+             result buffered for wait_end_of_query (a URL parameter, not a
+             setting: any HTTP client with a password may send it, and one
+             with the read-only user's filled the volume, review round
+             seven) and the server's spills. -->
+        <max_temporary_data_on_disk_size>{{ $tmp }}</max_temporary_data_on_disk_size>
         <logger>
             <level>warning</level>
             <console>1</console>
@@ -235,7 +245,7 @@ spec:
     metadata:
       annotations:
         # The ConfigMap's inputs (and the chart version, for its text).
-        checksum/config: {{ printf "%v|%v|%v|%v" .Chart.Version $days $d.readOnlyUser $db | sha256sum }}
+        checksum/config: {{ printf "%v|%v|%v|%v|%v" .Chart.Version $days $d.readOnlyUser $db $tmp | sha256sum }}
         {{- with $d.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

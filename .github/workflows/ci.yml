@@ -253,6 +253,17 @@ jobs:
           out=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse clickhouse-client --user grafana \
             --password grafana --query "SELECT hasColumnInTable('1.1.1.1:9000', 'a', 'b', 'c')" 2>&1) && exit 1
           grep -q 'Network is unreachable' <<<"$out" || { echo "ClickHouse may connect out: $out"; exit 1; }
+      - name: Grafana's ClickHouse user cannot fill the volume with a buffered result
+        # wait_end_of_query=1, a URL parameter rather than a setting, makes
+        # ClickHouse keep the whole result in a temporary file on the data
+        # volume until the query ends: about 5 GB here, which filled the
+        # volume. The server-level cap (2 GB, all users together) stops it.
+        run: |
+          out=$(docker compose -f deploy/docker-compose.yml exec -T clickhouse wget -qO- --content-on-error \
+            --post-data "SELECT hex(sipHash128(number)) AS a, a, a FROM numbers(100000000) FORMAT RowBinary" \
+            'http://localhost:8123/?user=grafana&password=grafana&wait_end_of_query=1' 2>&1 | head -c 1000 || true)
+          grep -q 'Limit for temporary files size exceeded' <<<"$out" ||
+            { echo "a buffered result was not capped: $(tr -cd '[:print:]' <<<"$out" | head -c 300)"; exit 1; }
       - name: dashboards through Grafana
         env:
           HOPCORDER_SERVER_URL: http://127.0.0.1:8080
@@ -509,6 +520,11 @@ jobs:
           for l in executeQuery DynamicQueryHandler HTTPHandler TCPHandler BackupsWorker DNSResolver Cluster; do
             grep -qF "<logger><name>$l</name><level>fatal</level></logger>" <<<"$ch" || { echo "hopcorder.xml: $l logs query messages"; exit 1; }
           done
+          # All temporary data together is capped (wait_end_of_query).
+          grep -qF '<max_temporary_data_on_disk_size>2000000000</max_temporary_data_on_disk_size>' <<<"$ch" ||
+            { echo "hopcorder.xml: temporary data is not capped"; exit 1; }
+          refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=0
+          refused deploy/helm/hopcorder-server --set clickhouse.deploy.enabled=true --set clickhouse.deploy.maxTemporaryDataOnDisk=2Gi
           for l in mysql_port postgresql_port interserver_http_port; do
             grep -qF "<$l remove=\"1\"/>" <<<"$ch" || { echo "hopcorder.xml: $l is open"; exit 1; }
           done

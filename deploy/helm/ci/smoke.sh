@@ -147,6 +147,12 @@ for i in $(seq 90); do
         echo "ClickHouse's console grew $grew bytes for one hasColumnInTable() host name"
         exit 1
       fi
+      # Temporary data is capped for all queries together: a result buffered
+      # for wait_end_of_query (a URL parameter) filled the volume.
+      if [ "$(adm "SELECT value FROM system.server_settings WHERE name = 'max_temporary_data_on_disk_size'")" != 2000000000 ]; then
+        echo "ClickHouse's temporary data is not capped at 2000000000 bytes"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then
