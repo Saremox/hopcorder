@@ -274,6 +274,19 @@ The section for a version is the text of its GitHub release.
   thousand idle connections, OOM-killed it (where a pod could reach its
   HTTP port, that is without a CNI that enforces the chart's
   NetworkPolicy).
+- Server: an outage that ended while the server could not restore its
+  stream's state no longer stays ongoing for good. After a restart, or
+  once a stream had been idle, the cycles of a stream whose restore
+  failed, ran out of time or did not fit the 256 restores one request does
+  are stored but derive no events; when the destination answered again in
+  them, the outage's end was never recorded, and the read API, the UI and
+  Grafana showed it ongoing since its start. With no fault at all, that
+  happened at a restart to an agent with more than 256 targets, for an
+  outage ending in its first batch after the restart. If the stream later
+  went down again while its restores failed, the new outage was merged
+  into the old one, reached cycles included. The next restore that works
+  now closes such an outage at the first cycle that reached the
+  destination.
 
 **Fixed (review round eight)**
 

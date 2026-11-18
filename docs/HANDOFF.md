@@ -1268,7 +1268,10 @@ decisions:
   batch, or its event insert failed), it opens one at the first of the
   trailing unreached cycles it replayed. Consequence: if restores fail for
   good (ClickHouse broken for reads only), streams derive no events until
-  they succeed; the metric and the warning show it.
+  they succeed; the metric and the warning show it. (Round nine: that
+  closed the outage only if its end was not among the skipped cycles; a
+  restore now also closes one storage holds open after it ended. See "A
+  restore closes an outage whose end derived no events".)
 - **Request bodies are read before a request takes an ingest slot**, into
   64 KiB chunks: at most 64 requests read at once (others wait 10 s, then
   503), each body within 20 s (`http.ResponseController.SetReadDeadline`;
@@ -2832,7 +2835,10 @@ decisions:
   own for instance, has one per two cycles (review: 1M rows read, 45 to
   78 ms per restore with 2M cycles). A stream down for the whole replay is
   still looked up without a bound. Test: `TestRestoreOutageLookupBounded`
-  (default run).
+  (default run). (Round nine: a restore also looks for an outage that
+  started before that cycle and is still open in storage, within the
+  replay first; see "A restore closes an outage whose end derived no
+  events".)
 
 **Agent**
 
@@ -4581,9 +4587,13 @@ the ten round-seven mediums fixed (#66 to #75).
     row); one that closed before is over. Not the one-line fix (select the
     real `end_ts` and keep `end_ts IS NULL`): it breaks re-derivation after
     a crash, which converged only because of this bug, into two
-    overlapping outages (`[51 to 96: 45] [61 to 96: 35]`).
+    overlapping outages (`[51 to 96: 45] [61 to 96: 35]`). (Round nine:
+    an open one goes on only if no stored cycle after its start reached;
+    one that did ended there, and is closed. See "A restore closes an
+    outage whose end derived no events".)
   - Tests (`clickhouse` tag, `restore_outage_clickhouse_test.go`; the fake
-    store models the intended filter, so only ClickHouse shows it):
+    store models the intended filter, so only ClickHouse shows it; round
+    nine: the fake now models the real lookup):
     `TestRestoreAfterAMonthKeepsTheOldOutageClosed` (reached and unreached
     comebacks) and `TestRestoreAfterFailedRestoresOpensTheNewOutage` failed
     before with the outages above; `TestRederivedPartClosesItsOutageOnce`
@@ -4845,3 +4855,129 @@ two HIGH findings were found next to them.
     header fields before authentication (failed with the old config: 401);
     the helm job requires them in the rendered config and the mount;
     `smoke.sh` checks them in the pod (not run here: no kind).
+- **A restore closes an outage whose end derived no events**
+  (`restoreOutage` and `closeLeftOpen`, `internal/server/ingest.go`; review
+  round nine, H1, HIGH; the gap dates from round two). Round two left the
+  cycles of a stream whose restore fails or does not fit the budget (256
+  per request, within 5 s) stored but deriving no events. When the
+  stream's outage was open in storage and the stream reached its
+  destination again in those cycles, the close row was never written: the
+  next restore that worked replayed a stream that reached, looked up no
+  outage, and the open row stayed "ongoing" for good (read API, the UI's
+  event list and timeline, Grafana's Outages panel, its duration growing
+  until retention). Had the stream gone down for `replayDepth` cycles or
+  more while unrestored again, the unbounded lookup found that outage and
+  round eight's rule resumed it, since it was open: the new outage was
+  merged into it, with the reached cycles in between (`[51 to 131: 80]`
+  for `[51 to 61: 10] [81 to 131: 50]`). Round two's record of the restore
+  as the fix for an outage "never closed" held only if the close itself
+  was not among the skipped cycles. Triggers:
+  - normal operation: a server restart (an upgrade) for an agent with more
+    than 256 streams (a stream per target, protocol and flow; the
+    per-agent default allows 4096). Its first request after the restart
+    restores 256, and an outage of another stream that ends in that
+    request stays ongoing (the review: 300 targets, `[t299 1500 to
+    ongoing]`). A lossy destination, whose every lost reply is a one-cycle
+    outage, makes it near certain.
+  - a plausible fault: ClickHouse too slow for the restore budget, or
+    failing reads, while the server restarts.
+  - Fix (the review's option b): an outage that storage holds open
+    although a stored cycle after its start reached ended at the first such
+    cycle, so a restore closes it there instead of leaving or resuming it:
+    - Down at the end of the replay, the lookup is round eight's (the
+      newest outage that started after the last replayed cycle that
+      reached, without a bound when there is none). The query that counted
+      an open one's cycles now also counts those that reached (`countIf`,
+      `minIf`, `argMinIf` and `maxIf` on `reached`, in the same window):
+      with none it goes on as before, with one it ended there.
+    - When that lookup finds nothing, or the stream reached at its last
+      replayed cycle (no lookup ran then), and the replay holds a cycle
+      that reached, the stream's newest outage started before that cycle
+      and has ended: it is looked up within the replay first, when the
+      replay holds an unreached cycle (a stream that flaps has a row per
+      two cycles; round four's bound), then before the replay. If storage
+      holds it open, it ended at the first cycle after its start that
+      reached.
+    - Its close row is the one observe writes: `end_seq`, `end_ts` and
+      `version` of that cycle, `cycles` counted from storage, the rest as
+      the open row. It goes into the batch's events and is counted in
+      `hopcorder_server_outages_total{event="close"}`.
+    - A stream down for its whole replay is then in an outage that began
+      with the first cycle after the last that reached, which can lie
+      before the replay: it is read from storage (its last hop with it)
+      and opened with its cycles counted (`event="open"`). One down after
+      a replayed cycle that reached opens at the first unreached cycle
+      after it, as before.
+    - The restore adds its events only once it completes, as it marks the
+      stream loaded: a restore that fails halfway changes nothing.
+  - Kept: round two's policy (cycles of a stream whose restore failed or
+    was skipped are stored and derive no events; ingest never waits for a
+    restore), and what round eight guarantees: a closed outage is never
+    resumed (one left open is closed, not resumed), and a part derived
+    again after a crash before its mark converges (the second restore
+    finds the outage closed, or the new one the first restore opened, which
+    it resumes as any open outage; tested for each case).
+  - Not changed: an outage whose start derived no events, longer than the
+    replay when the restore works, and with no outage left open before it,
+    still starts at the first unreached cycle replayed (round two;
+    `TestRestoreAfterFailedRestoresOpensTheNewOutage`). So in the review's
+    first scenario, where the first restore now closes `[51 to 61: 10]`,
+    the second outage reads `[91 to 131: 40]`; its true start, 81, lies
+    40 cycles before the restore. Only the case above reads the start from
+    storage, because its query already holds the last cycle that reached.
+    An outage that begins and ends within skipped cycles is still not
+    recorded, and skipped cycles still derive no path changes.
+  - Options weighed:
+    - Deriving the skipped cycles later from storage (the review's a):
+      the most complete, path changes too, but where a stream's skipped
+      cycles begin would have to outlive a restart and an idle drop, and a
+      restore would read and derive any number of cycles within its
+      budget.
+    - Holding the mark until the restore works (c): it reverses round
+      two's choice not to block ingest.
+  - Cost: a restore of a stream that reached at its last replayed cycle
+    runs one more query, the lookup, where it ran none. Measured on 25.8
+    (idle, the tagged tests' tables), 300 restores after a restart: 2.5 s
+    before, 4.1 s after (the replay 7.5 ms each, the lookup 5.9 ms), so
+    fewer restores fit a request's budget on a loaded ClickHouse; a stream
+    that does not fit is restored with its next batch, and now closes an
+    outage that ended meanwhile. Rows read, on an outages table of 1.1M
+    rows: within the replay a granule (10,000 rows for a stream with 1M
+    outages); before it, every outage of the stream (`FINAL`), as round
+    four left the lookup for a stream down for its whole replay: 8,192
+    rows for a stream with 1,000 outages, 1M rows in 32 ms for one that
+    flapped every cycle for 115 days and then reached for its whole
+    replay. Closing an outage left open takes up to three queries over the
+    stream's cycles since its start (what they hold, the counts, and the
+    first cycle of the outage the stream is in when it was down for its
+    whole replay), like the count that resuming one takes.
+  - The aliases of the new queries are no column names (round eight: an
+    alias is read in WHERE before a column of the same name).
+  - Tests:
+    - `clickhouse` tag, `restore_outage_clickhouse_test.go`:
+      `TestRestoreClosesAnOutageThatEndedInSkippedCycles` (the review's
+      first scenario, both outages; before: `[[51 to ongoing: 10 cycles]]`,
+      then `[[51 to 131: 80 cycles]]`),
+      `TestRestartBeyondTheRestoreBudgetClosesTheOutage` (the second, 300
+      streams and a restart, no fault; before: `[[1500 to ongoing: 4
+      cycles]]`) and `TestRestoreClosesAStaleOutageOnce` (the stream
+      reached, down again after a replayed cycle that reached, or down for
+      its whole replay when the restore works, each also with a crash
+      before the restored part's mark; before: the outage ongoing, or the
+      new one merged into it, `[[51 to ongoing: 80 cycles]]`).
+    - Default run: `TestRestoreClosesAnOutageLeftOpen` (fake store: the
+      outages and the metric's open and close counts; before: `map[51:end
+      0, 10 cycles]` and `map[51:end 0, 80 cycles]`, nothing counted). The
+      fake store now models the real lookup (the newest outage, open or
+      closed) and the new queries.
+    - Round eight's three tests, `TestRestoreOutageLookupBounded` and
+      `TestRestoresPerRequestBounded` pass unchanged.
+    - Also run, not added: the review's differential (100 runs with
+      crashes before the mark, restarts and idle drops, outages and path
+      changes identical to a clean run); a randomized check with restore
+      failures as well, whose outages must agree with the stored cycles
+      (start unreached, end at the first that reached, cycles counted,
+      ts and last hop, no overlap): 200 runs pass, and 53 of 100 failed
+      before; and round eight's chaos harness (kills, view failures, late
+      commits, paused ClickHouse; no restore failed there): outages and
+      path changes identical to the clean run.

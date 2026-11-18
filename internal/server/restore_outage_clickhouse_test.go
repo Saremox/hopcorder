@@ -211,3 +211,173 @@ func TestRederivedPartClosesItsOutageOnce(t *testing.T) {
 		})
 	}
 }
+
+// An outage open in storage whose end falls in cycles that derive no events
+// (review, round nine): after a restart or an idle drop the stream's next
+// batch could not be restored (its restore failed, ran out of its budget,
+// or was beyond the 256 a request does), so the cycle that reached again
+// wrote no close row. The restore that then worked replayed a stream that
+// reached its destination and looked up no outage: the open row stayed
+// "ongoing" for good, in the read API, the UI and Grafana. Now the restore
+// closes it at that cycle.
+//
+// The review's first scenario, with ClickHouse too slow for the restore
+// budget. Two days later, after another restart, the stream is down for 40
+// cycles while restores fail; the restore that then works finds the
+// stream's newest outage closed, so the new one opens at the first
+// unreached cycle it replays, as for any outage whose start derived no
+// events (round two; TestRestoreAfterFailedRestoresOpensTheNewOutage).
+// Before, that restore took up the stale open outage again, and the new
+// outage was merged into it with the reached cycles between them.
+func TestRestoreClosesAnOutageThatEndedInSkippedCycles(t *testing.T) {
+	c := testClickHouse(t)
+	st := &faultStore{Client: c}
+	in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	ts := func(seq uint64) time.Time {
+		if seq > 80 {
+			return t0.Add(48*time.Hour + time.Duration(seq)*5*time.Second)
+		}
+		return t0.Add(time.Duration(seq) * 5 * time.Second)
+	}
+	spec := func(seq uint64) []string {
+		if seq > 50 && seq <= 60 || seq > 80 && seq <= 130 {
+			return brokenA
+		}
+		return pathA
+	}
+	ingest := func(from, to uint64) {
+		t.Helper()
+		if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for from := uint64(1); from <= 51; from += 10 { // 1 to 60: down from 51, open at 60
+		ingest(from, from+9)
+	}
+	in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a restart
+	st.failReplay = true
+	ingest(61, 70) // reached again from 61; no events derived
+	st.failReplay = false
+	ingest(71, 80)
+	if got, want := storedOutages(t, c), "[[51 to 61: 10 cycles]]"; got != want {
+		t.Errorf("after the restore: %s, want %s", got, want)
+	}
+
+	in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // two days later, another restart
+	st.failReplay = true
+	ingest(81, 120) // down, no events derived
+	st.failReplay = false
+	ingest(121, 130) // still down; the restore works
+	ingest(131, 131)
+	if got, want := storedOutages(t, c), "[[51 to 61: 10 cycles] [91 to 131: 40 cycles]]"; got != want {
+		t.Errorf("after the second outage: %s, want %s", got, want)
+	}
+}
+
+// The review's second scenario, with no fault at all: an agent with 300
+// targets (streams), one cycle each per round, and a server restart (an
+// upgrade). A request restores at most 256 streams, so the first batch
+// after the restart (500 records, the agent's batch_max_records) derives
+// no events for 44 of them, and t299's outage ends in that batch.
+func TestRestartBeyondTheRestoreBudgetClosesTheOutage(t *testing.T) {
+	c := testClickHouse(t)
+	in := NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	const streams = 300
+	seqOf := func(round, i int) uint64 { return uint64((round-1)*streams + i + 1) }
+	var all []*record.Record
+	for round := 1; round <= 12; round++ {
+		for i := range streams {
+			spec := pathA
+			if i == streams-1 && round >= 5 && round <= 8 {
+				spec = brokenA
+			}
+			r := mk("lab", seqOf(round, i), spec...)
+			r.Target, r.TS = fmt.Sprintf("t%03d.example", i), t0.Add(time.Duration(round)*5*time.Second)
+			all = append(all, r)
+		}
+	}
+	send := func(recs []*record.Record) {
+		t.Helper()
+		for len(recs) > 0 {
+			n := min(500, len(recs))
+			if _, err := in.Ingest(t.Context(), recs[:n]); err != nil {
+				t.Fatal(err)
+			}
+			recs = recs[n:]
+		}
+	}
+	send(all[:8*streams]) // rounds 1 to 8; t299 down from round 5
+	in = NewIngester(c, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+	send(all[8*streams:])
+	want := fmt.Sprintf("[[%d to %d: 4 cycles]]", seqOf(5, streams-1), seqOf(9, streams-1))
+	if got := storedOutages(t, c); got != want {
+		t.Errorf("outages %s, want %s", got, want)
+	}
+}
+
+// The outage that ended in skipped cycles is closed once, at the first
+// cycle that reached, wherever the stream is when its restore works:
+// reached, down again after a reached cycle the restore replays, or down
+// for the whole replay (the case in which the stale outage was taken up
+// again and the new one merged into it). The new outage begins with the
+// first unreached cycle after the last reached one, which can lie before
+// the replay. With a crash after the restored part's events and before its
+// mark, the part is derived again after a restart and comes to the same
+// outages.
+func TestRestoreClosesAStaleOutageOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		skipped, part [2]uint64 // cycles that derive no events, then the part that restores the stream
+		down          func(uint64) bool
+		want, end     string // after the part; after seq 140, which reaches
+	}{
+		{"reached", [2]uint64{61, 70}, [2]uint64{71, 80}, func(uint64) bool { return false },
+			"[[51 to 61: 10 cycles]]", "[[51 to 61: 10 cycles]]"},
+		{"down again", [2]uint64{61, 75}, [2]uint64{76, 80}, func(seq uint64) bool { return seq > 70 && seq < 140 },
+			"[[51 to 61: 10 cycles] [71 to ongoing: 10 cycles]]", "[[51 to 61: 10 cycles] [71 to 140: 69 cycles]]"},
+		{"down for the replay", [2]uint64{61, 120}, [2]uint64{121, 130}, func(seq uint64) bool { return seq > 80 && seq < 140 },
+			"[[51 to 61: 10 cycles] [81 to ongoing: 50 cycles]]", "[[51 to 61: 10 cycles] [81 to 140: 59 cycles]]"},
+	} {
+		for _, crash := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/crash=%v", tc.name, crash), func(t *testing.T) {
+				c := testClickHouse(t)
+				st := &faultStore{Client: c}
+				in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+				ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+				spec := func(seq uint64) []string {
+					if seq > 50 && seq <= 60 || tc.down(seq) {
+						return brokenA
+					}
+					return pathA
+				}
+				ingest := func(from, to uint64) {
+					t.Helper()
+					if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for from := uint64(1); from <= 51; from += 10 { // 1 to 60: down from 51, open at 60
+					ingest(from, from+9)
+				}
+				in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a restart
+				st.failReplay = true
+				ingest(tc.skipped[0], tc.skipped[1])
+				st.failReplay = false
+				if crash {
+					st.failMark = true
+					ingest(tc.part[0], tc.part[1])
+					st.failMark = false
+					in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+				}
+				ingest(tc.part[0], tc.part[1])
+				if got := storedOutages(t, c); got != tc.want {
+					t.Errorf("after the restored part: %s, want %s", got, tc.want)
+				}
+				ingest(tc.part[1]+1, 140)
+				if got := storedOutages(t, c); got != tc.end {
+					t.Errorf("after seq 140: %s, want %s", got, tc.end)
+				}
+			})
+		}
+	}
+}
