@@ -1,0 +1,18 @@
+<!--
+Merged into the image's users.xml (users.d). What an HTTP request may hold
+before ClickHouse authenticates it: the default profile's limits, which the
+server reads for every request. With ClickHouse's defaults (a million header
+fields of up to 128 KiB, a 1 MiB URI) a few unauthenticated requests of 500 MB
+of headers OOM-killed ClickHouse (review round nine). hopcorder's server and
+Grafana's plugin send a few short headers and keep their queries in the body.
+-->
+<clickhouse>
+    <profiles>
+        <default>
+            <http_max_fields>32</http_max_fields>
+            <http_max_field_name_size>256</http_max_field_name_size>
+            <http_max_field_value_size>8192</http_max_field_value_size>
+            <http_max_uri_size>65536</http_max_uri_size>
+        </default>
+    </profiles>
+</clickhouse>

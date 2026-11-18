@@ -58,6 +58,12 @@ policy (the image gives it an engine), is off; hopcorder does not trace.
          OOM-killed it, and a query's hasColumnInTable() could make it log
          in to itself with a 1 MB name (review round eight). [::1] is
          skipped, with a warning, where there is no IPv6. -->
+    <!-- At most 256 connections, and short HTTP headers and URIs
+         (clickhouse-users.xml): before it authenticates a client, ClickHouse
+         keeps a thread per connection and the request's whole header and
+         URI, so unauthenticated clients could exhaust memory (review round
+         nine). -->
+    <max_connections>256</max_connections>
     <tcp_port remove="1"/>
     <protocols>
         <native_ipv4><type>tcp</type><host>127.0.0.1</host><port>9000</port></native_ipv4>

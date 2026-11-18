@@ -265,6 +265,16 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round nine)**
+
+- ClickHouse (compose and the chart's bundled ClickHouse) bounds what a
+  client may send before it logs in: at most 256 connections, 32 HTTP
+  header fields of at most 8 KiB, and 64 KiB of URI. With ClickHouse's
+  defaults a few unauthenticated requests with large headers, or a few
+  thousand idle connections, OOM-killed it (where a pod could reach its
+  HTTP port, that is without a CNI that enforces the chart's
+  NetworkPolicy).
+
 **Fixed (review round eight)**
 
 - Server: an outage that had ended is no longer taken up again by a stream

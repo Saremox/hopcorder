@@ -4807,3 +4807,41 @@ the ten round-seven mediums fixed (#66 to #75).
       create the spool an hour ahead, so that a run's seqs are known;
       `TestOutageAndRecovery` puts it two hours ahead for the run after
       its restart, and checks every seq of both runs.
+
+### Security and correctness review, round nine
+
+A focused round (the owner's choice) on round eight's two HIGH fixes (#76,
+#77) and the code paths around them. Both fixes held for what they named;
+two HIGH findings were found next to them.
+
+- **ClickHouse bounds what an unauthenticated HTTP request may hold**
+  (compose's `clickhouse-config.xml` and new `clickhouse-users.xml`, the
+  chart's `hopcorder.xml` and new `limits.xml` in `users.d`; review round
+  nine, H2, HIGH under the same condition as round eight's F1: a CNI that
+  does not enforce the chart's NetworkPolicy). With #77 the native port is
+  loopback only, but 8123 did the same before authentication: ClickHouse
+  reads a request's whole header and URI first, with its defaults of a
+  million header fields of up to 128 KiB and a 1 MiB URI, and keeps a
+  thread (about 220 KB) per connection, up to 4096. Measured on 25.8.33.6
+  with the chart's rendered config: at 2Gi, 3 connections of 500 MB of
+  headers, or 4,300 with 200 KB, or about 2,200 with a 1 MB query string,
+  OOM-killed it; at the CI values' 1Gi, 4,300 idle connections (about
+  260 KB sent in all) did, within 60 s. Round eight's deploy review had
+  found the HTTP port safe with 20 requests of 13 MB.
+  - Now `max_connections` is 256 and the default profile (which the server
+    reads for parsing every HTTP request) sets `http_max_fields` 32,
+    `http_max_field_name_size` 256, `http_max_field_value_size` 8192 and
+    `http_max_uri_size` 65536. hopcorder's server sends a few short headers
+    and keeps its queries in the body, as does Grafana's plugin: the whole
+    ClickHouse-tagged server suite passes through those limits.
+  - Measured with them at 1Gi: the same 4,300 held connections kept
+    ClickHouse at 260 to 351 MiB, no OOM; 40 header fields, a 10 KB header
+    or a 100 KB URI are refused with 400 before authentication.
+  - Accepted: a client that holds 256 connections still blocks other
+    clients, authenticated queries included, while it holds them (about 30
+    to 50 s here), the same class as the server's own reading slots. An
+    enforcing NetworkPolicy remains the real boundary.
+  - Checks: CI's `grafana` job requires the settings and a 400 for 40
+    header fields before authentication (failed with the old config: 401);
+    the helm job requires them in the rendered config and the mount;
+    `smoke.sh` checks them in the pod (not run here: no kind).

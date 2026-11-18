@@ -196,6 +196,13 @@ for i in $(seq 90); do
         echo "ClickHouse's native port listens beyond loopback"
         exit 1
       fi
+      # Connections and what an unauthenticated HTTP request may hold are
+      # bounded: with ClickHouse's defaults such clients OOM-killed it.
+      if [ "$(adm "SELECT (SELECT value FROM system.server_settings WHERE name = 'max_connections'), getSetting('http_max_fields'),
+        getSetting('http_max_field_value_size'), getSetting('http_max_uri_size') FORMAT CSV")" != '"256",32,8192,65536' ]; then
+        echo "ClickHouse's connection or HTTP header limits are not set"
+        exit 1
+      fi
       # The image's passwordless default user is gone.
       if out=$(kubectl exec statefulset/hopcorder-server-clickhouse -- clickhouse-client --user default --query 'SELECT 1' 2>&1) ||
         ! grep -q 'Authentication failed' <<<"$out"; then
