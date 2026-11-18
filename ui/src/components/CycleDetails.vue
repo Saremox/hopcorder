@@ -6,7 +6,7 @@ import type { Cycle, PathChange } from '../api'
 import { asLabel, fmtRTT, fmtTime } from '../format'
 import { nodeId, type Highlight } from '../topology'
 
-const props = defineProps<{ cycle: Cycle | null; change: PathChange | null; highlight: Highlight; loading: boolean }>()
+const props = defineProps<{ cycle: Cycle | null; change: PathChange | null; highlight: Highlight; loading: boolean; failed: boolean }>()
 
 const UNREACHABLE: Record<number, string> = {
   0: 'net unreachable',
@@ -57,6 +57,7 @@ const changeText = computed(() => {
         <span class="muted">{{ cycle.target_ip }} · {{ cycle.path_len }} hops</span>
       </template>
       <span v-else-if="loading" class="muted">loading…</span>
+      <span v-else-if="failed" class="muted">not loaded</span>
       <span v-else class="muted">no cycle in this range</span>
     </header>
     <p v-if="change" class="change-note"><strong>Route change:</strong> {{ changeText }}</p>

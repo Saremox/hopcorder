@@ -4449,3 +4449,35 @@ decisions:
     "1 cycles" after the outage's first batch (want 10). `TestEvents`,
     `TestRestoreAfterRestart` and `TestRestoreOpensUnrecordedOutage` expect
     the new rows.
+- **The stream view shows no other view's data.** A stream view kept its
+  topology, events and cycle when its stream or range changed, and replaced
+  them only when the new ones arrived: when a load failed (a 503 "too many
+  queries" after both read slots stayed busy for 10 s, a 502, a network
+  error), the previous stream's or range's figures, graph and cycle stayed
+  under the new header, with a red error line the only sign (review, round
+  seven: "lost.example … from r7a" over another stream's "Cycles 150,
+  Reached 33.3 %, Outages 1" and its unreached cycle). App.vue reuses the
+  view for every stream (no `:key`), so opening one by a link, a bookmark or
+  back and forward did this. Now (`StreamView.vue`):
+  - What is shown belongs to a view: the stream and the range as chosen. A
+    load for another view clears the range's data (and the selected node)
+    at once and the cycle's when it is asked for (that request is debounced:
+    the other view's request is aborted then, so its answer cannot land),
+    and an answer that arrives after its request was aborted is dropped. A
+    relative range's refresh is the same view, so what is shown stays until
+    the refreshed data arrives.
+  - A failed load clears what it would have replaced, a failed refresh
+    included: the error takes the panels' place. The figures read "–", the
+    graph and the event list "not loaded" (not "No hop answered" or "None
+    in this range", which would be wrong), the cycle "not loaded". The
+    range's and the cycle's errors are kept apart, so one load's success
+    no longer clears the other's error.
+  - No `:key` on the view in App.vue: keying it would remount the charts on
+    every change and still not cover a failed refresh.
+  - Test: the e2e "a failed load shows no other stream or range" (503 for
+    another stream opened by a link, for another range, and for a refresh
+    of the same range: every figure "–", no cycle table, the graph and the
+    events "not loaded", the error shown). Before (the committed build with
+    the test): "Cycles1440Reached95.6%Route changes3Outages2Loops6" under
+    the other stream's header; on their own, the range and refresh cases
+    kept cycle #1440's table too.

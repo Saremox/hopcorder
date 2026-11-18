@@ -136,6 +136,57 @@ test('two flows of one target are two streams', async ({ page }) => {
   expect(errors).toEqual([])
 })
 
+// After a failed load the panels show no other stream's or range's data, and
+// a failed refresh none of what it would have replaced: the error takes
+// their place. Before, the view kept the previous stream's figures, graph
+// and cycle under the new header, with only the error line to tell (review
+// round seven).
+test('a failed load shows no other stream or range', async ({ page }) => {
+  const stats = page.locator('.stats')
+  const cycle = page.locator('section.cycle')
+  const notLoaded = async (target: string) => {
+    await expect(page.locator('.stream-head h1')).toContainText(target)
+    await expect(page.locator('.error')).toContainText('too many queries; retry later')
+    for (const s of ['Cycles', 'Reached', 'Route changes', 'Outages', 'Loops']) await expect(stats).toContainText(`${s}–`)
+    await expect(page.locator('.stream-head h1')).not.toContainText('IPv')
+    await expect(cycle.locator('.panel-head')).toContainText('not loaded')
+    await expect(cycle.locator('table.hops')).toHaveCount(0)
+    await expect(page.locator('.graph-panel')).toContainText('Not loaded.')
+    await expect(page.locator('.events')).toContainText('not loaded')
+    await expect(page.locator('.events .count').first()).toHaveText('–')
+  }
+  const loaded = async () => {
+    await expect(stats).toContainText(`Cycles${CYCLES}`)
+    await expect(cycle.locator('.badge')).toHaveText('reached')
+    await expect(page.locator('.error')).toHaveCount(0)
+  }
+  // The server's answer when both of its query slots stay busy for 10 s.
+  const busy = { status: 503, contentType: 'application/json', body: '{"error":"too many queries; retry later"}' }
+  const go = (hash: string) => page.evaluate((h) => (window.location.hash = h), hash) // the view stays mounted
+
+  await page.goto(`./ui/${streamHash}`)
+  await loaded()
+  // Another stream, opened by a link (or back and forward).
+  await page.route(new RegExp(`/api/v1/query/.*agent=${dualAgent}`), (r) => r.fulfill(busy))
+  await go(`#/stream?agent=${dualAgent}&target=${DUAL}&protocol=icmp&flow_id=33435&range=6h`)
+  await notLoaded(DUAL)
+
+  // Another range.
+  await go(streamHash)
+  await loaded()
+  await page.route(/\/api\/v1\/query\//, (r) => r.fulfill(busy))
+  await page.getByRole('button', { name: '24h', exact: true }).click()
+  await notLoaded(TARGET)
+
+  // The same range again, refreshed.
+  await page.unrouteAll()
+  await page.getByRole('button', { name: '6h', exact: true }).click()
+  await loaded()
+  await page.route(/\/api\/v1\/query\//, (r) => r.fulfill(busy))
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await notLoaded(TARGET)
+})
+
 // Links from before flows were part of a stream have no flow_id.
 test('a link without flow_id opens its only stream', async ({ page }) => {
   await page.goto(`./ui/#/stream?agent=${agent}&target=${TARGET}&protocol=icmp&range=6h`)

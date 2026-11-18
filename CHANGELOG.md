@@ -248,6 +248,12 @@ The section for a version is the text of its GitHub release.
   began. The server now writes it again after each batch in which the
   outage went on, with its cycles so far; the row written when it ends
   still replaces every earlier one.
+- UI: when loading a stream failed (a busy server's "too many queries", a
+  network error), the stream view went on showing the previous stream's or
+  range's figures, graph and cycle under the new stream's header. It now
+  clears them as soon as another stream or range is chosen, and a failed
+  load, a failed refresh included, shows the error and "not loaded" in
+  their place.
 
 **Security: server ingest**
 
