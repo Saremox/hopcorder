@@ -46,6 +46,36 @@ export function fmtPct(ratio: number): string {
   return p === 0 || p === 100 ? `${p}%` : p < 1 ? `${p.toFixed(2)}%` : `${p.toFixed(1)}%`
 }
 
+// Destination unreachable codes: ICMPv4's (RFC 792, 1812) and ICMPv6's (RFC
+// 4443, 6550, 8883), which differ (3 is port unreachable in one, address
+// unreachable in the other). A hop's code is its cycle's family's.
+const UNREACHABLE4: Record<number, string> = {
+  0: 'net unreachable',
+  1: 'host unreachable',
+  2: 'protocol unreachable',
+  3: 'port unreachable',
+  4: 'fragmentation needed',
+  9: 'net prohibited',
+  10: 'host prohibited',
+  13: 'administratively prohibited',
+}
+const UNREACHABLE6: Record<number, string> = {
+  0: 'no route',
+  1: 'administratively prohibited',
+  2: 'beyond scope of source address',
+  3: 'address unreachable',
+  4: 'port unreachable',
+  5: 'source address failed policy',
+  6: 'reject route',
+  7: 'source routing header error',
+  8: 'headers too long',
+}
+
+/** What a destination unreachable code means, in address family af (4 or 6). */
+export function unreachableName(af: number, code: number): string {
+  return (af === 6 ? UNREACHABLE6 : UNREACHABLE4)[code] ?? `code ${code}`
+}
+
 /** A count of a list's rows: "n+" when the server cut the list (see List). */
 export function fmtCount(n: number, cut: boolean): string {
   return cut ? `${n}+` : String(n)

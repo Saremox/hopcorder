@@ -3,27 +3,17 @@
 // silent TTLs marked.
 import { computed } from 'vue'
 import type { Cycle, PathChange } from '../api'
-import { asLabel, fmtRTT, fmtTime } from '../format'
+import { asLabel, fmtRTT, fmtTime, unreachableName } from '../format'
 import { nodeId, type Highlight } from '../topology'
 
 const props = defineProps<{ cycle: Cycle | null; change: PathChange | null; highlight: Highlight; loading: boolean; failed: boolean }>()
-
-const UNREACHABLE: Record<number, string> = {
-  0: 'net unreachable',
-  1: 'host unreachable',
-  2: 'protocol unreachable',
-  3: 'port unreachable',
-  4: 'fragmentation needed',
-  9: 'net prohibited',
-  10: 'host prohibited',
-  13: 'administratively prohibited',
-}
 
 const rows = computed(() =>
   (props.cycle?.hops ?? []).map((h) => {
     const id = h.ip ? nodeId(h.ttl, h.ip) : ''
     let status: string = h.status
-    if (h.status === 'unreachable' && h.code !== undefined) status = `unreachable (${UNREACHABLE[h.code] ?? `code ${h.code}`})`
+    // ICMPv4 and ICMPv6 number their codes differently (review round five).
+    if (h.status === 'unreachable' && h.code !== undefined) status = `unreachable (${unreachableName(props.cycle?.af ?? 4, h.code)})`
     return {
       ...h,
       statusText: status,

@@ -1,5 +1,22 @@
 import { describe, expect, it } from 'vitest'
-import { cutNote, fmtCount } from '../src/format'
+import { cutNote, fmtCount, unreachableName } from '../src/format'
+
+// ICMPv6 numbers its destination unreachable codes differently from ICMPv4
+// (review round five: an ICMPv6 address unreachable read "port
+// unreachable", administratively prohibited "host unreachable").
+describe('unreachable codes', () => {
+  it('are named by the address family', () => {
+    expect(unreachableName(4, 3)).toBe('port unreachable')
+    expect(unreachableName(6, 3)).toBe('address unreachable')
+    expect(unreachableName(4, 1)).toBe('host unreachable')
+    expect(unreachableName(6, 1)).toBe('administratively prohibited')
+    expect(unreachableName(6, 4)).toBe('port unreachable')
+    expect(unreachableName(6, 0)).toBe('no route')
+    expect(unreachableName(4, 13)).toBe('administratively prohibited')
+    expect(unreachableName(6, 13)).toBe('code 13')
+    expect(unreachableName(4, 7)).toBe('code 7')
+  })
+})
 
 describe('lists the server cut', () => {
   it('count with a plus', () => {
