@@ -1,7 +1,11 @@
 -- Grafana's ClickHouse user in the docker-compose try-out: it may read the
 -- hopcorder database and nothing else. No writes or DDL, and no table
 -- functions that reach outside, such as url(), file() or remote(), which
--- need privileges it does not have. Anyone who can reach Grafana can send it
+-- need privileges it does not have. One function does reach outside without
+-- any grant: hasColumnInTable('host:port', ...) opens a connection to any
+-- host and port (review round seven), so ClickHouse is kept on an internal
+-- network (docker-compose.yml; the chart's NetworkPolicy lets it reach only
+-- DNS). Anyone who can reach Grafana can send it
 -- SQL (anonymous viewers included). This user keeps them from writes, other
 -- data and settings, and bounds each query, but it does not keep ClickHouse
 -- up: a query that names a time zone makes ClickHouse build a table of

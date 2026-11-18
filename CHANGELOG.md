@@ -128,6 +128,12 @@ The section for a version is the text of its GitHub release.
   one that fails to generate was never removed: about 1,000 empty files a
   second from one viewer, kept across restarts, until the data volume ran
   out of inodes and ingest failed.
+- ClickHouse (compose and the chart's bundled ClickHouse) may no longer
+  connect out. `hasColumnInTable('host:port', ...)`, which no grant
+  covers, let Grafana's read-only user make ClickHouse connect to any host
+  and port and resolve any name. The chart's NetworkPolicy now allows
+  ClickHouse egress to DNS only, and compose keeps ClickHouse on an
+  internal network.
 
 **Security: server ingest**
 

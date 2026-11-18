@@ -291,7 +291,11 @@ spec:
             storage: {{ $d.persistence.size }}
 {{- if $d.networkPolicy.enabled }}
 ---
-# Only the hopcorder server (and networkPolicy.from) may reach ClickHouse.
+# Only the hopcorder server (and networkPolicy.from) may reach ClickHouse,
+# and ClickHouse may reach nothing but DNS: Grafana's read-only user can make
+# it open connections to any host and port with hasColumnInTable('host:port',
+# ...), which no grant covers (review round seven). ClickHouse here needs no
+# outbound connection.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -303,7 +307,7 @@ spec:
   podSelector:
     matchLabels:
       {{- include "hopcorder-server.clickhouseSelectorLabels" . | nindent 6 }}
-  policyTypes: [Ingress]
+  policyTypes: [Ingress, Egress]
   ingress:
     - from:
         - podSelector:
@@ -314,6 +318,12 @@ spec:
         {{- end }}
       ports:
         - port: http
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
           protocol: TCP
 {{- end }}
 {{- end }}
