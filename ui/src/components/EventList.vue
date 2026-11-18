@@ -5,7 +5,9 @@ import { computed, ref } from 'vue'
 import type { LoopEvent, Outage, PathChange } from '../api'
 import { fmtDuration, fmtTime, toMs } from '../format'
 
-const props = defineProps<{ changes: PathChange[]; outages: Outage[]; loops: LoopEvent[]; selectedSeq: number | undefined }>()
+// status, unless empty, says why there are no events to show (loading, or
+// the load failed): the lists are then not the range's.
+const props = defineProps<{ changes: PathChange[]; outages: Outage[]; loops: LoopEvent[]; status: string; selectedSeq: number | undefined }>()
 const emit = defineEmits<{ seek: [t: number] }>()
 
 type Tab = 'changes' | 'outages' | 'loops'
@@ -60,10 +62,11 @@ const tabs = computed(() => [
         :class="{ active: tab === t.id }"
         @click="tab = t.id"
       >
-        {{ t.label }} <span class="count">{{ t.n }}</span>
+        {{ t.label }} <span class="count">{{ status ? '–' : t.n }}</span>
       </button>
     </div>
-    <ol v-if="items.length" class="event-list">
+    <p v-if="status" class="muted empty">{{ status }}</p>
+    <ol v-else-if="items.length" class="event-list">
       <li v-for="it in items" :key="it.key">
         <button :class="{ current: it.seq === selectedSeq }" @click="emit('seek', it.t)">
           <span class="when">{{ fmtTime(it.t) }}</span>

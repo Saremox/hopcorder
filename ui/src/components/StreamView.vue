@@ -25,14 +25,43 @@ const loops = shallowRef<LoopEvent[]>([])
 const cycle = shallowRef<Cycle | null>(null)
 const loadingRange = ref(false)
 const loadingCycle = ref(false)
-const error = ref('')
+const rangeError = ref('')
+const cycleError = ref('')
 const selectedNode = shallowRef<GraphNode | null>(null)
+
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+// What is shown is of one view: the stream and the range as chosen (a
+// relative range moves with the clock, and a refresh keeps what is shown
+// until it arrives). Another view's data is never shown, not while this
+// one loads and not after it failed: the error takes its place (review
+// round seven: after a failed load the previous stream's or range's
+// figures, graph and cycle stayed under the new header).
+const key = () => [props.stream.agent, props.stream.target, props.stream.protocol, props.stream.flow]
+const viewOf = () => JSON.stringify([...key(), props.range])
+/** The view topo, changes, outages and loops are of ('' for none). */
+const rangeView = ref('')
+const rangeLoaded = computed(() => rangeView.value === viewOf())
+
+function clearRange() {
+  topo.value = null
+  changes.value = []
+  outages.value = []
+  loops.value = []
+  rangeView.value = ''
+  selectedNode.value = null
+}
 
 let rangeAbort: AbortController | undefined
 async function loadRange() {
   rangeAbort?.abort()
   const ac = new AbortController()
   rangeAbort = ac
+  const view = viewOf()
+  if (rangeView.value !== view) {
+    clearRange()
+    rangeError.value = ''
+  }
   loadingRange.value = true
   try {
     const [t, c, o, l] = await Promise.all([
@@ -41,13 +70,18 @@ async function loadRange() {
       props.client.outages(props.stream, tr.value, ac.signal),
       props.client.loops(props.stream, tr.value, ac.signal),
     ])
+    if (ac.signal.aborted) return
     topo.value = t
     changes.value = c
     outages.value = o
     loops.value = l
-    error.value = ''
+    rangeView.value = view
+    rangeError.value = ''
   } catch (e) {
-    if (!ac.signal.aborted) error.value = e instanceof Error ? e.message : String(e)
+    if (!ac.signal.aborted) {
+      clearRange()
+      rangeError.value = message(e)
+    }
   } finally {
     if (rangeAbort === ac) loadingRange.value = false
   }
@@ -55,8 +89,20 @@ async function loadRange() {
 
 let cycleAbort: AbortController | undefined
 let cycleTimer: ReturnType<typeof setTimeout> | undefined
+/** The view cycle is of. */
+let cycleView = ''
 function loadCycle() {
   clearTimeout(cycleTimer)
+  const view = viewOf()
+  if (cycleView !== view) {
+    // The request below waits: drop the other view's cycle, and its answer, now.
+    cycleAbort?.abort()
+    cycleAbort = undefined
+    cycle.value = null
+    cycleError.value = ''
+    cycleView = view
+    loadingCycle.value = true
+  }
   // Debounced: dragging the scrubber fires many seeks.
   cycleTimer = setTimeout(async () => {
     cycleAbort?.abort()
@@ -64,26 +110,25 @@ function loadCycle() {
     cycleAbort = ac
     loadingCycle.value = true
     try {
-      cycle.value = await props.client.cycleAt(props.stream, tr.value, props.at ?? tr.value.to, ac.signal)
+      const c = await props.client.cycleAt(props.stream, tr.value, props.at ?? tr.value.to, ac.signal)
+      if (ac.signal.aborted) return
+      cycle.value = c
+      cycleError.value = ''
     } catch (e) {
-      if (!ac.signal.aborted) error.value = e instanceof Error ? e.message : String(e)
+      if (!ac.signal.aborted) {
+        cycle.value = null
+        cycleError.value = message(e)
+      }
     } finally {
       if (cycleAbort === ac) loadingCycle.value = false
     }
   }, 120)
 }
 
-const key = () => [props.stream.agent, props.stream.target, props.stream.protocol, props.stream.flow]
 watch(() => [...key(), tr.value.from, tr.value.to], loadRange, { immediate: true })
 watch(() => [...key(), props.at, props.at === undefined ? tr.value.to : 0], loadCycle, {
   immediate: true,
 })
-watch(
-  key,
-  () => {
-    selectedNode.value = null
-  },
-)
 onBeforeUnmount(() => {
   rangeAbort?.abort()
   cycleAbort?.abort()
@@ -108,6 +153,16 @@ const summary = computed(() => {
   return { cycles, reach: cycles ? reached / cycles : NaN }
 })
 
+const error = computed(() => [rangeError.value, cycleError.value].filter((e) => e !== '').join('; '))
+/** What the range's panels say while they have no data of this view. */
+const rangeStatus = computed(() => (rangeLoaded.value ? '' : loadingRange.value ? 'loading…' : 'not loaded'))
+const stat = (v: number | string) => (rangeLoaded.value ? v : '–')
+const graphNote = computed(() =>
+  [rangeLoaded.value ? `${layout.value.nodes.length} addresses over ${layout.value.maxTTL} TTLs` : '', loadingRange.value ? 'loading…' : '']
+    .filter((s) => s !== '')
+    .join(' · '),
+)
+
 const cycleTs = computed(() => (cycle.value ? toMs(cycle.value.ts) : undefined))
 /** Where the scrubber sits: the chosen moment, else the shown cycle. */
 const scrubAt = computed(() => props.at ?? cycleTs.value ?? tr.value.to)
@@ -130,7 +185,7 @@ async function step(dir: -1 | 1) {
     const c = dir < 0 ? await props.client.cycleBefore(props.stream, tr.value, ts) : await props.client.cycleAfter(props.stream, tr.value, ts)
     if (c) seek(toMs(c.ts))
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e)
+    cycleError.value = message(e)
   }
 }
 function onSlider(ev: Event) {
@@ -156,11 +211,11 @@ function onKey(ev: KeyboardEvent) {
         <span class="muted">{{ cycle ? `IPv${cycle.af} · ` : '' }}flow {{ stream.flow }} from {{ stream.agent }}</span>
       </h1>
       <dl class="stats">
-        <div><dt>Cycles</dt><dd>{{ summary.cycles }}</dd></div>
-        <div><dt>Reached</dt><dd>{{ fmtPct(summary.reach) }}</dd></div>
-        <div><dt>Route changes</dt><dd>{{ changes.length }}</dd></div>
-        <div><dt>Outages</dt><dd>{{ outages.length }}</dd></div>
-        <div><dt>Loops</dt><dd>{{ loops.length }}</dd></div>
+        <div><dt>Cycles</dt><dd>{{ stat(summary.cycles) }}</dd></div>
+        <div><dt>Reached</dt><dd>{{ stat(fmtPct(summary.reach)) }}</dd></div>
+        <div><dt>Route changes</dt><dd>{{ stat(changes.length) }}</dd></div>
+        <div><dt>Outages</dt><dd>{{ stat(outages.length) }}</dd></div>
+        <div><dt>Loops</dt><dd>{{ stat(loops.length) }}</dd></div>
       </dl>
     </header>
 
@@ -204,9 +259,10 @@ function onKey(ev: KeyboardEvent) {
     <section class="panel graph-panel">
       <header class="panel-head">
         <h2>Path topology</h2>
-        <span class="muted">{{ layout.nodes.length }} addresses over {{ layout.maxTTL }} TTLs{{ loadingRange ? ' · loading…' : '' }}</span>
+        <span class="muted">{{ graphNote }}</span>
       </header>
-      <p v-if="!loadingRange && layout.nodes.length === 0" class="muted empty">No hop answered in this range.</p>
+      <p v-if="rangeStatus === 'not loaded'" class="muted empty">Not loaded.</p>
+      <p v-else-if="rangeLoaded && layout.nodes.length === 0" class="muted empty">No hop answered in this range.</p>
       <HopGraph v-else :layout="layout" :highlight="highlight" :theme="theme" @select="selectedNode = $event" />
       <div v-if="selectedNode" class="node-card">
         <strong>{{ hopLabel(selectedNode.name, selectedNode.ip) }}</strong>
@@ -220,8 +276,8 @@ function onKey(ev: KeyboardEvent) {
     </section>
 
     <div class="columns">
-      <CycleDetails :cycle="cycle" :change="change" :highlight="highlight" :loading="loadingCycle" />
-      <EventList :changes="changes" :outages="outages" :loops="loops" :selected-seq="cycle?.seq" @seek="seek" />
+      <CycleDetails :cycle="cycle" :change="change" :highlight="highlight" :loading="loadingCycle" :failed="cycleError !== ''" />
+      <EventList :changes="changes" :outages="outages" :loops="loops" :status="rangeStatus" :selected-seq="cycle?.seq" @seek="seek" />
     </div>
   </div>
 </template>
