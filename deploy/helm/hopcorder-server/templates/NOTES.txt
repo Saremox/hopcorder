@@ -33,6 +33,31 @@ Clients inside the cluster reach the Service directly, around the ingress:
 {{- if .Values.networkPolicy.enabled }} the NetworkPolicy limits them to networkPolicy.from.
 {{- else }} set networkPolicy.enabled=true and networkPolicy.from to limit them (needs a CNI that enforces it).
 {{- end }}
+{{- if .Values.clickhouse.deploy.enabled }}
+{{- $names := list }}
+{{- $keys := list }}
+{{- if not .Values.clickhouse.passwordSecret.name }}
+{{- $names = append $names (include "hopcorder-server.clickhouseName" .) }}
+{{- $keys = append $keys "clickhouse.passwordSecret.name" }}
+{{- end }}
+{{- if and .Values.clickhouse.deploy.readOnlyUser.enabled (not .Values.clickhouse.deploy.readOnlyUser.passwordSecret.name) }}
+{{- $names = append $names (include "hopcorder-server.clickhouseReadOnlySecret" .) }}
+{{- $keys = append $keys "clickhouse.deploy.readOnlyUser.passwordSecret.name" }}
+{{- end }}
+{{- if $names }}
+
+The chart generated ClickHouse's passwords, in immutable Secrets it reads back
+on upgrades:
+
+  {{ join "\n  " $names }}
+
+A renderer that cannot read the cluster (Argo CD, Kustomize's helmCharts, helm
+template) generates new ones on every render, and applying them fails. With
+those, create the Secrets yourself and set
+
+  {{ join "\n  " $keys }}
+{{- end }}
+{{- end }}
 {{- if and .Values.clickhouse.deploy.enabled .Values.clickhouse.deploy.readOnlyUser.enabled }}
 
 ClickHouse's read-only user for Grafana is {{ .Values.clickhouse.deploy.readOnlyUser.name }} at

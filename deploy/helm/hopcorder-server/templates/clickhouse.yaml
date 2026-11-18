@@ -185,7 +185,12 @@ data:
 {{- if not .Values.clickhouse.passwordSecret.name }}
 ---
 # The server's ClickHouse password, generated once and kept by later
-# upgrades (helm reads the existing Secret back).
+# upgrades (helm reads the existing Secret back). A renderer that cannot read
+# the cluster (helm template, Argo CD, Kustomize's helmCharts) generates a
+# new one every time, and ClickHouse and the server read it only at start:
+# the Secret is immutable, so applying such a render fails rather than
+# change the password under them (review, round seven). With those, set
+# clickhouse.passwordSecret (and readOnlyUser.passwordSecret).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -194,11 +199,13 @@ metadata:
     {{- include "hopcorder-server.labels" . | nindent 4 }}
     app.kubernetes.io/component: hopcorder-clickhouse
 type: Opaque
+immutable: true
 data:
   password: {{ include "hopcorder-server.generatedPassword" (list . $name) }}
 {{- end }}
 {{- if and $d.readOnlyUser.enabled (not $d.readOnlyUser.passwordSecret.name) }}
 ---
+# The read-only user's password, generated and kept the same way.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -207,6 +214,7 @@ metadata:
     {{- include "hopcorder-server.labels" . | nindent 4 }}
     app.kubernetes.io/component: hopcorder-clickhouse
 type: Opaque
+immutable: true
 data:
   password: {{ include "hopcorder-server.generatedPassword" (list . (include "hopcorder-server.clickhouseReadOnlySecret" .)) }}
 {{- end }}

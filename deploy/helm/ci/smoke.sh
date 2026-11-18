@@ -11,6 +11,33 @@ helm install hopcorder-server ../hopcorder-server -f server-values.yaml --wait -
 helm install hopcorder-agent ../hopcorder-agent -f agent-values.yaml --wait --timeout 3m
 helm install hopcorder-agent-ds ../hopcorder-agent -f agent-ds-values.yaml --wait --timeout 3m
 
+# The generated ClickHouse passwords are in immutable Secrets: an upgrade
+# reads them back and keeps them, and its notes say what renderers that
+# cannot do that need; a render without the cluster (helm template, as
+# Argo CD renders) has new passwords, and applying it is refused rather
+# than change them under ClickHouse and the server, which read them only at
+# start.
+secrets=(hopcorder-server-clickhouse hopcorder-server-clickhouse-readonly)
+passwords() { kubectl get secret "${secrets[@]}" -o jsonpath='{range .items[*]}{.immutable} {.data.password}{"\n"}{end}'; }
+before=$(passwords)
+if [ "$(grep -c '^true ' <<<"$before")" != 2 ]; then
+  echo "the generated Secrets are not immutable: $(cut -d' ' -f1 <<<"$before" | xargs)"
+  exit 1
+fi
+notes=$(helm upgrade hopcorder-server ../hopcorder-server -f server-values.yaml --wait --timeout 5m)
+if [ "$(passwords)" != "$before" ]; then
+  echo "helm upgrade changed the generated passwords"
+  exit 1
+fi
+grep -q 'clickhouse.deploy.readOnlyUser.passwordSecret.name' <<<"$notes" ||
+  { echo "the notes do not say to set the password Secrets for renderers without the cluster"; exit 1; }
+rendered=$(helm template hopcorder-server ../hopcorder-server -f server-values.yaml --show-only templates/clickhouse.yaml |
+  awk '/^---/ { if (s) printf "%s", d; d = ""; s = 0 } { d = d $0 "\n" } /^kind: Secret$/ { s = 1 } END { if (s) printf "%s", d }')
+if out=$(kubectl apply --dry-run=server -f - <<<"$rendered" 2>&1) || ! grep -q 'immutable' <<<"$out"; then
+  echo "a render with new passwords was not refused: $out"
+  exit 1
+fi
+
 kubectl port-forward svc/hopcorder-server 18080:8080 >/dev/null 2>&1 &
 pf=$!
 trap 'kill $pf 2>/dev/null || true' EXIT
