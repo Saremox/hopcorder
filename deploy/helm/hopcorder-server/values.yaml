@@ -124,9 +124,11 @@ clickhouse:
       # 17 MiB on a week of eight streams.
       maxMemoryUsage: 400000000
       maxMemoryUsageForUser: 600000000
-    # Only the hopcorder server may reach ClickHouse (with a CNI that
-    # enforces NetworkPolicy); add other peers here, e.g. Grafana's namespace
-    # by kubernetes.io/metadata.name.
+    # Only the hopcorder server may reach ClickHouse, and ClickHouse may
+    # reach nothing but DNS (with a CNI that enforces NetworkPolicy): the
+    # read-only user can make it connect out with hasColumnInTable(). Add
+    # other peers here, e.g. Grafana's namespace by
+    # kubernetes.io/metadata.name.
     networkPolicy:
       enabled: true
       from: []

@@ -44,6 +44,12 @@ services:
       interval: 2s
       timeout: 5s
       retries: 60
+    # Only on the stack's internal network: ClickHouse reaches neither the
+    # internet nor the host's other networks. Grafana's read-only user can
+    # make it connect out with hasColumnInTable('host:port', ...), which no
+    # grant covers (review round seven). The host itself stays reachable
+    # through this network's gateway address.
+    networks: [clickhouse]
     restart: unless-stopped
 
   server:
@@ -51,6 +57,7 @@ services:
     image: hopcorder-server:local
     command: ["--config", "/etc/hopcorder/server.yaml"]
     ports: ["127.0.0.1:8080:8080"]
+    networks: [default, clickhouse]
     volumes:
       - ./compose/server.yaml:/etc/hopcorder/server.yaml:ro
       - server:/var/lib/hopcorder-server
@@ -104,12 +111,18 @@ services:
       - grafana:/var/lib/grafana
     depends_on:
       clickhouse: { condition: service_healthy }
+    networks: [default, clickhouse]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
       interval: 2s
       timeout: 5s
       retries: 90
     restart: unless-stopped
+
+networks:
+  default:
+  clickhouse:
+    internal: true
 
 volumes:
   clickhouse:

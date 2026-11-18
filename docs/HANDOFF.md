@@ -3735,3 +3735,26 @@ decisions:
     rendered XML. `formatRow()` is used because it formats in the server
     whatever the protocol (`FORMAT` in clickhouse-client's native protocol
     is formatted by the client).
+- **ClickHouse may not connect out.** `hasColumnInTable('host:port', db,
+  table, column[, user, password])` is a scalar function no grant covers:
+  Grafana's read-only user made ClickHouse open native-protocol
+  connections to any host and port and resolve any name, past the grants
+  that refuse `remote()`, `url()` and the like (review, round seven;
+  reproduced: a listener on the host got the connection while `remote()`
+  was refused). That is a port scan, a DNS lookup and an authentication
+  oracle against other ClickHouse servers, from inside the network.
+  `remote_url_allow_hosts` does not cover it, and nothing in 25.8 turns
+  the function off. ClickHouse needs no outbound connection here, so:
+  - The chart's ClickHouse NetworkPolicy has `policyTypes: [Ingress,
+    Egress]` and allows egress to port 53 only (DNS, UDP and TCP), with a
+    CNI that enforces NetworkPolicy.
+  - Compose puts ClickHouse on an `internal` network (`clickhouse`), with
+    the server and Grafana on it and on the default network: ClickHouse
+    reaches neither the internet nor the host's other networks, and
+    outside names do not resolve. The host itself stays reachable through
+    that network's gateway address; the try-out runs on one host.
+  - Checks: CI's `grafana` job runs `hasColumnInTable('1.1.1.1:9000', …)`
+    as Grafana's user and requires "Network is unreachable" (the runner
+    has a route there, so before it the attempt went out); the helm job
+    checks the rendered NetworkPolicy. kind's enforcement of
+    NetworkPolicy is not relied on.
