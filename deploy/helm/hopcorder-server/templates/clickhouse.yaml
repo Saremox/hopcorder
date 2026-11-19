@@ -322,6 +322,20 @@ spec:
     spec:
       # ClickHouse does not talk to the Kubernetes API.
       automountServiceAccountToken: false
+      # Nor does it need DNS (its NetworkPolicy allows no egress), but it
+      # resolves the name in an unauthenticated request's X-Forwarded-For
+      # before it checks the password: with cluster DNS dropped by that
+      # policy each such request held an HTTP connection for the resolver's
+      # timeout (about 20 s), after its client had gone, so a burst of 300
+      # kept HTTP clients out for that long (review, round seventeen). A
+      # resolver nothing listens on fails at once; /etc/hosts still gives
+      # localhost and the pod's own names.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers: [127.0.0.1]
+        options:
+          - name: ndots
+            value: "1"
       securityContext:
         {{- toYaml $d.podSecurityContext | nindent 8 }}
       containers:

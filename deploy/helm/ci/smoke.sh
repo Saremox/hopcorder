@@ -180,6 +180,23 @@ for i in $(seq 90); do
         echo "ClickHouse's console grew $grew bytes for one hasColumnInTable() host name"
         exit 1
       fi
+      # It resolves no names, and a name in an unauthenticated request's
+      # X-Forwarded-For (looked up before the password check) fails at once:
+      # with cluster DNS dropped by its NetworkPolicy each such request held
+      # an HTTP connection for the resolver's timeout, about 20 s.
+      if ! kubectl exec statefulset/hopcorder-server-clickhouse -- grep -qx 'nameserver 127.0.0.1' /etc/resolv.conf; then
+        echo "ClickHouse's pod resolves names through cluster DNS"
+        exit 1
+      fi
+      took=$(kubectl exec statefulset/hopcorder-server-clickhouse -- bash -c 'start=$(date +%s%N)
+        exec 3<>/dev/tcp/127.0.0.1/8123
+        printf "GET /?query=SELECT+1 HTTP/1.0\r\nX-Forwarded-For: xffprobe\r\n\r\n" >&3
+        cat <&3 >/dev/null
+        echo $(( ($(date +%s%N) - start) / 1000000 ))')
+      if [ "$took" -ge 2000 ]; then
+        echo "an unauthenticated request with an X-Forwarded-For name took ${took} ms"
+        exit 1
+      fi
       # Temporary data is capped for all queries together: a result buffered
       # for wait_end_of_query (a URL parameter) filled the volume. A tenth of
       # server-values.yaml's 1Gi volume.

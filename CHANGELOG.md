@@ -275,6 +275,9 @@ The section for a version is the text of its GitHub release.
   a batch the server acknowledged survives a crash of ClickHouse's host.
   Before, a power loss lost about the last 35 s of every agent's cycles, and
   with many agents ClickHouse could refuse to load its tables afterwards.
+- Server chart: the bundled ClickHouse resolves no names. A burst of
+  unauthenticated requests naming a host in `X-Forwarded-For` held its HTTP
+  connections for the DNS timeout its NetworkPolicy caused, about 20 s.
 
 **Fixed (review round sixteen)**
 
