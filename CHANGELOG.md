@@ -271,6 +271,10 @@ The section for a version is the text of its GitHub release.
   storage reading at most one row more than the batch. A two-record batch
   spanning a month of the agent's seqs made the server read the agent's
   whole history into memory, and could get it killed for running out of it.
+- Server: hopcorder's tables fsync every inserted part (migration 0005), so
+  a batch the server acknowledged survives a crash of ClickHouse's host.
+  Before, a power loss lost about the last 35 s of every agent's cycles, and
+  with many agents ClickHouse could refuse to load its tables afterwards.
 
 **Fixed (review round sixteen)**
 
