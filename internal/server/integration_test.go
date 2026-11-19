@@ -83,11 +83,16 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 	// Every table that stores rows fsyncs its inserted parts (migration
 	// 0005; review, round seventeen): an acknowledged batch survives a crash
-	// of ClickHouse's host.
+	// of ClickHouse's host. And its merged parts (0006; round eighteen), so
+	// that a crash under heavy ingest leaves no table refusing to attach.
 	for _, tbl := range []string{"cycles", "hops", "loop_events", "agent_seq", "path_changes", "outages"} {
 		if n := count(t, c, "SELECT count() AS n FROM system.tables WHERE database = currentDatabase() AND name = '"+tbl+
 			"' AND engine_full LIKE '%fsync_after_insert = 1%' AND engine_full LIKE '%fsync_part_directory = 1%'"); n != 1 {
 			t.Errorf("table %s does not fsync its inserted parts", tbl)
+		}
+		if n := count(t, c, "SELECT count() AS n FROM system.tables WHERE database = currentDatabase() AND name = '"+tbl+
+			"' AND engine_full LIKE '%min_compressed_bytes_to_fsync_after_merge = 1%'"); n != 1 {
+			t.Errorf("table %s does not fsync its merged parts", tbl)
 		}
 	}
 }

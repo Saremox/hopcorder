@@ -5581,9 +5581,11 @@ four reviewers (agent, ingest, read/UI/Grafana, deploy) at fbf5b61.
     migrations' `MODIFY QUERY` already did).
   - Cost, measured on this host's storage: 200 single-row inserts in
     1.48 s without, 2.08 s with: about 3 ms an insert part, a batch part
-    writing about five. Merged parts are not fsynced: their source parts
-    outlive them (`old_parts_lifetime`), so a crash detaches the merged
-    part and keeps the data.
+    writing about five. (Round eighteen measured it through the server:
+    more, see "Merged parts are fsynced too".) Merged parts were not
+    fsynced, on the ground that their source parts outlive them
+    (`old_parts_lifetime`); round eighteen showed that after a crash under
+    heavy ingest they still kept tables from attaching (migration 0006).
   - Test (`clickhouse` tag): `TestMigrateIdempotent` requires both settings
     on every table that stores rows (failed without the migration).
 - **The bundled ClickHouse resolves no names** (`dnsPolicy: None` with
@@ -5611,4 +5613,44 @@ four reviewers (agent, ingest, read/UI/Grafana, deploy) at fbf5b61.
   outage definition (cycles of the stream), and its cycle count shows it.
   A `last_ts` of the last unreached cycle, used by the UI and Grafana,
   would fix it.
+
+### Security and correctness review, round eighteen
+
+A focused round (the owner's choice) on round seventeen's fixes (#95, #96,
+#97). #95 and #97 hold; #96 does what it names: in 13 simulated power losses
+of ClickHouse's host (crash-consistent copies: ClickHouse frozen, a copy
+accepted only if the loop device's write counters did not move), every
+cycle the server had acknowledged survived with its hop and loop rows, at
+60 to 300 agents and during catch-ups, where the same runs without it lost
+the last 11 to 12 s. One HIGH.
+
+- **Merged parts are fsynced too** (migration `0006_fsync_merges.sql`:
+  `min_compressed_bytes_to_fsync_after_merge = 1` on the six tables; review
+  round eighteen, H1, HIGH as round seventeen counted "refuses to attach",
+  MEDIUM if the owner weighs that nothing acknowledged is lost). Merged
+  parts sat in the page cache; at a crash their directory entries were on
+  disk (the inserts' fsyncs commit the journal) and their files empty, and
+  ClickHouse 25.8 counted each as broken: past `max_suspicious_broken_parts`
+  (100) it refused to attach the table. At 300 agents × 30 records every
+  10 s, or 16 agents catching up with 500-record batches, hops,
+  path_changes, outages or loop_events stayed unattached in 5 of 6 runs
+  (restarts did not help); `checkSchema` then failed, `/readyz` and ingest
+  answered 503 for every agent, until an operator raised the limit (with
+  which every table attached and held all its rows). With the setting the
+  same runs left no broken part, every table attached, `CHECK TABLE` passed,
+  and throughput was within noise.
+  - Test (`clickhouse` tag): `TestMigrateIdempotent` requires the setting on
+    every table that stores rows (failed without the migration).
+- **Not fixed (lows):** #96's cost through the server is more than round
+  seventeen's "about 3 ms an insert part" on this host's storage: 200
+  agents × 10 records, p50 a batch 23 → 113 ms; 300 agents × 30 records
+  saturated ingest (329 to 435 of 2,700 batches 503 after the queue wait);
+  catch-up with 500-record batches 17.4k → 8.8k records/s. No insert or
+  events budget was exceeded. #95 refuses a stale re-delivery with a hole for
+  good (recorded for a damaged spool; a record now older than
+  `max_record_age` is a second way to it). Migrations 0005 and 0006 need
+  `ALTER SETTINGS` on the tables (the example config asks for all privileges
+  on the database). On a small ext4 volume at sustained capacity, outdated
+  parts kept for `old_parts_lifetime` can use up the inodes (seen once on a
+  2 GiB image; the chart's 20Gi default holds it).
 
