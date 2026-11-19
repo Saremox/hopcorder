@@ -784,16 +784,24 @@ func (in *Ingester) heldOpen(ctx context.Context, id string, part []*record.Reco
 // or another agent's (review, round eight): an agent's seqs jump at every
 // open of its spool (they go on from the clock), so the batch of a spool
 // that went back to an earlier state, or a retry cut shorter, can lie
-// that far below.
+// that far below. The lookup reads at most one row more than the batch
+// holds: the window is the sender's to set (two records a month and most
+// of the agent's seqs apart made it read the agent's whole history into
+// memory; review, round seventeen), and a window with more stored cycles
+// than the batch has records is not a re-delivery of it.
 func (in *Ingester) holdsAll(ctx context.Context, id string, recs []*record.Record) (bool, error) {
 	type row struct {
 		Seq uint64 `json:"seq"`
 		MS  int64  `json:"ms"`
 	}
 	rows, err := clickhouseQuery[row](ctx, in.store,
-		"SELECT DISTINCT seq, toUnixTimestamp64Milli(ts) AS ms FROM cycles WHERE "+partWindow, windowParams(id, recs))
+		"SELECT DISTINCT seq, toUnixTimestamp64Milli(ts) AS ms FROM cycles WHERE "+partWindow+" LIMIT {n:UInt64}",
+		withParam(windowParams(id, recs), "n", strconv.Itoa(len(recs)+1)))
 	if err != nil {
 		return false, fmt.Errorf("look up stored cycles of %s: %w", id, err)
+	}
+	if len(rows) > len(recs) {
+		return false, nil // the window holds cycles the batch does not: not a re-delivery of it
 	}
 	held := make(map[row]bool, len(rows))
 	for _, r := range rows {
