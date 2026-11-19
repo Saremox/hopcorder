@@ -81,6 +81,15 @@ func TestMigrateIdempotent(t *testing.T) {
 			t.Errorf("table %s missing", tbl)
 		}
 	}
+	// Every table that stores rows fsyncs its inserted parts (migration
+	// 0005; review, round seventeen): an acknowledged batch survives a crash
+	// of ClickHouse's host.
+	for _, tbl := range []string{"cycles", "hops", "loop_events", "agent_seq", "path_changes", "outages"} {
+		if n := count(t, c, "SELECT count() AS n FROM system.tables WHERE database = currentDatabase() AND name = '"+tbl+
+			"' AND engine_full LIKE '%fsync_after_insert = 1%' AND engine_full LIKE '%fsync_part_directory = 1%'"); n != 1 {
+			t.Errorf("table %s does not fsync its inserted parts", tbl)
+		}
+	}
 }
 
 func TestIngestEndToEndClickHouse(t *testing.T) {

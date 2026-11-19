@@ -5560,4 +5560,37 @@ four reviewers (agent, ingest, read/UI/Grafana, deploy) at fbf5b61.
     million stored cycles, a two-record batch spanning them: 899,001 rows
     handed to the server before, at most 3 after); the stale re-delivery
     tests still pass.
+- **Inserted parts are fsynced before ClickHouse answers** (migration
+  `0005_fsync_inserts.sql`: `fsync_after_insert = 1, fsync_part_directory
+  = 1` on cycles, hops, loop_events, agent_seq, path_changes and outages;
+  review round seventeen, agent H1, HIGH: lost records after a plausible
+  fault; the ingest reviewer rated the same MEDIUM, reasoned). The agent
+  deletes records on a 2xx, the server answers 2xx once ClickHouse has
+  acknowledged the inserts, and ClickHouse 25.8's defaults left an inserted
+  part in the page cache until Linux wrote it back (up to about 35 s). In
+  a simulated power loss (ClickHouse's data on ext4 in a loop image, copied
+  right after the last delivery) 208 of 360 acknowledged cycles were lost,
+  all of the last 34.5 s, with the mark in agent_seq gone back with them so
+  that nothing re-sent them; at the insert rate of about 30 agents
+  ClickHouse then refused to attach cycles, hops and agent_seq at all
+  ("Suspiciously many (187) broken parts"), until an operator intervened.
+  A crash of the ClickHouse process or a clean reboot lost nothing. With
+  both settings 360 of 360 and 240 of 240 survived and the tables attached.
+  - A migration, not the bundled configs, so an external ClickHouse gets
+    it too (the server's user needs ALTER on its tables, as the earlier
+    migrations' `MODIFY QUERY` already did).
+  - Cost, measured on this host's storage: 200 single-row inserts in
+    1.48 s without, 2.08 s with: about 3 ms an insert part, a batch part
+    writing about five. Merged parts are not fsynced: their source parts
+    outlive them (`old_parts_lifetime`), so a crash detaches the merged
+    part and keeps the data.
+  - Test (`clickhouse` tag): `TestMigrateIdempotent` requires both settings
+    on every table that stores rows (failed without the migration).
+- **Not fixed (the owner's choice), MEDIUM:** an outage that is open when its
+  stream stops being traced (a target removed, an agent retired) stays
+  "ongoing" for good, and if the stream comes back the outage spans the
+  untraced gap (2 hours of 5 cycles in the reviewer's run): it follows the
+  outage definition (cycles of the stream), and its cycle count shows it.
+  A `last_ts` of the last unreached cycle, used by the UI and Grafana,
+  would fix it.
 
