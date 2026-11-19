@@ -5529,3 +5529,35 @@ differential at retry parts of 5-25 KB (both identical before and after
     every 20 ms nothing was lost and no outage was wrong; at about one KILL
     every 40 ms for 16 s, 5 of 246 route changes were lost in 1 of 5 runs.
 
+### Security and correctness review, round seventeen
+
+A review of every area (the owner's choice), the first since round eight:
+four reviewers (agent, ingest, read/UI/Grafana, deploy) at fbf5b61.
+
+- **The stale-batch lookup reads at most one row more than the batch**
+  (`holdsAll`, `internal/server/ingest.go`; review round seventeen, ingest
+  H1, HIGH: a crash caused by a holder of an agent credential beyond its own
+  data). A batch far below the agent's mark is looked up in `cycles` by its
+  seq and ts window, and the lookup returned every stored cycle of the agent
+  in that window, not only the batch's own. The sender sets the window: a
+  two-record batch of 690 bytes, seq 1 at now-29.5 days and a seq far below
+  the mark at now+23 h, made the server hold about 70 bytes and ClickHouse
+  about 130 bytes per stored cycle. With 15M cycles in the month one
+  request OOM-killed the real server in a 1 GiB container (ClickHouse used
+  1.79 GiB for the query), and four concurrent requests against four agents
+  of 5M cycles did too (the agents planted through ingest in 2 minutes).
+  With the chart's bundled 2 GiB ClickHouse the lookup failed first
+  (MEMORY_LIMIT_EXCEEDED); an external ClickHouse, compose and systemd put
+  no such bound before the server.
+  - Now the lookup has `LIMIT len(recs)+1`, and a window holding more
+    stored cycles than the batch has records is not a re-delivery of it
+    (409, the agent keeps the batch, as for any other mismatch). A
+    re-delivery from the agent's spool is a run of its own seqs, so its
+    window holds only its cycles; only a damaged spool's batch with gaps
+    could be refused so. Measured by the reviewer: the same requests get
+    409 in 34-77 ms, ClickHouse using 42 MiB.
+  - Test (`clickhouse` tag): `TestStaleBatchLookupIsBoundedByTheBatch` (a
+    million stored cycles, a two-record batch spanning them: 899,001 rows
+    handed to the server before, at most 3 after); the stale re-delivery
+    tests still pass.
+

@@ -265,6 +265,13 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round seventeen)**
+
+- Server: a batch far below an agent's stored seqs is checked against
+  storage reading at most one row more than the batch. A two-record batch
+  spanning a month of the agent's seqs made the server read the agent's
+  whole history into memory, and could get it killed for running out of it.
+
 **Fixed (review round sixteen)**
 
 - Server: a batch's restores no longer count against the 10 s for storing
