@@ -5586,6 +5586,24 @@ four reviewers (agent, ingest, read/UI/Grafana, deploy) at fbf5b61.
     part and keeps the data.
   - Test (`clickhouse` tag): `TestMigrateIdempotent` requires both settings
     on every table that stores rows (failed without the migration).
+- **The bundled ClickHouse resolves no names** (`dnsPolicy: None` with
+  nameserver 127.0.0.1, in the chart's StatefulSet; review round seventeen,
+  deploy M1, MEDIUM, fixed at the owner's choice). ClickHouse 25.8 resolves
+  the name in an unauthenticated request's `X-Forwarded-For` before it
+  checks the password (round seven's N6), and with cluster DNS silently
+  dropped by the chart's NetworkPolicy (`egress: []`) each such request
+  held one of the 256 HTTP connections for the resolver's timeout, about
+  20 s, after its client had gone: one burst of 300 requests of 100 bytes
+  kept HTTP clients out for about 20 s (readiness passed; nothing
+  restarted). Round ten's accepted end state, but with no open sockets and
+  outliving the attacker. A resolver nothing listens on fails at once
+  (3 ms measured); `/etc/hosts` still gives localhost and the pod's names,
+  and ClickHouse here needs no DNS. It also makes Grafana's
+  `hasColumnInTable('<name>:…')` lookups fail at once.
+  - Checks: the helm job requires `dnsPolicy: None` and the nameserver in
+    the StatefulSet (failed on the old chart); the kind smoke test requires
+    `nameserver 127.0.0.1` in the pod's `/etc/resolv.conf` and an
+    `X-Forwarded-For` request answered within 2 s.
 - **Not fixed (the owner's choice), MEDIUM:** an outage that is open when its
   stream stops being traced (a target removed, an agent retired) stays
   "ongoing" for good, and if the stream comes back the outage spans the
