@@ -265,6 +265,14 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round sixteen)**
+
+- Server: a batch's restores no longer count against the 10 s for storing
+  its events. A slow restore after a restart could leave a slow route
+  change insert too little time, and the route change was lost.
+- Server: an events insert that fails three times no longer waits 300 ms
+  more before giving up.
+
 **Fixed (review round fifteen)**
 
 - Server: after a restart, an outages write the previous process left
