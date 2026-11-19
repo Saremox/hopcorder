@@ -2736,7 +2736,9 @@ decisions:
     stops the agent's writes that still run: every write of its cycles has
     the query_id `hopcorder/<agent_id>/<random>`, and `KILL QUERY WHERE
     startsWith(query_id, …) SYNC` ends them, a previous process's too, so
-    what is stored no longer changes. Then, per part, it looks up which of
+    what is stored no longer changes. (Round fifteen: its events inserts
+    too, which until then had no such query_id, so `outages` could still
+    change after it; see "Events inserts are settled too".) Then, per part, it looks up which of
     the part's seqs `cycles` holds (by agent, the part's seq range and its
     ts range: ts is in the sort key, seq is not), writes their missing hop
     and loop rows from `cycles` with the views' own queries, only where
@@ -5382,7 +5384,9 @@ state: one HIGH.
   - Now a part found stored asks storage once which of the agent's
     outages that start within it are held open (`heldOpen`: `outages
     FINAL` by `agent_id` and `start_seq`, `end_ts` checked in Go, never
-    filtered by a SELECT alias); a lost close row is `pendKeep` if its
+    filtered by a SELECT alias; round fifteen bounded it by the part's ts
+    range and made sure an earlier process's events insert cannot land
+    after it, see "Events inserts are settled too"); a lost close row is `pendKeep` if its
     outage started before the part or is among those. If the lookup fails,
     the part is not marked and is retried. A part found stored is rare
     (after a kill or a committed-but-failed cycles insert), so the query is
@@ -5400,4 +5404,69 @@ state: one HIGH.
   outages insert failed keeps its pending close row until it is dropped
   idle (an hour), and that outage stays "ongoing" (as since round ten:
   #85's restore also needed the stream's next cycle).
+
+### Security and correctness review, round fifteen
+
+A focused round (the owner's choice) on round fourteen's fix (#92). #92
+classified correctly whenever storage had stopped changing when it looked:
+crashes whose retries were themselves killed before their mark, retries
+with other part boundaries than the killed attempt's, `heldOpen` failing
+once or twice, and every crash retry losing its outages insert: 0 of 100
+wrong; round thirteen's fault mix with half the crash retries lost: 4 of
+100, the documented restart case. But nothing made storage stop changing:
+one HIGH.
+
+- **Events inserts are settled too** (`insertEvents` and `settle`,
+  `internal/server/ingest.go`; review round fifteen, H1, HIGH by the
+  yardstick of rounds twelve to fourteen, MEDIUM if a late commit that
+  outlasts a server restart counts as unusual). `settle` stops the
+  agent's writes that carry its query_id prefix, and only the cycles
+  writes and the fill-ins did; the outages and path_changes inserts had
+  none. An outages insert whose client gave up or died goes on in
+  ClickHouse, so after a kill or a restart it could land after the next
+  process had read `outages`:
+  - after a kill during a part's outages insert, the retry's `heldOpen`
+    missed the long outage's open row; the retry's own outages insert
+    failed, its close row (`pendOwn`, 8 closes of a lossy stream before
+    it) was dropped past the bound, and the old insert then landed: the
+    outage "ongoing" for good (`[70 to ongoing: 21 cycles]` for `[70 to
+    111: 41 cycles]`);
+  - older than #92: an outages insert with the only open row of a long
+    outage still ran when the server restarted; the restore did not see
+    it and opened the outage again at a later start (the documented
+    restart case), then the row landed: the outage recorded twice, the
+    true one "ongoing" for good (`[[60 to ongoing: 41 cycles] [71 to 161:
+    90 cycles]]`).
+  Measured by the reviewer on 25.8 with an insert genuinely still running
+  (a constraint that sleeps 3 s, the client giving up after 300 ms), and
+  with its differential: every crash retry losing its insert and half the
+  killed attempts' inserts landing after the retry, 23 of 100 runs wrong,
+  26 outages "ongoing"; round thirteen's fault mix with every lost insert
+  committed after the next batch, 1 of 100.
+  - Now every events insert attempt has the agent's query_id
+    (`writeCtx`), so a new process's first batch, which is unsure, stops
+    and waits for the old process's events inserts before `findStored`,
+    `heldOpen` or any restore reads anything. An insert stopped so is lost,
+    as one that failed (its close rows were pending in the old process;
+    the restart case may follow, as documented). With the fix modelled in
+    the differential: 3 of 100, all the documented restart case, none
+    "ongoing"; and 0 of 100.
+  - Not covered, as round four accepted: an insert ClickHouse had received
+    but not started when the KILL ran; and the same process's own late
+    events inserts before a stream is dropped (trimmed or idle).
+  - Round twelve's L5 (two hopcorder servers sharing a ClickHouse and
+    agent_ids can cancel each other's writes) now covers events inserts as
+    well.
+  - Tests (`clickhouse` tag), each failing on ea74520 with an insert
+    really running: `TestKilledAttemptsRunningEventsInsertIsSettled` (8
+    and 20 one-cycle outages; 7 passes there) and
+    `TestRunningOpenRowIsSettledBeforeTheRestore` (`inflight=true`; the
+    control is the documented `[[71 to 161: 90 cycles]]`).
+- **`heldOpen` is bounded by the part's ts range** (review round fifteen,
+  L1). An outage that starts in a part starts at one of its cycles, so
+  within its ts range; without the bound the lookup read every outage of
+  the agent: 41M rows, 1.1-1.6 s and up to 363 MiB for one agent with
+  4096 streams on 25.8, against 34 ms and 10 MiB with it. A failure of the
+  lookup makes the agent's batch retry, so a slow one could keep a large
+  agent stuck.
 

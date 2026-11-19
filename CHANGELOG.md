@@ -265,6 +265,16 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round fifteen)**
+
+- Server: after a restart, an outages write the previous process left
+  running in ClickHouse is stopped before the server reads outages again.
+  Landing after that read, it could leave an outage "ongoing" for good, or
+  record it twice.
+- Server: the lookup of outages held open, for a batch stored again after
+  a crash, reads only the batch's time range instead of every outage of
+  the agent.
+
 **Fixed (review round fourteen)**
 
 - Server: after a crash before a batch was marked stored, a retry whose
