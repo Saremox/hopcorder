@@ -15,7 +15,9 @@
 --
 -- The cost is an fsync of each inserted part and its directory: an insert
 -- into each of these tables per part of an agent's batch. Merged parts are
--- not fsynced; their source parts outlive them (old_parts_lifetime).
+-- fsynced since 0006: left in the page cache, after a crash under heavy
+-- ingest more than max_suspicious_broken_parts of them kept a table from
+-- attaching (review, round eighteen).
 ALTER TABLE cycles MODIFY SETTING fsync_after_insert = 1, fsync_part_directory = 1;
 ALTER TABLE hops MODIFY SETTING fsync_after_insert = 1, fsync_part_directory = 1;
 ALTER TABLE loop_events MODIFY SETTING fsync_after_insert = 1, fsync_part_directory = 1;

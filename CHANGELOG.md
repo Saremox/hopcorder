@@ -265,6 +265,13 @@ The section for a version is the text of its GitHub release.
   unreachable", and administratively prohibited read "host unreachable".
   Codes are now named by the cycle's address family.
 
+**Fixed (review round eighteen)**
+
+- Server: hopcorder's tables fsync merged parts as well (migration 0006).
+  After a crash of ClickHouse's host under heavy ingest, the unwritten merged
+  parts kept a table from attaching, and the server refused every agent until
+  an operator intervened.
+
 **Fixed (review round seventeen)**
 
 - Server: a batch far below an agent's stored seqs is checked against
