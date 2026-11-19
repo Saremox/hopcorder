@@ -1258,6 +1258,9 @@ decisions:
   batch's events has its own 10 s. Before, one request with 4096 new
   streams held an ingest slot for 20 s of serial restore queries, and slow
   restores used up the insert budget so that the batch's events were lost.
+  (Round sixteen: from round four to round sixteen the events budget
+  started before the first part's derive, so its restores counted against
+  it; see "The events budget starts after the first part's derive".)
 - **A stream whose restore fails or does not fit the budget stays
   unloaded**: its cycles in that batch derive no events (counted in
   `hopcorder_server_unrestored_cycles_total`, one warning per batch) and it
@@ -5469,4 +5472,60 @@ one HIGH.
   4096 streams on 25.8, against 34 ms and 10 MiB with it. A failure of the
   lookup makes the agent's batch retry, so a slow one could keep a large
   agent stuck.
+
+### Security and correctness review, round sixteen
+
+A focused round (the owner's choice) on round fifteen's fix (#93) and on two
+failures the owner's own verification runs showed with round fifteen's
+differential at retry parts of 5-25 KB (both identical before and after
+#93). No HIGH, CRITICAL or MEDIUM finding.
+
+- **Held:** after `settle` nothing of an earlier process changes
+  `outages` (but round four's accepted window: an insert received and not
+  started); the `start_ts` bound of `heldOpen` is right in every edge case
+  built on 25.8 in New York time (sub-millisecond, equal and backwards ts,
+  the outage starting at the part's first or last ts; a restore opens
+  outages before the part, which never needed the lookup); killing an
+  events insert loses nothing a failure of it would not; both suites,
+  rounds thirteen to fifteen's PoCs (but the one modelling round four's
+  window); the fault-mix differential at real part sizes, 3 of 100 wrong,
+  all the documented restart case, none "ongoing".
+- **The events budget starts after the first part's derive** (`storeRecords`,
+  `internal/server/ingest.go`; review round sixteen, L1, a regression of
+  round two's decision since round four). Go evaluated `ectx.get()` before
+  `in.derive(...)` in the same argument list, so the lazy 10 s events
+  budget started before the first part's restores (up to 5 s): with a 4 s
+  restore and a 7 s path_changes insert the route change was lost. Now
+  `derive` runs first. The budget is an `Ingester` field
+  (`eventsTimeout`), so the test can lower it. Test (default run):
+  `TestRestoresDoNotCountAgainstTheEventsBudget` (1 s budget, a 0.4 s
+  restore and a 0.7 s insert: 0 path changes with the old order).
+- **No sleep after an events insert's last attempt** (review round
+  sixteen, L4): it slept 300 ms more before giving up, half of the 0.6 s a
+  failing insert spent.
+- **Not fixed (lows, with their bounds):**
+  - The parts of a batch share its events budget: the owner's first
+    finding (route changes lost in a batch of many small parts whose
+    outages inserts fail) needs about 16 such parts. Measured parts per
+    batch (cost against the raw NDJSON the agent counts): 1 at the agent's
+    default batch (2 at a UTC month boundary), 4-7 at its 16 MiB cap, 10
+    for IPv6 loops at `max_ttl` 64, 31 only for loops at `max_ttl` 255; a
+    16 MiB batch of 8,075 records was stored in 0.87 s on 25.8, its events
+    in 0.5 s. Otherwise round four's accepted "events whose own insert
+    fails".
+  - In a part derived again, an outage that began before the part is
+    `pendKeep` even if the earlier derivation stored it closed: the owner's
+    second finding (an outage "ongoing" for good) needs at least 9 of the
+    retry's failed parts in the region found stored (8 held, 9 did not, in
+    a threshold test). That region is the killed process's unmarked parts:
+    one after a kill, more only if its `agent_seq` inserts failed too; a
+    retry's parts are no smaller than the killed attempt's. At real
+    proportions the owner's differential gave 0 of 100; with every mark
+    failing and about 25 parts a batch, 27 of 100 (26 of them lost route
+    changes from the shared budget). Documented at `keepPending`; a keyed
+    lookup of the lost closes would remove it.
+  - Round twelve's L5 re-measured after #93: a second server's KILLs now
+    stop this server's events inserts too. With a KILL loop every 1 s to
+    every 20 ms nothing was lost and no outage was wrong; at about one KILL
+    every 40 ms for 16 s, 5 of 246 route changes were lost in 1 of 5 runs.
 

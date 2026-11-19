@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -241,5 +244,63 @@ func TestRederivedPartKeepsTheCloseOfTheOutageItLeftOpen(t *testing.T) {
 	got := outagesOf(st.table("outages"))
 	if got[30] != "end 71, 41 cycles" {
 		t.Errorf("the long outage: %q, want end 71, 41 cycles (all: %v)", got[30], got)
+	}
+}
+
+// slowStore makes the stream replay query take replay and each
+// path_changes insert take insert, honouring ctx as the HTTP client does.
+type slowStore struct {
+	*hookStore
+	replay, insert time.Duration
+}
+
+func (s *slowStore) InsertJSON(ctx context.Context, table string, rows [][]byte) error {
+	if table == "path_changes" && s.insert > 0 {
+		select {
+		case <-time.After(s.insert):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.hookStore.InsertJSON(ctx, table, rows)
+}
+
+// A batch's events budget starts after its first part's derive, so the
+// restores in it do not count against it (round two). Since round four
+// ectx.get() was evaluated before derive in the same argument list, and a
+// slow restore left a slow events insert too little: the route change was
+// lost (review, round sixteen, L1). Here with a 1 s budget: a 0.4 s restore
+// and a 0.7 s insert.
+func TestRestoresDoNotCountAgainstTheEventsBudget(t *testing.T) {
+	for _, tc := range []struct {
+		replay, insert time.Duration
+	}{
+		{0, 700 * time.Millisecond},                      // a slow insert alone: within the budget
+		{400 * time.Millisecond, 0},                      // a slow restore alone
+		{400 * time.Millisecond, 700 * time.Millisecond}, // both: over it if the restore counts
+	} {
+		t.Run(tc.replay.String()+"+"+tc.insert.String(), func(t *testing.T) {
+			hs := newHookStore()
+			st := &slowStore{hookStore: hs}
+			hs.query = func(q string) error {
+				if st.replay > 0 && strings.Contains(q, "ORDER BY seq DESC LIMIT {depth:UInt32}") {
+					time.Sleep(st.replay)
+				}
+				return nil
+			}
+			in := NewIngester(st, nil, quietLogger(), nil)
+			if _, err := in.Ingest(t.Context(), lab(1, 5)); err != nil {
+				t.Fatal(err)
+			}
+			in = NewIngester(st, nil, quietLogger(), nil) // a restart: the stream is restored
+			in.eventsTimeout = time.Second
+			st.replay, st.insert = tc.replay, tc.insert
+			if _, err := in.Ingest(t.Context(), lab(6, 12)); err != nil {
+				t.Fatal(err)
+			}
+			if n := len(hs.table("path_changes")); n != 1 {
+				t.Errorf("%d path changes stored, want the one at 6", n)
+			}
+		})
 	}
 }

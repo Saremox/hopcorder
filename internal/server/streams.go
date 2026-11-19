@@ -44,7 +44,13 @@ type stream struct {
 // was derived in). Only past maxPending such rows (eight failed parts in a
 // row, each of which closed an outage begun before it) is a row that must
 // be kept dropped, the newest; the oldest, which storage holds open if any
-// does, stays.
+// does, stays. In a part derived again, an outage that began before the
+// part is pendKeep even if the earlier derivation stored it closed, so the
+// row heldOpen found open is dropped when at least 9 of the retry's failed
+// parts lie in the region found stored before its close: that region is
+// the killed process's unmarked parts, one after a kill (more only if its
+// mark inserts failed too), and a retry's parts are no smaller than the
+// killed attempt's (round sixteen: 8 parts held, 9 did not).
 func (s *stream) keepPending(o outageRow) {
 	if len(s.pending) < maxPending {
 		s.pending = append(s.pending, o)

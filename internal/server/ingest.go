@@ -81,6 +81,9 @@ type Ingester struct {
 	// restoreTimeout of its first restore.
 	maxRestores    int
 	restoreTimeout time.Duration
+	// eventsTimeout bounds storing a batch's derived events, from after the
+	// first part's derive (restores have their own budget); tests lower it.
+	eventsTimeout time.Duration
 	// partBytes bounds one insert (maxInsertBytes; tests lower it).
 	partBytes int
 	now       func() time.Time
@@ -209,7 +212,7 @@ func NewIngester(store Store, en Enricher, log *slog.Logger, m *serverMetrics) *
 	return &Ingester{store: store, enrich: en, log: log, metrics: m, agents: map[string]*agentState{},
 		maxStreams: DefaultMaxStreams, maxAgents: DefaultMaxAgents, idleTTL: DefaultStreamIdleTTL,
 		maxRecordAge: DefaultMaxRecordAge, maxRestores: maxRestores, restoreTimeout: restoreTimeout,
-		partBytes: maxInsertBytes, now: time.Now}
+		eventsTimeout: eventsTimeout, partBytes: maxInsertBytes, now: time.Now}
 }
 
 // lockAgent returns the agent's state, locked.
@@ -509,8 +512,16 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 	rb *restoreBudget) (int, error) {
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), insertTimeout)
 	defer cancel()
-	// Events have their own budget, from the first part's on.
-	ectx := &lazyTimeout{parent: context.WithoutCancel(ctx), d: eventsTimeout}
+	// Events have their own budget, from the first part's on: it starts
+	// after that part's derive, so the restores in it (restoreTimeout) do
+	// not count against it (round two; round sixteen restored the order,
+	// lost since round four, when ectx.get() was evaluated before derive in
+	// the same argument list). The parts of a batch share it: a failing
+	// outages insert spends about 0.6 s of it, so the events of a batch of
+	// more than about 16 parts whose outages inserts fail can run out of
+	// it; a batch has 1 part at the agent's default size and at most about
+	// 7 at its 16 MiB cap (round sixteen, measured).
+	ectx := &lazyTimeout{parent: context.WithoutCancel(ctx), d: in.eventsTimeout}
 	defer ectx.stop()
 	var st deriveStats
 	defer in.reportDerive(a, id, &st)
@@ -571,7 +582,8 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 		// A loaded stream is never restored now (round thirteen: past a
 		// bound of 8 rows it still was, and one part of a lossy destination
 		// has more closes than that).
-		for _, o := range in.insertEvents(ectx.get(), id, in.derive(ctx, a, part, now, rb, &st)) {
+		ev := in.derive(ctx, a, part, now, rb, &st) // before ectx.get(): see ectx
+		for _, o := range in.insertEvents(ectx.get(), id, ev) {
 			s, ok := a.streams[streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID}]
 			if !ok || !s.loaded {
 				continue
@@ -1325,8 +1337,8 @@ func (in *Ingester) insertEvents(ctx context.Context, id string, ev events) (los
 				return true
 			}
 			in.metrics.insertError(table)
-			if ctx.Err() != nil {
-				break
+			if ctx.Err() != nil || attempt == 2 {
+				break // no sleep after the last attempt (round sixteen, L4)
 			}
 			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 		}
