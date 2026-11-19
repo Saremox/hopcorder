@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1048,5 +1049,157 @@ func TestCommittedCyclesThenLateCommitLeaveNothingOpen(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// inflightStore: the next outages insert really runs on in ClickHouse after
+// its client has gone (a constraint makes ClickHouse sleep 3 s before it
+// commits; the client gives up after 300 ms, as a process that dies closes
+// its connection), and the process's later outages inserts never happen.
+type inflightStore struct {
+	*clickhouse.Client
+	mu          sync.Mutex
+	failMark    bool
+	slowNext    bool // the next outages insert runs on in ClickHouse
+	dead        bool // the process that sent it is gone
+	failOutages int
+	sent        time.Time
+}
+
+func (f *inflightStore) InsertJSON(ctx context.Context, table string, rows [][]byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case f.failMark && table == "agent_seq":
+		return errors.New("killed before the mark")
+	case table == "outages" && f.slowNext:
+		f.slowNext, f.dead = false, true
+		if err := f.Exec(context.Background(), "ALTER TABLE outages ADD CONSTRAINT slow CHECK sleep(3) = 0", nil); err != nil {
+			return err
+		}
+		f.sent = time.Now()
+		cctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		err := f.Client.InsertJSON(cctx, table, rows) // ClickHouse goes on with it
+		cancel()
+		if derr := f.Exec(context.Background(), "ALTER TABLE outages DROP CONSTRAINT slow", nil); derr != nil {
+			return derr
+		}
+		return fmt.Errorf("the process died during the insert: %w", err)
+	case table == "outages" && f.dead:
+		return errors.New("the process is gone")
+	case table == "outages" && f.failOutages > 0:
+		f.failOutages--
+		return errors.New("clickhouse: code 241: memory limit exceeded")
+	}
+	return f.Client.InsertJSON(ctx, table, rows)
+}
+
+// waitLanded sleeps until an insert inflightStore sent at sent has landed;
+// it fails the test if it had landed before the step just done.
+func waitLanded(t *testing.T, sent time.Time, step string) {
+	t.Helper()
+	d := time.Since(sent)
+	if d >= 3*time.Second {
+		t.Fatalf("%s ran %v after the slow insert: it had landed", step, d)
+	}
+	time.Sleep(3500*time.Millisecond - d)
+}
+
+// The server is killed while a part's outages insert runs in ClickHouse,
+// before the part's mark (review, round fifteen). Events inserts carried no
+// query_id of the agent, so the next process's settle did not stop them:
+// heldOpen ran while it still ran and missed the long outage's open row,
+// the retry's own outages insert failed, its close row was dropped past
+// the bound, and when the old insert landed the outage stayed "ongoing" for
+// good. Now settle stops it and waits; its rows are lost with it (as an
+// insert that failed: accepted), and nothing is left open.
+func TestKilledAttemptsRunningEventsInsertIsSettled(t *testing.T) {
+	for _, n := range []int{maxPending - 1, maxPending, 20} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &inflightStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			longFrom := uint64(52 + 2*n + 2)
+			flap := flapThenDown(n, longFrom, longFrom+40)
+			spec := func(seq uint64) []string {
+				if seq >= 185 && seq < 191 {
+					return brokenA
+				}
+				return flap(seq)
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			st.failMark, st.slowNext = true, true
+			ingest(51, longFrom+20) // cycles stored; the outages insert runs on; killed before the mark
+			st.failMark, st.dead = false, false
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			st.failOutages = 3
+			ingest(51, 150) // the agent's retry, with what came in since: its outages insert fails
+			waitLanded(t, st.sent, "the retry")
+			ingest(151, 180)
+			ingest(181, 200)
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a later restart
+			ingest(201, 210)
+			if got := storedOutages(t, c); strings.Contains(got, "ongoing") {
+				t.Errorf("an outage is left ongoing: %s", got)
+			}
+		})
+	}
+}
+
+// The same cause without a kill before the mark: a part's outages insert,
+// with the only open row of a long outage so far, outlives its client and
+// still runs when the server restarts. The restore did not see the open
+// row and opened the outage again at its first trailing unreached cycle
+// replayed (the documented restart case); then the row landed, and the
+// outage was recorded twice, the true one "ongoing" for good. The control
+// (inflight=false: the insert never commits) is the documented case.
+func TestRunningOpenRowIsSettledBeforeTheRestore(t *testing.T) {
+	for _, inflight := range []bool{false, true} {
+		t.Run(fmt.Sprintf("inflight=%v", inflight), func(t *testing.T) {
+			c := testClickHouse(t)
+			st := &inflightStore{Client: c}
+			in := NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil)
+			ts := func(seq uint64) time.Time { return t0.Add(time.Duration(seq) * 5 * time.Second) }
+			spec := func(seq uint64) []string {
+				if seq >= 60 && seq <= 160 {
+					return brokenA
+				}
+				return pathA
+			}
+			ingest := func(from, to uint64) {
+				t.Helper()
+				if _, err := in.Ingest(t.Context(), cyclesFor(from, to, ts, spec)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for from := uint64(1); from <= 41; from += 10 {
+				ingest(from, from+9)
+			}
+			if inflight {
+				st.slowNext = true // the open row of [60 ...] runs on in ClickHouse
+			} else {
+				st.failOutages = 3
+			}
+			ingest(51, 100) // stored and marked; its outages insert "failed"
+			st.dead, st.failOutages = false, 0
+			in = NewIngester(st, fakeEnrich{}, slog.New(slog.DiscardHandler), nil) // a restart
+			ingest(101, 150)                                                       // the restore: down for its whole replay
+			if inflight {
+				waitLanded(t, st.sent, "the restore")
+			}
+			ingest(151, 170)
+			if got, want := storedOutages(t, c), "[[71 to 161: 90 cycles]]"; got != want {
+				t.Errorf("got %s, want %s", got, want)
+			}
+		})
 	}
 }

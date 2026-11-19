@@ -571,7 +571,7 @@ func (in *Ingester) storeRecords(ctx context.Context, a *agentState, id string, 
 		// A loaded stream is never restored now (round thirteen: past a
 		// bound of 8 rows it still was, and one part of a lossy destination
 		// has more closes than that).
-		for _, o := range in.insertEvents(ectx.get(), in.derive(ctx, a, part, now, rb, &st)) {
+		for _, o := range in.insertEvents(ectx.get(), id, in.derive(ctx, a, part, now, rb, &st)) {
 			s, ok := a.streams[streamKey{Agent: o.AgentID, Target: o.Target, Protocol: o.Protocol, Flow: o.FlowID}]
 			if !ok || !s.loaded {
 				continue
@@ -654,7 +654,7 @@ func (in *Ingester) insertPart(ctx context.Context, id string, rows [][]byte) er
 }
 
 // writeCtx gives a write of agent id's cycles (or of their hop and loop
-// rows) a query_id that settle finds it by, and the settings the ingester
+// rows, or of its events) a query_id that settle finds it by, and the settings the ingester
 // relies on whatever the user's profile says: the insert is the client's
 // own (not buffered with others'), and it fails if a view fails.
 func writeCtx(ctx context.Context, id string) context.Context {
@@ -670,7 +670,10 @@ func writeCtx(ctx context.Context, id string) context.Context {
 // settle stops the writes of agent id that still run in ClickHouse (an
 // insert of this process that outlived its timeout, or one of a process
 // before a restart) and waits until they have ended, so that what
-// findStored sees no longer changes. (KILL QUERY needs the server's
+// findStored, heldOpen and a restore see no longer changes: the cycles
+// writes and, since round fifteen, the events inserts (an outages insert
+// of a killed process landing after heldOpen or a restore had looked left
+// an outage "ongoing" for good). (KILL QUERY needs the server's
 // ClickHouse user to read query_id, user and query of system.processes;
 // Migrate checks that.)
 func (in *Ingester) settle(ctx context.Context, id string) error {
@@ -742,10 +745,14 @@ func (in *Ingester) heldOpen(ctx context.Context, id string, part []*record.Reco
 		StartSeq uint64  `json:"start_seq"`
 		EndTS    *string `json:"end_ts"`
 	}
+	// An outage that starts in part starts at one of its cycles, so within
+	// its ts range too: the bound prunes by partition and keeps the read to
+	// the part's outages (round fifteen: without it, every outage of the
+	// agent, 41M rows and 1.1-1.6 s for one with 4096 streams).
 	rows, err := clickhouseQuery[row](ctx, in.store, `SELECT target, protocol, flow_id, start_seq, end_ts
-		FROM outages FINAL WHERE agent_id = {agent:String} AND start_seq >= {lo:UInt64} AND start_seq <= {hi:UInt64}`,
-		clickhouse.Params{"agent": id, "lo": strconv.FormatUint(part[0].Seq, 10),
-			"hi": strconv.FormatUint(part[len(part)-1].Seq, 10)})
+		FROM outages FINAL WHERE agent_id = {agent:String} AND start_seq >= {lo:UInt64} AND start_seq <= {hi:UInt64}
+		AND start_ts >= {from:DateTime64(3, 'UTC')} AND start_ts <= {to:DateTime64(3, 'UTC')}`,
+		windowParams(id, part))
 	if err != nil {
 		return nil, fmt.Errorf("look up outages of %s held open: %w", id, err)
 	}
@@ -1305,14 +1312,16 @@ const maxPending = 8
 // insertEvents stores events in inserts of at most partBytes of JSON each,
 // encoding an insert's rows only when it is due. It returns the outage
 // close rows it could not store, which storeRecords keeps on their streams.
-func (in *Ingester) insertEvents(ctx context.Context, ev events) (lost []outageRow) {
+func (in *Ingester) insertEvents(ctx context.Context, id string, ev events) (lost []outageRow) {
 	insert := func(table string, rows [][]byte) bool {
 		if len(rows) == 0 {
 			return true
 		}
 		var err error
 		for attempt := range 3 {
-			if err = in.store.InsertJSON(ctx, table, rows); err == nil {
+			// With the agent's query_id prefix: settle stops an events insert
+			// that outlived its process (or its timeout) before heldOpen looks.
+			if err = in.store.InsertJSON(writeCtx(ctx, id), table, rows); err == nil {
 				return true
 			}
 			in.metrics.insertError(table)
